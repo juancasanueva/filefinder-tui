@@ -16,6 +16,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
         "Move between the sidebar, the panes and the details",
     ),
     ("⏎", "Open"),
+    ("Space", "Preview the selected file"),
     ("Backspace", "Go to the parent folder"),
     ("Alt+← / Alt+→", "Back / forward"),
     ("Alt+Home", "Go home"),

@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::list::{self, size_text};
-use super::{fit, scroll};
+use super::{fit, picture, scroll};
 use crate::app::{App, TileSize};
 use crate::format::{self, DateStyle};
 use crate::icons::Icon;
@@ -115,7 +115,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         if let Some(visible) = thumb_rect(area, size, pane.offset, index) {
             if entry.is_dir {
                 folder_card(frame, visible);
-            } else {
+            } else if !picture(frame, app.thumbs.as_mut(), entry, thumb, visible) {
                 stand_in(frame, thumb, visible, entry);
             }
         }
@@ -141,7 +141,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 }
 
 /// A plain card with a folder's tab on its top left.
-fn folder_card(frame: &mut Frame, thumb: Rect) {
+pub(super) fn folder_card(frame: &mut Frame, thumb: Rect) {
     let tab = "▄".repeat((thumb.width / 3) as usize);
     frame.render_widget(Paragraph::new(tab).style(theme::card_tab()), thumb);
     let card = Rect {
@@ -154,7 +154,7 @@ fn folder_card(frame: &mut Frame, thumb: Rect) {
 
 /// What a file shows until it has a picture of its own: a box with the glyph
 /// of its kind in the middle and its extension in the bottom right corner.
-fn stand_in(frame: &mut Frame, thumb: Rect, visible: Rect, entry: &Entry) {
+pub(super) fn stand_in(frame: &mut Frame, thumb: Rect, visible: Rect, entry: &Entry) {
     frame.render_widget(Block::new().style(theme::card()), visible);
     let mut mark = |row: u16, text: String, alignment: Alignment| {
         let line = Rect {
@@ -222,11 +222,13 @@ fn details(entry: &Entry, now: SystemTime, date_style: DateStyle, width: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::testing::{ctrl, fixture, grid_fixture, press};
+    use crate::app::testing::{ctrl, fixture, grid_fixture, pictures, press, settle};
     use crate::icons::Icon;
+    use crate::thumbs::testing::painted;
     use crate::ui::testing::{buffer, find, screen};
     use ratatui::crossterm::event::KeyCode;
-    use std::fs;
+    use std::fs::{self, File};
+    use std::time::Duration;
 
     #[test]
     fn tiles_fill_the_width_and_say_where_their_thumbnails_go() {
@@ -378,6 +380,143 @@ mod tests {
         let (x, y) = find(&small, "┌", 24..96).unwrap();
         assert_eq!(small[(x + 13, y)].symbol(), "┐");
         assert_eq!(small[(x, y + 5)].symbol(), "└");
+    }
+
+    #[test]
+    fn a_file_with_a_picture_shows_it_in_the_middle_of_its_thumbnail() {
+        let (mut f, thumbnailer) = pictures();
+        fs::write(f.home.join("tall.jpg"), "tall").unwrap();
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        press(&mut f.app, &[KeyCode::F(5)]);
+
+        // Drawing only asks: until the picture has been made the stand-in shows.
+        let before = buffer(&mut f.app, 120, 24);
+        assert_eq!(before[(74, 5)].symbol(), Icon::Text.glyph());
+        assert!(!painted(&before[(74, 5)]));
+        settle(&mut f.app);
+        let after = buffer(&mut f.app, 120, 24);
+
+        // notes.txt, four by three: all sixteen by six cells of its thumbnail and no more.
+        for (x, y) in [(67, 3), (82, 3), (74, 5), (67, 8), (82, 8)] {
+            assert!(painted(&after[(x, y)]), "{x}, {y}");
+        }
+        assert_eq!(after[(74, 5)].symbol(), " ", "the stand-in is gone");
+        for (x, y) in [(66, 3), (83, 3), (67, 2), (67, 9)] {
+            assert!(!painted(&after[(x, y)]), "{x}, {y}");
+        }
+        // tall.jpg on the second row, three by four: nine cells wide in the middle of sixteen.
+        for (x, y) in [(30, 13), (38, 13), (30, 18), (38, 18)] {
+            assert!(painted(&after[(x, y)]), "{x}, {y}");
+        }
+        for (x, y) in [(27, 13), (29, 13), (39, 13), (42, 18), (30, 12), (30, 19)] {
+            assert!(!painted(&after[(x, y)]), "{x}, {y}");
+            assert_eq!(after[(x, y)].bg, theme::BACKGROUND);
+        }
+        // Folders keep their card and are never asked for.
+        assert_eq!(after[(27, 3)].symbol(), "▄");
+        assert_eq!(after[(27, 4)].bg, theme::LIGHTER_BACKGROUND);
+        let mut asked = thumbnailer.asked();
+        asked.sort();
+        assert_eq!(asked, ["notes.txt", "tall.jpg"]);
+        let here = std::thread::current().id();
+        let threads = thumbnailer.threads.lock().unwrap();
+        assert!(
+            threads.iter().all(|thread| *thread != here),
+            "off this thread"
+        );
+    }
+
+    #[test]
+    fn a_thumbnail_the_bottom_edge_cuts_stays_inside_the_view() {
+        let (mut f, _thumbnailer) = pictures();
+        for name in ["a", "b", "c", "d", "e", "f", "g"] {
+            fs::write(f.home.join(format!("{name}.txt")), name).unwrap();
+        }
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        // Sorting says so in a band under the view: the view is one row shorter.
+        press(&mut f.app, &[KeyCode::Char('s'), KeyCode::Char('S')]);
+        buffer(&mut f.app, 120, 26);
+        settle(&mut f.app);
+        let cut = buffer(&mut f.app, 120, 26);
+
+        // The third row of tiles: two rows of its thumbnails fit above the band.
+        let area = Rect::new(24, 2, 62, 23);
+        assert_eq!(
+            thumb_rect(area, TileSize::Normal, 0, 6),
+            Some(Rect::new(27, 23, 16, 2))
+        );
+        for (x, y) in [(27, 23), (42, 23), (27, 24), (42, 24)] {
+            assert!(painted(&cut[(x, y)]), "{x}, {y}");
+        }
+        for x in 24..86 {
+            assert!(!painted(&cut[(x, 25)]), "the band at {x} is drawn over");
+            assert_eq!(cut[(x, 25)].bg, theme::LIGHTER_BACKGROUND);
+        }
+        assert_eq!(find(&cut, "Sorted by name", 24..86), Some((26, 25)));
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_drawn_keeps_its_stand_in_until_it_changes() {
+        let (mut f, thumbnailer) = pictures();
+        fs::write(f.home.join("notes.txt"), "broken").unwrap();
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        press(&mut f.app, &[KeyCode::F(5)]);
+        for _ in 0..3 {
+            buffer(&mut f.app, 120, 24);
+            settle(&mut f.app);
+        }
+        let failed = buffer(&mut f.app, 120, 24);
+        assert_eq!(failed[(74, 5)].symbol(), Icon::Text.glyph());
+        assert_eq!(failed[(67, 3)].bg, theme::LIGHTER_BACKGROUND);
+        assert_eq!(thumbnailer.asked(), ["notes.txt"], "asked once");
+
+        // Written again later: it is worth another try.
+        fs::write(f.home.join("notes.txt"), "mended").unwrap();
+        let later = SystemTime::now() + Duration::from_secs(60);
+        let file = File::options().write(true).open(f.home.join("notes.txt"));
+        file.unwrap().set_modified(later).unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
+        buffer(&mut f.app, 120, 24);
+        settle(&mut f.app);
+        let mended = buffer(&mut f.app, 120, 24);
+        assert!(painted(&mended[(74, 5)]));
+        assert_eq!(thumbnailer.asked(), ["notes.txt", "notes.txt"]);
+    }
+
+    #[test]
+    fn bigger_tiles_show_the_same_thumbnail_bigger() {
+        let (mut f, thumbnailer) = pictures();
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        buffer(&mut f.app, 130, 30);
+        settle(&mut f.app);
+        let normal = buffer(&mut f.app, 130, 30);
+        let area = Rect::new(24, 2, 72, 28);
+        let thumb = thumb_rect(area, TileSize::Normal, 0, 2).unwrap();
+        assert!(painted(&normal[(thumb.x, thumb.y)]));
+        assert!(painted(&normal[(thumb.right() - 1, thumb.bottom() - 1)]));
+
+        f.app.handle_key(ctrl(KeyCode::Char('=')));
+        buffer(&mut f.app, 130, 30);
+        settle(&mut f.app);
+        let large = buffer(&mut f.app, 130, 30);
+        // Twenty-four cells by nine now, filled from edge to edge.
+        let thumb = thumb_rect(area, TileSize::Large, 0, 2).unwrap();
+        assert_eq!((thumb.width, thumb.height), (24, 9));
+        for (x, y) in [
+            (thumb.x, thumb.y),
+            (thumb.right() - 1, thumb.y),
+            (thumb.x, thumb.bottom() - 1),
+            (thumb.right() - 1, thumb.bottom() - 1),
+        ] {
+            assert!(painted(&large[(x, y)]), "{x}, {y}");
+        }
+        assert!(!painted(&large[(thumb.x - 1, thumb.y)]));
+        assert!(!painted(&large[(thumb.right(), thumb.y)]));
+        assert_eq!(
+            thumbnailer.asked(),
+            ["notes.txt"],
+            "the file is drawn once; only the fitting is done again"
+        );
     }
 
     #[test]

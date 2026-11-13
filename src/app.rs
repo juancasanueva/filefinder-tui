@@ -10,6 +10,7 @@ use crate::model::{self, Entry, SortMode};
 use crate::places::{self, Place, Section};
 use crate::state::{self, Saved};
 use crate::system::System;
+use crate::thumbs::{Facts, Thumbs};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewMode {
@@ -143,6 +144,8 @@ pub struct Config {
     pub date_style: DateStyle,
     /// Where the view and tile size are remembered; `None` remembers nothing.
     pub state_dir: Option<PathBuf>,
+    /// What makes the thumbnails; `None` leaves every file its stand-in.
+    pub thumbs: Option<Thumbs>,
 }
 
 pub struct App {
@@ -165,6 +168,9 @@ pub struct App {
     pub page_rows: usize,
     /// Tiles across the grid last time, for Up and Down.
     pub grid_columns: usize,
+    pub thumbs: Option<Thumbs>,
+    /// What was read about the selected item for the details pane.
+    pub facts: Option<Facts>,
     state_dir: Option<PathBuf>,
     system: Box<dyn System>,
 }
@@ -194,6 +200,8 @@ impl App {
             date_style: config.date_style,
             page_rows: 10,
             grid_columns: 1,
+            thumbs: config.thumbs,
+            facts: None,
             state_dir: config.state_dir,
             system,
         };
@@ -248,6 +256,24 @@ impl App {
             .map(|(index, _)| index)
     }
 
+    /// What every turn of the event loop does besides keys: takes in the
+    /// thumbnails made since the last one, and reads what the details pane
+    /// says about a newly selected item, so that drawing never has to.
+    pub fn tick(&mut self) {
+        if let Some(thumbs) = &mut self.thumbs {
+            thumbs.collect();
+        }
+        let selected = self.panes[self.active].selected();
+        let current = match (&self.facts, selected) {
+            (Some(facts), Some(entry)) => facts.describes(entry),
+            (None, None) => true,
+            _ => false,
+        };
+        if !current {
+            self.facts = selected.map(Facts::read);
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         if self.help_visible {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
@@ -272,6 +298,7 @@ impl App {
             KeyCode::Home if alt => self.go_home(),
             KeyCode::F(5) => self.reload(),
             KeyCode::Backspace if plain => self.go_up(),
+            KeyCode::Char(' ') if plain => self.preview_selected(),
             KeyCode::Char('s') if plain => self.set_sort(self.sort.step(1)),
             KeyCode::Char('S') if plain => self.set_sort(self.sort.step(-1)),
             KeyCode::Char('1') if ctrl => self.set_view(ViewMode::Grid),
@@ -363,6 +390,15 @@ impl App {
             self.navigate(&path);
         } else if self.system.open(&path).is_err() {
             self.fail(format!("No app is set up to open {name}."));
+        }
+    }
+
+    /// Shows the selected item in a window of its own, or closes that window.
+    fn preview_selected(&mut self) {
+        let Some(entry) = self.selected() else { return };
+        let (path, name) = (entry.path.clone(), entry.name.clone());
+        if self.system.preview(&path).is_err() {
+            self.fail(format!("{name} couldn't be previewed."));
         }
     }
 
@@ -548,18 +584,28 @@ fn read_error(path: &Path, error: &io::Error) -> String {
 #[cfg(test)]
 pub mod testing {
     use super::*;
+    use crate::thumbs::testing::FakeThumbnailer;
     use std::cell::RefCell;
     use std::fs;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[derive(Clone, Default)]
     pub struct FakeSystem {
         pub opened: Rc<RefCell<Vec<PathBuf>>>,
+        /// Every call to `preview`: an open window is closed by the next one.
+        pub previewed: Rc<RefCell<Vec<PathBuf>>>,
     }
 
     impl System for FakeSystem {
         fn open(&self, path: &Path) -> io::Result<()> {
             self.opened.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        }
+
+        fn preview(&self, path: &Path) -> io::Result<()> {
+            self.previewed.borrow_mut().push(path.to_path_buf());
             Ok(())
         }
     }
@@ -573,6 +619,30 @@ pub mod testing {
 
     /// A home folder with `Documents/`, `Pictures/{Trip/, a.jpg}`, `notes.txt` and `.hidden`.
     pub fn fixture() -> Fixture {
+        fixture_with(None)
+    }
+
+    /// The fixture drawing real thumbnails: a fake thumbnailer shown through half blocks.
+    pub fn pictures() -> (Fixture, Arc<FakeThumbnailer>) {
+        let thumbnailer = Arc::new(FakeThumbnailer::default());
+        let thumbs = Thumbs::new(crate::thumbs::testing::picker(), thumbnailer.clone());
+        (fixture_with(Some(thumbs)), thumbnailer)
+    }
+
+    /// Lets the worker finish what the last frames asked for and takes it in.
+    pub fn settle(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.tick();
+            if app.thumbs.as_ref().is_none_or(Thumbs::is_idle) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the thumbnails never arrived");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn fixture_with(thumbs: Option<Thumbs>) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
         fs::create_dir(home.join("Documents")).unwrap();
@@ -586,6 +656,7 @@ pub mod testing {
             start: home.clone(),
             date_style: DateStyle::MonthFirst,
             state_dir: None,
+            thumbs,
         };
         let mut app = App::new(config, Box::new(system.clone()));
         // The tests written against the list keep it; the others switch with Ctrl+1 or Ctrl+3.
@@ -605,6 +676,7 @@ pub mod testing {
             start: home.to_path_buf(),
             date_style: DateStyle::MonthFirst,
             state_dir: state_dir.map(Path::to_path_buf),
+            thumbs: None,
         };
         App::new(config, Box::new(FakeSystem::default()))
     }
@@ -676,6 +748,7 @@ mod tests {
             start: f.home.join("notes.txt"),
             date_style: DateStyle::MonthFirst,
             state_dir: None,
+            thumbs: None,
         };
         let app = App::new(config, Box::new(FakeSystem::default()));
         assert_eq!(app.pane().cwd, f.home);
@@ -1077,6 +1150,63 @@ mod tests {
         assert!(f.app.pane().ancestors.is_empty());
         f.app.handle_key(ctrl(KeyCode::Char('3')));
         assert_eq!(f.app.pane().ancestors.len(), 1);
+    }
+
+    #[test]
+    fn space_previews_the_selected_file_and_again_closes_it() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::End, KeyCode::Char(' ')]);
+        assert_eq!(*f.system.previewed.borrow(), [f.home.join("notes.txt")]);
+        assert!(f.system.opened.borrow().is_empty(), "nothing is opened");
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(f.app.message, None);
+        // The port closes the window it has open when it is asked again.
+        press(&mut f.app, &[KeyCode::Char(' ')]);
+        assert_eq!(f.system.previewed.borrow().len(), 2);
+    }
+
+    #[test]
+    fn space_with_nothing_selected_does_nothing() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Documents"));
+        assert!(f.app.selected().is_none());
+        press(&mut f.app, &[KeyCode::Char(' ')]);
+        assert!(f.system.previewed.borrow().is_empty());
+        assert_eq!(f.app.message, None);
+    }
+
+    #[test]
+    fn the_newest_thumbnails_asked_for_are_made_first() {
+        let (mut f, thumbnailer) = pictures();
+        for name in ["a", "b", "c", "d", "e", "f", "g"] {
+            fs::write(f.home.join(format!("{name}.txt")), name).unwrap();
+        }
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        press(&mut f.app, &[KeyCode::F(5)]);
+        thumbnailer.hold();
+        // The first page asks for a.txt to g.txt; the last one for e.txt to notes.txt.
+        crate::ui::testing::screen(&mut f.app, 120, 24);
+        press(&mut f.app, &[KeyCode::End]);
+        crate::ui::testing::screen(&mut f.app, 120, 24);
+        thumbnailer.release();
+        settle(&mut f.app);
+
+        let asked = thumbnailer.asked();
+        assert_eq!(asked.len(), 8, "each file once: {asked:?}");
+        // The one the worker had already picked up aside, what is on screen now
+        // doesn't wait behind what scrolled away.
+        let rest = &asked[1..];
+        let place = |name: &str| rest.iter().position(|asked| asked == name);
+        for showing in ["e.txt", "f.txt", "g.txt", "notes.txt"] {
+            for scrolled_away in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+                if let (Some(showing), Some(scrolled_away)) = (place(showing), place(scrolled_away))
+                {
+                    assert!(showing < scrolled_away, "{asked:?}");
+                }
+            }
+        }
+        assert_eq!(place("notes.txt").or(Some(0)), Some(0), "{asked:?}");
     }
 
     #[test]

@@ -9,14 +9,18 @@ mod sidebar;
 mod topbar;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui_image::Image;
+use ratatui_image::protocol::Protocol;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Focus, ViewMode};
+use crate::model::Entry;
 use crate::theme;
+use crate::thumbs::Thumbs;
 
 const SIDEBAR_WIDTH: u16 = 24;
 const DETAILS_WIDTH: u16 = 34;
@@ -24,6 +28,9 @@ const DETAILS_WIDTH: u16 = 34;
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(theme::base()), area);
+    if let Some(thumbs) = &mut app.thumbs {
+        thumbs.cover(app.help_visible);
+    }
 
     let [top, body] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
     topbar::draw(frame, app, top);
@@ -50,6 +57,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(block, side);
         sidebar::draw(frame, app, inner);
     }
+    draw_files(frame, app, files);
+    // After the files: the selected item's big picture is asked for last, so
+    // it is the first one made.
     if details.width > 0 {
         let block = Block::new()
             .borders(Borders::LEFT)
@@ -58,7 +68,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(block, details);
         details::draw(frame, app, inner);
     }
-    draw_files(frame, app, files);
 
     if app.help_visible {
         help::draw(frame, area);
@@ -87,6 +96,43 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
         let text = fit(&format!("  {}", note.text), message.width as usize);
         frame.render_widget(Paragraph::new(Line::from(text)).style(style), message);
     }
+}
+
+/// Draws a file's picture in the middle of `rect`, as much of it as is inside
+/// `visible` (the bottom edge of a view may cut `rect` short). False when the
+/// file has no picture to show, at least not yet: the caller draws a stand-in.
+/// Nothing is read or decoded here; a picture that isn't ready is asked for.
+pub fn picture(
+    frame: &mut Frame,
+    thumbs: Option<&mut Thumbs>,
+    entry: &Entry,
+    rect: Rect,
+    visible: Rect,
+) -> bool {
+    let Some(thumbs) = thumbs else { return false };
+    let size = Size::new(rect.width, rect.height);
+    let Some(protocol) = thumbs.get(&entry.path, entry.modified, size) else {
+        return false;
+    };
+    let size = protocol.size();
+    let whole = Rect {
+        x: rect.x + rect.width.saturating_sub(size.width) / 2,
+        y: rect.y + rect.height.saturating_sub(size.height) / 2,
+        width: size.width.min(rect.width),
+        height: size.height.min(rect.height),
+    };
+    let showing = whole.intersection(visible);
+    if showing == whole {
+        frame.render_widget(Image::new(protocol), whole);
+    } else if matches!(protocol, Protocol::Kitty(_) | Protocol::Halfblocks(_)) {
+        // These two can show the top of a picture; the others show all or nothing.
+        if !showing.is_empty() {
+            frame.render_widget(Image::new(protocol).allow_clipping(true), showing);
+        }
+    } else {
+        return false;
+    }
+    true
 }
 
 /// Where a view has to start for the cursor's row to be among the `rows` it shows.
@@ -272,6 +318,7 @@ mod tests {
             ),
             ("Ctrl+I", "Show or hide the details pane"),
             ("Ctrl+H", "Show hidden files"),
+            ("Space", "Preview the selected file"),
         ] {
             let line = format!("{keys:<26}{does}");
             assert!(all.contains(&line), "{line} is missing from\n{all}");

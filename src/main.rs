@@ -8,10 +8,12 @@ mod places;
 mod state;
 mod system;
 mod theme;
+mod thumbs;
 mod ui;
 
-use std::io::{self, stdout};
+use std::io::{self, Write, stdout};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
@@ -21,10 +23,12 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::supports_keyboard_enhancement;
+use ratatui_image::picker::Picker;
 
 use app::{App, Config};
 use format::DateStyle;
 use system::MacSystem;
+use thumbs::{MacThumbnailer, Thumbs};
 
 fn main() -> io::Result<()> {
     let home = std::env::var_os("HOME")
@@ -35,15 +39,18 @@ fn main() -> io::Result<()> {
         None => std::env::current_dir().unwrap_or_else(|_| home.clone()),
     };
     icons::init_from_env();
+
+    let mut terminal = ratatui::init();
+    let picker = query_picker();
+    let thumbnailer = MacThumbnailer::new(&home.join("Library/Caches/filefinder-tui"));
     let config = Config {
         state_dir: Some(home.join(".config/filefinder-tui")),
+        thumbs: Some(Thumbs::new(picker, Arc::new(thumbnailer))),
         home,
         start,
         date_style: DateStyle::from_env(),
     };
-    let mut app = App::new(config, Box::new(MacSystem));
-
-    let mut terminal = ratatui::init();
+    let mut app = App::new(config, Box::new(MacSystem::default()));
     // Tells Ctrl+I from Tab and Ctrl+Shift+N from Ctrl+N, where the terminal can.
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     if enhanced {
@@ -63,10 +70,31 @@ fn main() -> io::Result<()> {
     result
 }
 
+/// Asks the terminal how it shows pictures. It has to be asked before any key
+/// is read; one that doesn't say gets them as colored half blocks.
+fn query_picker() -> Picker {
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    if picker.capabilities().is_empty() {
+        // The terminal said nothing useful. When it said nothing at all (tmux
+        // with nobody attached passes the question on to no one) the picker
+        // gave up and left its reader waiting on the keyboard, where it would
+        // take the next thing typed. A status report, which tmux and every
+        // terminal answer themselves, is what that reader is waiting for; it
+        // holds the lock on the standard input until it has read it.
+        let mut out = stdout();
+        if out.write_all(b"\x1b[5n").and_then(|()| out.flush()).is_ok() {
+            drop(io::stdin().lock());
+        }
+    }
+    picker
+}
+
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     while !app.should_quit {
+        app.tick();
         terminal.draw(|frame| ui::draw(frame, app))?;
-        if event::poll(Duration::from_millis(250))?
+        // Short enough for thumbnails to show up as they are made.
+        if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind != KeyEventKind::Release
         {
