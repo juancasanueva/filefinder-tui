@@ -33,7 +33,7 @@ cargo run --release -- ~/Pictures
 cargo run --release -- ~/Pictures/photo.jpg   # opens its folder with the file selected
 ```
 
-To install it on your `PATH`: `cargo install --path .`, then run `filefinder`.
+To install it on your `PATH`: `cargo install --path .`, then run `filefinder-tui`.
 
 ## Keys
 
