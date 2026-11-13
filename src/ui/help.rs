@@ -19,16 +19,23 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Backspace", "Go to the parent folder"),
     ("Alt+← / Alt+→", "Back / forward"),
     ("Alt+Home", "Go home"),
+    ("Ctrl+1 / 2 / 3", "Switch the view: grid, list, columns"),
+    (
+        "Ctrl+= / Ctrl+- / Ctrl+0",
+        "Bigger, smaller or normal tiles",
+    ),
+    ("Ctrl+I", "Show or hide the details pane"),
     ("S / Shift+S", "Sort: name, kind, newest, oldest, size"),
+    ("Ctrl+H", "Show hidden files"),
     ("F5", "Reload"),
     ("?", "Show these shortcuts"),
     ("Q", "Close the window"),
 ];
 
-const KEY_WIDTH: usize = 24;
+const KEY_WIDTH: usize = 26;
 
 pub fn draw(frame: &mut Frame, area: Rect) {
-    let width = 84.min(area.width.saturating_sub(4));
+    let width = 86.min(area.width.saturating_sub(4));
     let height = (SHORTCUTS.len() as u16 + 6).min(area.height.saturating_sub(2));
     let overlay = Rect {
         x: area.x + (area.width - width) / 2,

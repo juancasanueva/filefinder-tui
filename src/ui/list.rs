@@ -8,7 +8,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::{pad, pad_left};
+use super::{icon_style, pad, pad_left, row_style, scroll};
 use crate::app::App;
 use crate::format;
 use crate::icons::Icon;
@@ -28,11 +28,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 
     // One blank row of air on top, like folio's panels.
     let rows = area.height.saturating_sub(1) as usize;
-    if pane.cursor < pane.offset {
-        pane.offset = pane.cursor;
-    } else if rows > 0 && pane.cursor >= pane.offset + rows {
-        pane.offset = pane.cursor + 1 - rows;
-    }
+    pane.offset = scroll(pane.offset, pane.cursor, rows);
 
     let width = area.width as usize;
     // The date steps aside first when it gets narrow, then the size.
@@ -46,18 +42,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let mut lines = vec![Line::default()];
     for (index, entry) in pane.entries.iter().enumerate().skip(pane.offset).take(rows) {
         let selected = index == pane.cursor;
-        let row = match (selected, focused) {
-            (true, true) => theme::selected(),
-            (true, false) => theme::selected_inactive(),
-            _ => theme::base(),
-        };
-        let icon = if selected && focused {
-            row
-        } else if entry.is_dir {
-            row.fg(theme::ACCENT)
-        } else {
-            row.fg(theme::DIM)
-        };
+        let row = row_style(selected, focused);
+        let icon = icon_style(row, entry.is_dir, selected && focused);
         let meta = if selected { row } else { row.fg(theme::DIM) };
 
         let mut spans = vec![

@@ -5,6 +5,7 @@ mod format;
 mod icons;
 mod model;
 mod places;
+mod state;
 mod system;
 mod theme;
 mod ui;
@@ -35,6 +36,7 @@ fn main() -> io::Result<()> {
     };
     icons::init_from_env();
     let config = Config {
+        state_dir: Some(home.join(".config/filefinder-tui")),
         home,
         start,
         date_style: DateStyle::from_env(),

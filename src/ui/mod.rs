@@ -1,6 +1,8 @@
 //! Drawing: one function per region of the window.
 
+mod columns;
 mod details;
+mod grid;
 mod help;
 mod list;
 mod sidebar;
@@ -8,11 +10,12 @@ mod topbar;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, ViewMode};
 use crate::theme;
 
 const SIDEBAR_WIDTH: u16 = 24;
@@ -67,8 +70,13 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
     let [view, message] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(band)]).areas(area);
     let focused = app.focus == Focus::Files;
+    // Lists show one blank row of air on top; the grid counts its own rows.
     app.page_rows = view.height.saturating_sub(1).max(1) as usize;
-    list::draw(frame, app, view, focused);
+    match app.view {
+        ViewMode::Grid => grid::draw(frame, app, view, focused),
+        ViewMode::List => list::draw(frame, app, view, focused),
+        ViewMode::Columns => columns::draw(frame, app, view, focused),
+    }
 
     if let Some(note) = &app.message {
         let style = if note.is_error {
@@ -78,6 +86,37 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         let text = fit(&format!("  {}", note.text), message.width as usize);
         frame.render_widget(Paragraph::new(Line::from(text)).style(style), message);
+    }
+}
+
+/// Where a view has to start for the cursor's row to be among the `rows` it shows.
+pub fn scroll(offset: usize, cursor: usize, rows: usize) -> usize {
+    if cursor < offset {
+        cursor
+    } else if rows > 0 && cursor >= offset + rows {
+        cursor + 1 - rows
+    } else {
+        offset
+    }
+}
+
+/// A row of a list: the selected one is lit where the keyboard is, grey elsewhere.
+pub fn row_style(selected: bool, focused: bool) -> Style {
+    match (selected, focused) {
+        (true, true) => theme::selected(),
+        (true, false) => theme::selected_inactive(),
+        _ => theme::base(),
+    }
+}
+
+/// The glyph in front of a row: folders in accent, files dim, the lit row all one color.
+pub fn icon_style(row: Style, is_dir: bool, lit: bool) -> Style {
+    if lit {
+        row
+    } else if is_dir {
+        row.fg(theme::ACCENT)
+    } else {
+        row.fg(theme::DIM)
     }
 }
 
@@ -121,12 +160,19 @@ pub mod testing {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use std::ops::Range;
+
+    /// Draws the app at a size and returns the cells, for tests that look at colors.
+    pub fn buffer(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
 
     /// Draws the app at a size and returns the screen as lines of text.
     pub fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        let buffer = buffer(app, width, height);
         (0..height)
             .map(|y| {
                 (0..width)
@@ -135,13 +181,34 @@ pub mod testing {
             })
             .collect()
     }
+
+    /// The first cell, reading down the screen, where a piece of text starts
+    /// within a range of columns.
+    pub fn find(buffer: &Buffer, text: &str, columns: Range<u16>) -> Option<(u16, u16)> {
+        let cells: Vec<&str> = text.split_inclusive(|_| true).collect();
+        let last = columns.end.min(buffer.area.width);
+        (0..buffer.area.height).find_map(|y| {
+            columns
+                .clone()
+                .find(|x| {
+                    let end = x + cells.len() as u16;
+                    end <= last
+                        && cells
+                            .iter()
+                            .zip(*x..end)
+                            .all(|(cell, x)| buffer[(x, y)].symbol() == *cell)
+                })
+                .map(|x| (x, y))
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::testing::screen;
+    use super::testing::{buffer, find};
     use super::*;
-    use crate::app::testing::{fixture, press};
+    use crate::app::testing::{ctrl, fixture, press};
     use ratatui::crossterm::event::KeyCode;
 
     #[test]
@@ -196,5 +263,60 @@ mod tests {
         let all = screen(&mut f.app, 120, 40).join("\n");
         assert!(all.contains("Keyboard shortcuts"));
         assert!(all.contains("Go to the parent folder"));
+        for (keys, does) in [
+            ("Ctrl+1 / 2 / 3", "Switch the view: grid, list, columns"),
+            ("→ / ←", "In list and columns: into a folder / back out"),
+            (
+                "Ctrl+= / Ctrl+- / Ctrl+0",
+                "Bigger, smaller or normal tiles",
+            ),
+            ("Ctrl+I", "Show or hide the details pane"),
+            ("Ctrl+H", "Show hidden files"),
+        ] {
+            let line = format!("{keys:<26}{does}");
+            assert!(all.contains(&line), "{line} is missing from\n{all}");
+        }
+    }
+
+    #[test]
+    fn ctrl_1_2_3_draw_the_grid_the_list_and_the_columns() {
+        let mut f = fixture();
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        let grid = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&grid, "▦", 0..120).map(|(_, y)| y), Some(0));
+        assert_eq!(find(&grid, "notes.txt", 24..86), Some((71, 10)));
+
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        let list = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&list, "≡", 0..120).map(|(_, y)| y), Some(0));
+        assert_eq!(find(&list, "notes.txt", 24..86), Some((28, 5)));
+        assert_eq!(find(&list, "5 B", 24..86).map(|(_, y)| y), Some(5));
+
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        let columns = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&columns, "▥", 0..120).map(|(_, y)| y), Some(0));
+        assert_eq!(find(&columns, "notes.txt", 24..86), Some((28, 5)));
+        assert_eq!(find(&columns, "5 B", 24..86), None);
+        assert_eq!(find(&columns, "›", 24..86), Some((48, 3)));
+    }
+
+    #[test]
+    fn the_top_bar_lights_the_hidden_and_details_toggles_that_are_on() {
+        let mut f = fixture();
+        let before = buffer(&mut f.app, 120, 24);
+        let (hidden, _) = find(&before, "◉", 0..120).unwrap();
+        let (details, _) = find(&before, "◨", 0..120).unwrap();
+        assert_eq!(before[(hidden, 0)].bg, theme::BACKGROUND);
+        assert_eq!(before[(details, 0)].bg, theme::SELECTION);
+        assert!(find(&before, "Modified", 86..120).is_some());
+        assert_eq!(find(&before, ".hidden", 24..86), None);
+
+        f.app.handle_key(ctrl(KeyCode::Char('h')));
+        f.app.handle_key(ctrl(KeyCode::Char('i')));
+        let after = buffer(&mut f.app, 120, 24);
+        assert_eq!(after[(hidden, 0)].bg, theme::SELECTION);
+        assert_eq!(after[(details, 0)].bg, theme::BACKGROUND);
+        assert_eq!(find(&after, "Modified", 0..120), None);
+        assert_eq!(find(&after, ".hidden", 24..120), Some((28, 5)));
     }
 }

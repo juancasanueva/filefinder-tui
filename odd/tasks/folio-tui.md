@@ -20,7 +20,7 @@ Assumptions (mine, not the user's words; macOS and terminal adaptations of the L
 
 - **A1** "Real previews" use terminal graphics through `ratatui-image` (kitty protocol in Ghostty/kitty/WezTerm, sixel or iTerm2 elsewhere, half-blocks as the fallback). Non-image thumbnails come from Quick Look (`qlmanage -t`), the macOS counterpart of installed thumbnailers.
 - **A2** Space opens Quick Look (`qlmanage -p`), the macOS "own window" preview. Enter opens with `open`.
-- **A3** Sidebar on macOS: Home folders, Pinned (stored in `~/Library/Application Support/filefinder/pinned`), Recents (Spotlight `mdfind`), Trash (`~/.Trash`), Drives (`/Volumes`). Hidden means dotfiles plus the macOS `UF_HIDDEN` flag.
+- **A3** Sidebar on macOS: Home folders, Pinned (stored in `~/.config/filefinder-tui/pinned`), Recents (Spotlight `mdfind`), Trash (`~/.Trash`), Drives (`/Volumes`). Hidden means dotfiles plus the macOS `UF_HIDDEN` flag.
 - **A4** Out of scope: plugins, tailnet/SFTP, Dropbox/Taildrop/LocalSend sharing, translations, "New window" (a TUI lives in one terminal window), drag and drop, rubber-band selection, Omarchy theme following.
 - **A5** Mac keyboards have no forward Delete key: fn+⌫ sends Delete; ⌘⌫ is also accepted when the terminal forwards it. Ghostty sends Alt+←/→ as Alt+B/Alt+F by default, so both spellings are accepted.
 - **A6** Ctrl+1/2/3, Ctrl+I, Ctrl+Shift+letter chords are only distinguishable in terminals with the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2); the app enables it when available.
@@ -28,16 +28,16 @@ Assumptions (mine, not the user's words; macOS and terminal adaptations of the L
 
 ## Tasks
 
-- [ ] **T1** S1 S2 S8 — scaffold, theme, folder model, shell (top bar, Home sidebar, list view, details text), navigation and history, help overlay, quit. Route: inline. Commit: —
-- [ ] **T2** S3 S9 — grid and columns views, Ctrl+1/2/3, sort, hidden files, reload, details toggle, tile sizes. Route: inline. Commit: —
-- [ ] **T3** S3 S4 — thumbnails and details preview (ratatui-image, Quick Look thumbnails), text opening lines, Space preview. Route: inline. Commit: —
-- [ ] **T4** S6 S8 S9 — file operations: copy/cut/paste without overwriting, rename, duplicate, new folder, trash, delete permanently, copy path, undo/redo, status band. Route: inline. Commit: —
-- [ ] **T5** S5 S8 S9 — sidebar Pinned / Recents / Trash / Drives, Tab focus cycle, pin and unpin. Route: inline. Commit: —
-- [ ] **T6** S8 — Ctrl+L path entry with Tab completion, `/` search here and below. Route: inline. Commit: —
-- [ ] **T7** S7 S9 — split panes, multi-select (Shift+arrows, Ctrl+A). Route: inline. Commit: —
-- [ ] **T8** S6 — context menu (Alt+Enter), compress, mouse (click, double-click, scroll, right-click). Route: inline. Commit: —
+- [x] **T1** S1 S2 S8 — scaffold, theme, folder model, shell (top bar, Home sidebar, list view, details text), navigation and history, sort (S / Shift+S), reload (F5), help overlay, quit. Route: inline. Commit: f3910ce (34 tests green, clippy clean, smoke-run in tmux)
+- [ ] **T2** S3 S9 — grid and columns views, Ctrl+1/2/3, sort, hidden files, reload, details toggle, tile sizes. Route: delegated (context backstop). Commit: —
+- [ ] **T3** S3 S4 — thumbnails and details preview (ratatui-image, Quick Look thumbnails), text opening lines, Space preview. Route: delegated (context backstop). Commit: —
+- [ ] **T4** S6 S8 S9 — file operations: copy/cut/paste without overwriting, rename, duplicate, new folder, trash, delete permanently, copy path, undo/redo, status band. Route: delegated (context backstop). Commit: —
+- [ ] **T5** S5 S8 S9 — sidebar Pinned / Recents / Trash / Drives, Tab focus cycle, pin and unpin. Route: delegated (context backstop). Commit: —
+- [ ] **T6** S8 — Ctrl+L path entry with Tab completion, `/` search here and below. Route: delegated (context backstop). Commit: —
+- [ ] **T7** S7 S9 — split panes, multi-select (Shift+arrows, Ctrl+A). Route: delegated (context backstop). Commit: —
+- [ ] **T8** S6 — context menu (Alt+Enter), compress, mouse (click, double-click, scroll, right-click). Route: delegated (context backstop). Commit: —
 
-Route evidence: every task shares `src/app.rs`, so units are not disjoint and no Writer trigger holds; all inline.
+Route evidence: T1 inline. From T2 on, one bounded writer per task, one at a time in the same tree: Writer trigger (b), the long-session context backstop (the parent session passed roughly 150k tokens during T1). Tasks share `src/app.rs`, so they never run in parallel; the parent owns git.
 
 ## Log
 
@@ -45,3 +45,6 @@ Route evidence: every task shares `src/app.rs`, so units are not disjoint and no
 - **L2** (2026-11-13) Explored folio: README, `plans/folio.md`, `docs/*.png`, `src/HelpOverlay.qml`, `src/theme.cpp`, `src/SortMenu.qml`, `src/i18n/en.json`. It is C++/Qt Quick for Linux, so this is a port of looks and behavior, not of code.
 - **L3** (2026-11-13) No Rust toolchain was installed; installed `rustup` with Homebrew (keg-only, not on PATH) and `stable` (rustc 1.100.0). Dependencies: ratatui 0.30.2, ratatui-image 11.1.0 (without the `chafa` feature, which needs a system library), image 0.25, trash 5.3, chrono 0.4.
 - **L4** (2026-11-13) Forecast: about 4,000 authored lines across T1–T8, far above one 400-line slice; strategy `exception-ok` recorded in the header, one commit per task.
+- **L5** (2026-11-13) T1 done in f3910ce. Native assess over 7fcee92..f3910ce: risk medium, review not due (`under_budget`).
+- **L6** (2026-11-13) Trash probe on this Mac, terminal without Full Disk Access: moving a file into `~/.Trash` works, `stat` and moving a known path back out work, listing `~/.Trash` is refused. Decision for T4/T5: trash is a rename into `~/.Trash/<unique name>` (undo is the rename back, no `trash` crate), and the sidebar Trash shows "Permission was refused." with a Full Disk Access hint when it can't be listed. The probe file was moved back and removed.
+- **L7** (2026-11-13) Decisions carried by T1 that later tasks must keep: `System` trait in `src/system.rs` is the only port to the outside (tests use `app::testing::FakeSystem`); `App::handle_key` is the public interface tests drive; `ui::testing::screen` renders to text; `model` and `format` hold no terminal types; the home folder and start folder are injected through `app::Config`.

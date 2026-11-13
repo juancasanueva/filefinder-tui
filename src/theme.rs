@@ -59,6 +59,21 @@ pub fn selected_inactive() -> Style {
     Style::new().fg(BRIGHT_FOREGROUND).bg(LIGHTER_BACKGROUND)
 }
 
+/// The selected tile's frame and name: the selection's color with nothing behind it.
+pub fn selected_tile(focused: bool) -> Style {
+    if focused { accent() } else { bright() }
+}
+
+/// A folder card or a file's stand-in box, and the dim marks on it.
+pub fn card() -> Style {
+    Style::new().fg(DIM).bg(LIGHTER_BACKGROUND)
+}
+
+/// The tab on top of a folder card, drawn with half blocks.
+pub fn card_tab() -> Style {
+    Style::new().fg(LIGHTER_BACKGROUND)
+}
+
 pub fn button() -> Style {
     Style::new()
         .fg(ON_ACCENT)
