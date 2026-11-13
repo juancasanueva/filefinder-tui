@@ -946,6 +946,11 @@ impl App {
             KeyCode::Char('w') if ctrl => self.close_split(),
             // Shift is what it takes to type the bar, so it may come along.
             KeyCode::Char('|') if plain => self.toggle_split(),
+            // Option+1 is the bar on a Spanish Mac keyboard; with Option sent
+            // as Alt, it arrives as Alt+1.
+            KeyCode::Char('1') if alt && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.toggle_split()
+            }
             KeyCode::Esc => self.escape(),
             KeyCode::Tab => self.move_focus(1),
             KeyCode::BackTab => self.move_focus(-1),
@@ -5157,6 +5162,24 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('w')));
         f.app.handle_key(ctrl(KeyCode::Char('l')));
         press(&mut f.app, &[KeyCode::Char('|')]);
+        assert_eq!(f.app.panes.len(), 1);
+    }
+
+    #[test]
+    fn alt_1_splits_and_closes_like_the_bar() {
+        // On a Spanish Mac keyboard the bar is Option+1; with Option sent as
+        // Alt, the app gets Alt+1 instead.
+        let mut f = fixture();
+        f.app.handle_key(alt(KeyCode::Char('1')));
+        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        f.app.handle_key(alt(KeyCode::Char('1')));
+        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+
+        // Ctrl+1 still means the grid, and splits nothing.
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        assert_eq!(f.app.view, ViewMode::Grid);
         assert_eq!(f.app.panes.len(), 1);
     }
 

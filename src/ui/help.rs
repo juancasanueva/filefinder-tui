@@ -19,7 +19,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("→ / ←", "In list and columns: into a folder / back out"),
     (
         "| or Ctrl+Alt+N / Ctrl+W",
-        "Split into two panes / close the right one",
+        "Split into two panes / close the right one (or Alt+1)",
     ),
     (
         "Tab / Shift+Tab",

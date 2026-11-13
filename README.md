@@ -8,7 +8,7 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 - **Details pane**: a large preview, the kind and size, the modified date, picture dimensions, and the opening lines of text files. Space opens Quick Look.
 - **Sidebar**: every folder in your home, pinned folders, Recents (from Spotlight), the Trash with Restore and Empty Trash, and mounted drives.
 - **File operations** that never overwrite: copy, cut, paste, duplicate, rename, new folder, compress, move to the trash, and delete permanently after asking. Everything except a permanent delete can be undone.
-- **Split** the window in two with `|` (or the ◫ icon in the top bar) to move things between folders; the same key or icon closes it again.
+- **Split** the window in two with `|` or Alt+1 (or the ◫ icon in the top bar) to move things between folders; the same key or icon closes it again.
 - **Search** this folder and below with `/`, or type a path with Ctrl+L.
 - **Mouse friendly**: click, double-click, right-click for the menu, Shift+click for a range.
 
@@ -55,7 +55,7 @@ To install it on your `PATH`: `cargo install --path .`, then run `filefinder-tui
 | Shift+Delete | Delete permanently (asks first) |
 | Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y | Undo, redo |
 | Ctrl+P | Pin or unpin the folder |
-| `\|` | Split into two panes, or close the right one |
+| `\|` or Alt+1 | Split into two panes, or close the right one (on a Spanish Mac keyboard `\|` is Option+1) |
 | Ctrl+Alt+N, Ctrl+W | Split into two panes, close the right one |
 | Tab, Shift+Tab | Sidebar, panes and details |
 | Ctrl+1 / 2 / 3 | Grid, list, columns |
