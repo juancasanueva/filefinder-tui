@@ -1,0 +1,12 @@
+[package]
+name = "filefinder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+ratatui = "0.30.2"
+unicode-width = "0.2.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
