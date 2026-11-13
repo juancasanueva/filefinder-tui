@@ -248,6 +248,7 @@ pub enum Toggle {
     View,
     Sort,
     Hidden,
+    Split,
     Details,
 }
 
@@ -943,6 +944,8 @@ impl App {
                 self.split()
             }
             KeyCode::Char('w') if ctrl => self.close_split(),
+            // Shift is what it takes to type the bar, so it may come along.
+            KeyCode::Char('|') if plain => self.toggle_split(),
             KeyCode::Esc => self.escape(),
             KeyCode::Tab => self.move_focus(1),
             KeyCode::BackTab => self.move_focus(-1),
@@ -1191,6 +1194,7 @@ impl App {
             }),
             Toggle::Sort => self.set_sort(self.sort.step(1)),
             Toggle::Hidden => self.toggle_hidden(),
+            Toggle::Split => self.toggle_split(),
             Toggle::Details => self.toggle_details(),
         }
     }
@@ -2205,6 +2209,15 @@ impl App {
         } else {
             // Why was said; a pane with nothing to show is no use.
             self.panes.pop();
+        }
+    }
+
+    /// `|` and the split switch in the top bar: two panes, or back to one.
+    fn toggle_split(&mut self) {
+        if self.panes.len() > 1 {
+            self.close_split();
+        } else {
+            self.split();
         }
     }
 
@@ -5120,6 +5133,34 @@ mod tests {
     }
 
     #[test]
+    fn a_bar_opens_a_second_pane_and_closes_it_again() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+
+        press(&mut f.app, &[KeyCode::Char('|')]);
+        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        assert_eq!(f.app.pane().cwd, pictures);
+
+        // Pressed again it closes the right pane, as Ctrl+W does.
+        press(&mut f.app, &[KeyCode::Char('|')]);
+        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+
+        // Some terminals send the bar with Shift held, since it takes Shift to type.
+        f.app
+            .handle_key(KeyEvent::new(KeyCode::Char('|'), KeyModifiers::SHIFT));
+        assert_eq!(f.app.panes.len(), 2);
+
+        // In a text field it is just a character.
+        f.app.handle_key(ctrl(KeyCode::Char('w')));
+        f.app.handle_key(ctrl(KeyCode::Char('l')));
+        press(&mut f.app, &[KeyCode::Char('|')]);
+        assert_eq!(f.app.panes.len(), 1);
+    }
+
+    #[test]
     fn ctrl_alt_n_splits_the_window_in_two_and_ctrl_w_closes_the_right_pane() {
         let mut f = fixture();
         let pictures = f.home.join("Pictures");
@@ -7094,6 +7135,23 @@ mod mouse_tests {
         let details = spot(&mut f.app, "◨", 86..120);
         click(&mut f.app, details);
         assert!(!f.app.details_visible);
+    }
+
+    #[test]
+    fn the_split_toggle_opens_and_closes_the_second_pane_and_is_lit_while_split() {
+        let mut f = fixture();
+        let toggle = spot(&mut f.app, "◫", 86..120);
+        assert_eq!(draw(&mut f.app)[toggle].bg, crate::theme::BACKGROUND);
+
+        click(&mut f.app, toggle);
+        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(f.app.active, 1);
+        assert_eq!(draw(&mut f.app)[toggle].bg, crate::theme::SELECTION);
+
+        click(&mut f.app, toggle);
+        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(f.app.active, 0);
+        assert_eq!(draw(&mut f.app)[toggle].bg, crate::theme::BACKGROUND);
     }
 
     fn said(app: &App) -> Option<&str> {

@@ -18,7 +18,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+A", "Select everything"),
     ("→ / ←", "In list and columns: into a folder / back out"),
     (
-        "Ctrl+Alt+N / Ctrl+W",
+        "| or Ctrl+Alt+N / Ctrl+W",
         "Split into two panes / close the right one",
     ),
     (

@@ -41,7 +41,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     } else {
         draw_crumbs(frame, app, path, hits);
     }
-    let switches = [Toggle::View, Toggle::Sort, Toggle::Hidden, Toggle::Details];
+    let switches = [
+        Toggle::View,
+        Toggle::Sort,
+        Toggle::Hidden,
+        Toggle::Split,
+        Toggle::Details,
+    ];
     let mut x = right.x;
     for (span, switch) in toggles.iter().zip(switches) {
         let width = span.content.width() as u16;
@@ -174,7 +180,7 @@ fn field(frame: &mut Frame, area: Rect, lead: &str, input: &Input, typing: bool)
     }
 }
 
-/// View, sort, hidden files and details; the ones switched on are lit.
+/// View, sort, hidden files, split and details; the ones switched on are lit.
 fn toggles(app: &App) -> Vec<Span<'static>> {
     let view = match app.view {
         ViewMode::Grid => "▦",
@@ -186,6 +192,7 @@ fn toggles(app: &App) -> Vec<Span<'static>> {
         Span::styled(format!(" {view} "), theme::base()),
         Span::styled(" ⇅ ", theme::base()),
         Span::styled(" ◉ ", lit(app.show_hidden)),
+        Span::styled(" ◫ ", lit(app.panes.len() > 1)),
         Span::styled(" ◨ ", lit(app.details_visible)),
     ]
 }
@@ -278,7 +285,7 @@ mod tests {
         assert_eq!(find(&drawn, "~/Pictures ", 0..120), Some((2, 0)));
         assert_eq!(find(&drawn, "~ / Pictures", 0..120), None);
         // Accent on a lighter ground, as far as the toggles: it reads as a field.
-        for x in [2, 11, 12, 60, 105] {
+        for x in [2, 11, 12, 60, 102] {
             assert_eq!(drawn[(x, 0)].fg, theme::ACCENT, "{x}");
             assert_eq!(drawn[(x, 0)].bg, theme::LIGHTER_BACKGROUND, "{x}");
         }
@@ -308,11 +315,11 @@ mod tests {
         let mut f = fixture();
         f.app.handle_key(ctrl(KeyCode::Char('l')));
         type_text(&mut f.app, &"/abcdefghi".repeat(6));
-        // 27 cells of bar, 13 of them the toggles: a field of 11, the last
+        // 30 cells of bar, 16 of them the toggles: a field of 11, the last
         // of them for the cursor.
-        let lines = screen(&mut f.app, 27, 10);
+        let lines = screen(&mut f.app, 30, 10);
         assert!(lines[0].starts_with("  /abcdefghi  "), "{}", lines[0]);
-        assert_eq!(cursor(&mut f.app, 27, 10), (12, 0));
+        assert_eq!(cursor(&mut f.app, 30, 10), (12, 0));
     }
 
     #[test]

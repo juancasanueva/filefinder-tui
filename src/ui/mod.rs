@@ -775,7 +775,7 @@ mod tests {
         let all = screen(&mut f.app, 120, 40).join("\n");
         for (keys, does) in [
             (
-                "Ctrl+Alt+N / Ctrl+W",
+                "| or Ctrl+Alt+N / Ctrl+W",
                 "Split into two panes / close the right one",
             ),
             (
