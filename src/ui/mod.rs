@@ -363,6 +363,24 @@ mod tests {
     }
 
     #[test]
+    fn the_help_overlay_lists_the_sidebar_shortcuts() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        let all = screen(&mut f.app, 120, 40).join("\n");
+        for (keys, does) in [
+            ("Ctrl+P", "Pin or unpin the folder"),
+            ("Delete in the sidebar", "Unpin the folder"),
+        ] {
+            let line = format!("{keys:<26}{does}");
+            assert!(all.contains(&line), "{line} is missing from\n{all}");
+        }
+        assert!(
+            all.contains("Close the window"),
+            "the last one fits:\n{all}"
+        );
+    }
+
+    #[test]
     fn the_band_says_what_file_work_is_under_way_and_then_how_it_went() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::End]);

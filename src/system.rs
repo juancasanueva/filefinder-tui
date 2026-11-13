@@ -1,8 +1,11 @@
-//! The port to everything outside the folder tree: launching apps and previews.
+//! The port to everything outside the folder tree: launching apps, previews
+//! and what Spotlight knows.
 
 use std::cell::RefCell;
+use std::ffi::OsStr;
 use std::io::{self, Write};
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 pub trait System {
@@ -15,11 +18,27 @@ pub trait System {
 
     /// Puts text on the system clipboard, for other apps to paste.
     fn copy_text(&self, text: &str) -> io::Result<()>;
+
+    /// The files used lately, the newest first and at most `limit` of them.
+    fn recents(&self, limit: usize) -> Vec<PathBuf>;
 }
 
-#[derive(Default)]
+/// What Spotlight is asked for: everything opened in the last thirty days.
+const USED_LATELY: &str = "kMDItemLastUsedDate >= $time.today(-30)";
+
 pub struct MacSystem {
+    /// Where Spotlight looks for the files used lately.
+    home: PathBuf,
     preview: Preview,
+}
+
+impl MacSystem {
+    pub fn new(home: &Path) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            preview: Preview::default(),
+        }
+    }
 }
 
 impl System for MacSystem {
@@ -41,6 +60,38 @@ impl System for MacSystem {
     fn copy_text(&self, text: &str) -> io::Result<()> {
         pipe_into(&mut Command::new("pbcopy"), text)
     }
+
+    fn recents(&self, limit: usize) -> Vec<PathBuf> {
+        let mut spotlight = Command::new("mdfind");
+        spotlight.arg("-onlyin").arg(&self.home).arg(USED_LATELY);
+        found(&mut spotlight, limit)
+    }
+}
+
+/// Runs a command that prints one path per line and returns the files among
+/// them that are there, the last modified first and at most `limit` of them.
+/// A command that fails found nothing.
+fn found(command: &mut Command, limit: usize) -> Vec<PathBuf> {
+    let printed = command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| output.stdout)
+        .unwrap_or_default();
+    let mut files: Vec<_> = printed
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| PathBuf::from(OsStr::from_bytes(line)))
+        .filter_map(|path| {
+            let meta = path.metadata().ok().filter(|meta| meta.is_file())?;
+            Some((meta.modified().ok(), path))
+        })
+        .collect();
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    files.truncate(limit);
+    files.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Runs a command with `text` as its input and waits for it to take it.
@@ -166,5 +217,37 @@ mod tests {
         let missing = || Command::new("/nonexistent/qlmanage").spawn();
         assert!(preview.toggle(missing).is_err());
         assert!(!preview.is_open());
+    }
+
+    #[test]
+    fn what_spotlight_finds_comes_back_newest_first_without_what_is_gone() {
+        use std::fs::{self, File};
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let aged = |name: &str, secs: u64| {
+            let path = dir.path().join(name);
+            let file = File::create(&path).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(secs))
+                .unwrap();
+            path
+        };
+        let (old, new, mid) = (
+            aged("old.txt", 300),
+            aged("new.txt", 10),
+            aged("mid.txt", 100),
+        );
+        let folder = dir.path().join("Folder");
+        fs::create_dir(&folder).unwrap();
+        let gone = dir.path().join("gone.txt");
+
+        // Stands in for `mdfind`: prints the paths it is given, one per line.
+        let mut find = Command::new("printf");
+        find.arg("%s\n").args([&old, &gone, &folder, &new, &mid]);
+        assert_eq!(found(&mut find, 200), [new.clone(), mid.clone(), old]);
+        assert_eq!(found(&mut find, 2), [new, mid]);
+
+        // A Spotlight that fails or isn't there finds nothing.
+        assert!(found(&mut Command::new("false"), 200).is_empty());
+        assert!(found(&mut Command::new("/nonexistent/mdfind"), 200).is_empty());
     }
 }

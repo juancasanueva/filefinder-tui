@@ -4,12 +4,12 @@ use std::sync::OnceLock;
 
 use crate::model::Category;
 
-// Recents, Trash, Drive and Pin arrive with the sidebar sections.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Folder,
     File,
+    // Nothing in the sidebar stands for the home folder itself yet.
+    #[allow(dead_code)]
     Home,
     Desktop,
     Documents,

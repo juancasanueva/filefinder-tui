@@ -13,7 +13,7 @@ use crate::format::DateStyle;
 use crate::input::Input;
 use crate::model::{self, Entry, SortMode};
 use crate::ops::{self, Change, History, Kind, Report};
-use crate::places::{self, Place, Section};
+use crate::places::{self, Place, PlaceKind, Section};
 use crate::state::{self, Saved};
 use crate::system::System;
 use crate::thumbs::{Facts, Thumbs};
@@ -94,11 +94,20 @@ impl Drop for Work {
     }
 }
 
+/// How many of the files used lately Recents lists.
+const RECENTS_LIMIT: usize = 200;
+
+/// What is said when macOS keeps the terminal out of the trash.
+const TRASH_REFUSED: &str = "Trash: Permission was refused. Give your terminal \
+                             Full Disk Access in System Settings to see it.";
+
 /// A folder in the history, with what was selected there.
 #[derive(Clone, Debug)]
 struct Visit {
     path: PathBuf,
     selected: Option<String>,
+    /// It was Recents that was showing, not the folder.
+    recents: bool,
 }
 
 /// A folder above the pane's own, as the columns view lists it.
@@ -110,6 +119,9 @@ pub struct Ancestor {
 
 pub struct Pane {
     pub cwd: PathBuf,
+    /// The pane shows the files used lately in place of a folder's. `cwd` is
+    /// the home folder meanwhile: that is where "up" leads from there.
+    pub recents: bool,
     pub entries: Vec<Entry>,
     pub cursor: usize,
     /// First visible row (of tiles, in the grid); the view keeps the cursor on screen with it.
@@ -125,6 +137,7 @@ impl Pane {
     fn new(cwd: PathBuf, entries: Vec<Entry>) -> Self {
         Self {
             cwd,
+            recents: false,
             entries,
             cursor: 0,
             offset: 0,
@@ -142,11 +155,13 @@ impl Pane {
         Visit {
             path: self.cwd.clone(),
             selected: self.selected().map(|entry| entry.name.clone()),
+            recents: self.recents,
         }
     }
 
     fn show(&mut self, cwd: PathBuf, entries: Vec<Entry>, select: Option<&str>) {
         self.cwd = cwd;
+        self.recents = false;
         self.entries = entries;
         self.offset = 0;
         self.cursor = select
@@ -180,12 +195,15 @@ pub struct Config {
     /// A folder to open, or a file to select in its folder.
     pub start: PathBuf,
     pub date_style: DateStyle,
-    /// Where the view and tile size are remembered; `None` remembers nothing.
+    /// Where the view, the tile size and the pinned folders are remembered;
+    /// `None` remembers nothing.
     pub state_dir: Option<PathBuf>,
     /// What makes the thumbnails; `None` leaves every file its stand-in.
     pub thumbs: Option<Thumbs>,
     /// Where Delete moves things: the trash folder.
     pub trash_dir: PathBuf,
+    /// Where drives are mounted.
+    pub volumes_dir: PathBuf,
 }
 
 pub struct App {
@@ -215,7 +233,11 @@ pub struct App {
     clipboard: Option<Clipboard>,
     history: History,
     work: Option<Work>,
+    /// Every pinned folder, the ones that are gone included: they keep their
+    /// line in the file and are only left out of the sidebar.
+    pins: Vec<PathBuf>,
     trash_dir: PathBuf,
+    volumes_dir: PathBuf,
     state_dir: Option<PathBuf>,
     system: Box<dyn System>,
 }
@@ -227,8 +249,13 @@ impl App {
             .as_deref()
             .map(state::load)
             .unwrap_or_default();
+        let pins = config
+            .state_dir
+            .as_deref()
+            .map(state::load_pins)
+            .unwrap_or_default();
         let mut app = Self {
-            sidebar: vec![places::home_section(&config.home)],
+            sidebar: Vec::new(),
             panes: vec![Pane::new(config.home.clone(), Vec::new())],
             home: config.home,
             active: 0,
@@ -251,10 +278,13 @@ impl App {
             clipboard: None,
             history: History::default(),
             work: None,
+            pins,
             trash_dir: config.trash_dir,
+            volumes_dir: config.volumes_dir,
             state_dir: config.state_dir,
             system,
         };
+        app.rebuild_sidebar();
         let (folder, select) = if config.start.is_dir() {
             (config.start, None)
         } else {
@@ -296,14 +326,27 @@ impl App {
             .flat_map(|section| section.places.iter())
     }
 
-    /// The sidebar place the active pane is in: the deepest one holding its folder.
+    /// The sidebar place the active pane is in: Recents while it shows them,
+    /// and otherwise the deepest place holding its folder.
     pub fn current_place(&self) -> Option<usize> {
-        let cwd = &self.pane().cwd;
+        let pane = self.pane();
+        let recents = |place: &Place| place.kind == PlaceKind::Recents;
+        if pane.recents {
+            return self.places().position(recents);
+        }
         self.places()
             .enumerate()
-            .filter(|(_, place)| cwd.starts_with(&place.path))
+            .filter(|(_, place)| !recents(place) && pane.cwd.starts_with(&place.path))
             .max_by_key(|(_, place)| place.path.components().count())
             .map(|(index, _)| index)
+    }
+
+    /// Reads the sidebar's places again. Done at the start, on F5, when a pin
+    /// changes and as the keyboard moves into it; never while drawing.
+    fn rebuild_sidebar(&mut self) {
+        self.sidebar = places::sections(&self.home, &self.pins, &self.trash_dir, &self.volumes_dir);
+        let last = self.places().count().saturating_sub(1);
+        self.sidebar_cursor = self.sidebar_cursor.min(last);
     }
 
     /// What the file work under way is doing, in the band's words.
@@ -360,7 +403,7 @@ impl App {
             KeyCode::Char('b') if alt => self.go_back(),
             KeyCode::Char('f') if alt => self.go_forward(),
             KeyCode::Home if alt => self.go_home(),
-            KeyCode::F(5) => self.reload(),
+            KeyCode::F(5) => self.refresh(),
             KeyCode::Backspace if plain => self.go_up(),
             KeyCode::Char(' ') if plain => self.preview_selected(),
             KeyCode::Char('s') if plain => self.set_sort(self.sort.step(1)),
@@ -370,6 +413,7 @@ impl App {
             KeyCode::Char('3') if ctrl => self.set_view(ViewMode::Columns),
             KeyCode::Char('h') if ctrl => self.toggle_hidden(),
             KeyCode::Char('i') if ctrl => self.toggle_details(),
+            KeyCode::Char('p') if ctrl => self.toggle_pin(),
             // Ctrl++ is Ctrl+Shift+= on most keyboards; either spelling may arrive.
             KeyCode::Char('=' | '+') if ctrl => self.set_tile(self.tile.bigger()),
             KeyCode::Char('-') if ctrl => self.set_tile(self.tile.smaller()),
@@ -407,9 +451,9 @@ impl App {
             (_, Some('y')) if ctrl && !shift => self.redo(),
             (KeyCode::F(2), _) => self.ask_rename(),
             (KeyCode::Delete, _) if bare && shift => self.ask_delete(),
-            (KeyCode::Delete, _) if bare => self.trash(),
+            (KeyCode::Delete, _) if bare => self.delete_key(),
             // A Mac keyboard's own way to say Delete.
-            (KeyCode::Backspace, _) if held.contains(KeyModifiers::SUPER) => self.trash(),
+            (KeyCode::Backspace, _) if held.contains(KeyModifiers::SUPER) => self.delete_key(),
             _ => return false,
         }
         true
@@ -513,6 +557,10 @@ impl App {
         if self.busy() {
             return;
         }
+        if self.pane().recents {
+            self.note("Files can't be pasted here.");
+            return;
+        }
         let Some(clipboard) = &self.clipboard else {
             self.note("There's nothing to paste.");
             return;
@@ -548,7 +596,26 @@ impl App {
         });
     }
 
-    /// Delete: moves the selection to the trash.
+    /// Delete: unpins in the sidebar and moves the selection to the trash
+    /// everywhere else, except in the trash itself, where all that is left
+    /// to do with it is to delete it for good.
+    fn delete_key(&mut self) {
+        if self.focus == Focus::Sidebar {
+            self.unpin_place();
+        } else if self.in_trash() {
+            self.ask_delete();
+        } else {
+            self.trash();
+        }
+    }
+
+    /// Whether the pane shows the trash, or a folder that is in it.
+    fn in_trash(&self) -> bool {
+        let pane = self.pane();
+        !pane.recents && pane.cwd.starts_with(&self.trash_dir)
+    }
+
+    /// Moves the selection to the trash.
     fn trash(&mut self) {
         if self.busy() {
             return;
@@ -601,6 +668,10 @@ impl App {
         if self.busy() {
             return;
         }
+        if self.pane().recents {
+            self.note("Folders can't be made here.");
+            return;
+        }
         self.dialog = Some(Dialog::NewFolder {
             folder: self.pane().cwd.clone(),
             input: Input::new("New Folder"),
@@ -612,6 +683,10 @@ impl App {
     fn copy_path(&mut self) {
         let mut paths = self.selection();
         if paths.is_empty() {
+            if self.pane().recents {
+                // Not a folder: it has no path of its own.
+                return;
+            }
             paths.push(self.pane().cwd.clone());
         }
         let lines: Vec<String> = paths
@@ -722,17 +797,15 @@ impl App {
     /// is in it: one of `paths`, what was selected before, or `neighbour`.
     fn relist(&mut self, paths: &[PathBuf], neighbour: Option<String>) {
         let here = self.pane().visit();
-        if !self.show_folder(&here.path, here.selected.as_deref()) {
+        if !self.revisit(&here) {
             return;
         }
         let pane = self.pane_mut();
+        let named = |name: String| pane.entries.iter().position(|entry| entry.name == name);
         let found = paths
             .iter()
-            .filter(|path| path.parent() == Some(here.path.as_path()))
-            .map(|path| name_of(path))
-            .chain(here.selected)
-            .chain(neighbour)
-            .find_map(|name| pane.entries.iter().position(|entry| entry.name == name));
+            .find_map(|path| pane.entries.iter().position(|entry| entry.path == *path))
+            .or_else(|| here.selected.into_iter().chain(neighbour).find_map(named));
         if let Some(index) = found {
             pane.cursor = index;
         }
@@ -797,11 +870,14 @@ impl App {
             KeyCode::Down => self.sidebar_cursor = (self.sidebar_cursor + 1).min(last),
             KeyCode::Enter | KeyCode::Right => {
                 let place = self.places().nth(self.sidebar_cursor);
-                let path = place.map(|place| place.path.clone());
-                if let Some(path) = path {
-                    self.navigate(&path);
-                    self.focus = Focus::Files;
+                let Some((kind, path)) = place.map(|place| (place.kind, place.path.clone())) else {
+                    return;
+                };
+                match kind {
+                    PlaceKind::Recents => self.open_recents(),
+                    _ => self.navigate(&path),
                 }
+                self.focus = Focus::Files;
             }
             _ => {}
         }
@@ -824,7 +900,59 @@ impl App {
             .unwrap_or(1) as isize;
         self.focus = stops[(index + delta).rem_euclid(stops.len() as isize) as usize];
         if self.focus == Focus::Sidebar {
+            // A drive plugged in since the last look shows up now.
+            self.rebuild_sidebar();
             self.sidebar_cursor = self.current_place().unwrap_or(self.sidebar_cursor);
+        }
+    }
+
+    /// Ctrl+P: pins the pane's folder to the sidebar, or unpins it.
+    fn toggle_pin(&mut self) {
+        if self.pane().recents {
+            self.note("Only folders can be pinned.");
+            return;
+        }
+        // What Home lists is read again, so a folder made since counts.
+        self.rebuild_sidebar();
+        let folder = self.pane().cwd.clone();
+        let name = places::label(&folder);
+        let mut pins = self.pins.clone();
+        let under_home = |place: &Place| place.kind == PlaceKind::Home && place.path == folder;
+        if let Some(index) = pins.iter().position(|pin| *pin == folder) {
+            pins.remove(index);
+        } else if self.places().any(under_home) {
+            self.note(&format!("{name} is already under Home."));
+            return;
+        } else {
+            pins.push(folder);
+        }
+        self.set_pins(pins, &name);
+    }
+
+    /// Delete in the sidebar: unpins the pinned place the keyboard is on.
+    fn unpin_place(&mut self) {
+        let place = self.places().nth(self.sidebar_cursor);
+        let Some(place) = place.filter(|place| place.kind == PlaceKind::Pinned) else {
+            return;
+        };
+        let (path, name) = (place.path.clone(), place.label.clone());
+        let pins = self.pins.iter().filter(|pin| **pin != path);
+        self.set_pins(pins.cloned().collect(), &name);
+    }
+
+    /// Saves the pinned folders and lists them in the sidebar. Pins that
+    /// can't be saved stay as they were; `name` is the folder they changed for.
+    fn set_pins(&mut self, pins: Vec<PathBuf>, name: &str) {
+        let saved = match &self.state_dir {
+            Some(dir) => state::save_pins(dir, &pins),
+            None => Ok(()),
+        };
+        match saved {
+            Ok(()) => {
+                self.pins = pins;
+                self.rebuild_sidebar();
+            }
+            Err(_) => self.fail(format!("Couldn't save the pin to {name}.")),
         }
     }
 
@@ -850,7 +978,20 @@ impl App {
     /// Goes to a folder, remembering where we were for Back.
     pub fn navigate(&mut self, path: &Path) {
         let from = self.pane().visit();
-        if path != from.path && self.show_folder(path, None) {
+        let elsewhere = from.recents || path != from.path;
+        if elsewhere && self.show_folder(path, None) {
+            let pane = self.pane_mut();
+            pane.back.push(from);
+            pane.forward.clear();
+        }
+    }
+
+    /// Shows the files used lately in place of a folder, remembering where
+    /// we were for Back.
+    fn open_recents(&mut self) {
+        let from = self.pane().visit();
+        if !from.recents {
+            self.show_recents(None);
             let pane = self.pane_mut();
             pane.back.push(from);
             pane.forward.clear();
@@ -858,6 +999,11 @@ impl App {
     }
 
     fn go_up(&mut self) {
+        if self.pane().recents {
+            // Recents hang off the home folder.
+            self.go_home();
+            return;
+        }
         let from = self.pane().visit();
         let Some(parent) = from.path.parent().map(Path::to_path_buf) else {
             return;
@@ -883,7 +1029,7 @@ impl App {
         let Some(to) = self.pane_mut().back.pop() else {
             return;
         };
-        if self.show_folder(&to.path, to.selected.as_deref()) {
+        if self.revisit(&to) {
             self.pane_mut().forward.push(from);
         } else {
             self.pane_mut().back.push(to);
@@ -895,7 +1041,7 @@ impl App {
         let Some(to) = self.pane_mut().forward.pop() else {
             return;
         };
-        if self.show_folder(&to.path, to.selected.as_deref()) {
+        if self.revisit(&to) {
             self.pane_mut().back.push(from);
         } else {
             self.pane_mut().forward.push(to);
@@ -943,26 +1089,69 @@ impl App {
         self.note(sort.tip());
     }
 
-    /// Lists the folder again, keeping the selection on the same item.
+    /// F5: reads the sidebar's places and what the pane shows again.
+    fn refresh(&mut self) {
+        self.rebuild_sidebar();
+        self.reload();
+    }
+
+    /// Lists what the pane shows again, keeping the selection on the same item.
     fn reload(&mut self) {
         let here = self.pane().visit();
-        self.show_folder(&here.path, here.selected.as_deref());
+        self.revisit(&here);
+    }
+
+    /// Shows what a visit was of: a folder, or the files used lately.
+    fn revisit(&mut self, visit: &Visit) -> bool {
+        if visit.recents {
+            self.show_recents(visit.selected.as_deref());
+            true
+        } else {
+            self.show_folder(&visit.path, visit.selected.as_deref())
+        }
     }
 
     /// Lists a folder into the active pane; on failure says why and stays put.
     fn show_folder(&mut self, path: &Path, select: Option<&str>) -> bool {
-        match model::list_dir(path, self.show_hidden, self.sort) {
+        let is_trash = path == self.trash_dir;
+        let listed = match model::list_dir(path, self.show_hidden, self.sort) {
+            // A trash nothing was ever moved to is an empty one.
+            Err(error) if is_trash && error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            listed => listed,
+        };
+        match listed {
             Ok(entries) => {
                 self.pane_mut().show(path.to_path_buf(), entries, select);
                 self.refresh_ancestors();
                 self.message = None;
                 true
             }
+            Err(error) if is_trash && error.kind() == io::ErrorKind::PermissionDenied => {
+                self.fail(TRASH_REFUSED.to_string());
+                false
+            }
             Err(error) => {
                 self.fail(read_error(path, &error));
                 false
             }
         }
+    }
+
+    /// Asks Spotlight for the files used lately and lists them into the
+    /// active pane, the newest first whatever the sort order is.
+    fn show_recents(&mut self, select: Option<&str>) {
+        let found = self.system.recents(RECENTS_LIMIT);
+        // One that went since Spotlight last looked is simply not listed.
+        let entries = found
+            .into_iter()
+            .filter_map(|path| Entry::from_path(path).ok());
+        let entries = entries.collect();
+        let home = self.home.clone();
+        let pane = self.pane_mut();
+        pane.show(home, entries, select);
+        pane.recents = true;
+        self.refresh_ancestors();
+        self.message = None;
     }
 
     /// Lists the folders above the active pane's again, when the view shows them.
@@ -1080,7 +1269,7 @@ fn read_error(path: &Path, error: &io::Error) -> String {
 pub mod testing {
     use super::*;
     use crate::thumbs::testing::FakeThumbnailer;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -1093,6 +1282,10 @@ pub mod testing {
         pub previewed: Rc<RefCell<Vec<PathBuf>>>,
         /// Every text put on the system clipboard.
         pub copied: Rc<RefCell<Vec<String>>>,
+        /// What Spotlight answers when asked for the files used lately.
+        pub recents: Rc<RefCell<Vec<PathBuf>>>,
+        /// How many times it was asked.
+        pub asked: Rc<Cell<usize>>,
     }
 
     impl System for FakeSystem {
@@ -1110,6 +1303,11 @@ pub mod testing {
             self.copied.borrow_mut().push(text.to_string());
             Ok(())
         }
+
+        fn recents(&self, limit: usize) -> Vec<PathBuf> {
+            self.asked.set(self.asked.get() + 1);
+            self.recents.borrow().iter().take(limit).cloned().collect()
+        }
     }
 
     pub struct Fixture {
@@ -1118,6 +1316,9 @@ pub mod testing {
         pub home: PathBuf,
         /// The trash the app was given: a folder of the fixture's own.
         pub trash: PathBuf,
+        /// Where the app looks for drives: a folder of the fixture's own,
+        /// not there until a test mounts something.
+        pub volumes: PathBuf,
         _dir: tempfile::TempDir,
     }
 
@@ -1169,6 +1370,7 @@ pub mod testing {
         fs::write(home.join(".hidden"), "").unwrap();
         let system = FakeSystem::default();
         let trash = home.join(".Trash");
+        let volumes = home.join(".Volumes");
         let config = Config {
             home: home.clone(),
             start: home.clone(),
@@ -1176,6 +1378,7 @@ pub mod testing {
             state_dir: None,
             thumbs,
             trash_dir: trash.clone(),
+            volumes_dir: volumes.clone(),
         };
         let mut app = App::new(config, Box::new(system.clone()));
         // The tests written against the list keep it; the others switch with Ctrl+1 or Ctrl+3.
@@ -1185,6 +1388,7 @@ pub mod testing {
             system,
             home,
             trash,
+            volumes,
             _dir: dir,
         }
     }
@@ -1198,6 +1402,7 @@ pub mod testing {
             state_dir: state_dir.map(Path::to_path_buf),
             thumbs: None,
             trash_dir: home.join(".Trash"),
+            volumes_dir: home.join(".Volumes"),
         };
         App::new(config, Box::new(FakeSystem::default()))
     }
@@ -1286,6 +1491,7 @@ mod tests {
             state_dir: None,
             thumbs: None,
             trash_dir: f.trash.clone(),
+            volumes_dir: f.volumes.clone(),
         };
         let app = App::new(config, Box::new(FakeSystem::default()));
         assert_eq!(app.pane().cwd, f.home);
@@ -1383,8 +1589,16 @@ mod tests {
     #[test]
     fn the_sidebar_lists_home_folders_and_enter_goes_there() {
         let mut f = fixture();
-        let labels: Vec<_> = f.app.places().map(|place| place.label.clone()).collect();
-        assert_eq!(labels, ["Documents", "Pictures"]);
+        let home = &f.app.sidebar[0];
+        let labels: Vec<_> = home
+            .places
+            .iter()
+            .map(|place| place.label.as_str())
+            .collect();
+        assert_eq!(
+            (home.title, labels),
+            ("Home", vec!["Documents", "Pictures"])
+        );
         press(
             &mut f.app,
             &[KeyCode::BackTab, KeyCode::Down, KeyCode::Enter],
@@ -2308,5 +2522,409 @@ mod tests {
         assert_eq!(f.app.message, None);
         press(&mut f.app, &[KeyCode::Char('q')]);
         assert!(f.app.should_quit);
+    }
+
+    // The sidebar's other sections. Pins are remembered in a folder inside
+    // the fixture, drives come from a folder of its own, and Spotlight is a
+    // fake that answers what the test tells it to.
+
+    type Listed = (&'static str, Vec<&'static str>);
+
+    fn home_places() -> Listed {
+        ("Home", vec!["Documents", "Pictures"])
+    }
+
+    fn views() -> Listed {
+        ("Views", vec!["Recents", "Trash"])
+    }
+
+    /// Every section of the sidebar with the labels of its places.
+    fn sections(app: &App) -> Vec<(&str, Vec<&str>)> {
+        app.sidebar
+            .iter()
+            .map(|section| {
+                let labels = section.places.iter().map(|place| place.label.as_str());
+                (section.title, labels.collect())
+            })
+            .collect()
+    }
+
+    fn place_of(app: &App, label: &str) -> Option<usize> {
+        app.places().position(|place| place.label == label)
+    }
+
+    /// Moves the keyboard into the sidebar and onto a place.
+    fn go_to_place(app: &mut App, label: &str) {
+        while app.focus != Focus::Sidebar {
+            press(app, &[KeyCode::BackTab]);
+        }
+        let index = place_of(app, label).unwrap_or_else(|| panic!("{label} isn't listed"));
+        press(app, &[KeyCode::Up; 40]);
+        press(app, &vec![KeyCode::Down; index]);
+        assert_eq!(app.sidebar_cursor, index);
+    }
+
+    fn open_place(app: &mut App, label: &str) {
+        go_to_place(app, label);
+        press(app, &[KeyCode::Enter]);
+    }
+
+    fn pin(app: &mut App) {
+        app.handle_key(ctrl(KeyCode::Char('p')));
+    }
+
+    #[test]
+    fn the_sidebar_holds_home_and_the_views_and_leaves_empty_sections_out() {
+        let f = fixture();
+        assert_eq!(sections(&f.app), [home_places(), views()]);
+    }
+
+    #[test]
+    fn ctrl_p_pins_the_folder_and_ctrl_p_again_unpins_it() {
+        let f = fixture();
+        let state = f.home.join(".state");
+        let mut app = launch(&f.home, Some(&state));
+        let trip = f.home.join("Pictures").join("Trip");
+        app.navigate(&trip);
+        assert_eq!(app.current_place(), Some(1), "Pictures holds it");
+
+        pin(&mut app);
+        let pinned = ("Pinned", vec!["Trip"]);
+        assert_eq!(sections(&app), [home_places(), pinned, views()]);
+        assert_eq!(read(state.join("pinned")), format!("{}\n", trip.display()));
+        assert_eq!(app.message, None);
+        assert_eq!(app.current_place(), Some(2), "the pin is the deepest");
+        assert_eq!(app.pane().cwd, trip);
+
+        pin(&mut app);
+        assert_eq!(sections(&app), [home_places(), views()]);
+        assert_eq!(read(state.join("pinned")), "");
+        assert_eq!(app.current_place(), Some(1));
+    }
+
+    #[test]
+    fn pins_survive_a_restart_and_a_folder_that_is_gone_is_kept_but_not_listed() {
+        let f = fixture();
+        let state = f.home.join(".state");
+        let trip = f.home.join("Pictures").join("Trip");
+        let gone = f.home.join("Pictures").join("Gone");
+        fs::create_dir(&gone).unwrap();
+        let mut app = launch(&f.home, Some(&state));
+        for folder in [&gone, &trip] {
+            app.navigate(folder);
+            pin(&mut app);
+        }
+        assert_eq!(sections(&app)[1], ("Pinned", vec!["Gone", "Trip"]));
+        fs::remove_dir(&gone).unwrap();
+
+        let mut again = launch(&f.home, Some(&state));
+        assert_eq!(sections(&again)[1], ("Pinned", vec!["Trip"]));
+        // Its line stays in the file, for when the folder comes back.
+        let both = format!("{}\n{}\n", gone.display(), trip.display());
+        assert_eq!(read(state.join("pinned")), both);
+        again.navigate(&trip);
+        pin(&mut again);
+        assert_eq!(read(state.join("pinned")), format!("{}\n", gone.display()));
+        assert_eq!(sections(&again), [home_places(), views()]);
+    }
+
+    #[test]
+    fn what_home_already_lists_and_what_is_not_a_folder_cannot_be_pinned() {
+        let f = fixture();
+        let state = f.home.join(".state");
+        let mut app = launch(&f.home, Some(&state));
+        app.navigate(&f.home.join("Pictures"));
+        pin(&mut app);
+        assert_eq!(said(&app), ("Pictures is already under Home.", false));
+
+        open_place(&mut app, "Recents");
+        pin(&mut app);
+        assert_eq!(said(&app), ("Only folders can be pinned.", false));
+        assert_eq!(sections(&app), [home_places(), views()]);
+        assert!(!state.join("pinned").exists());
+    }
+
+    #[test]
+    fn a_pin_that_cannot_be_saved_says_so_and_is_not_kept() {
+        let f = fixture();
+        // A file is where the folder for the pins would go.
+        let state = f.home.join("notes.txt").join("state");
+        let mut app = launch(&f.home, Some(&state));
+        app.navigate(&f.home.join("Pictures").join("Trip"));
+        pin(&mut app);
+        assert_eq!(said(&app), ("Couldn't save the pin to Trip.", true));
+        assert_eq!(sections(&app), [home_places(), views()]);
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+    }
+
+    #[test]
+    fn delete_in_the_sidebar_unpins_a_pinned_place_and_leaves_the_others() {
+        let f = fixture();
+        let state = f.home.join(".state");
+        let mut app = launch(&f.home, Some(&state));
+        let trip = f.home.join("Pictures").join("Trip");
+        app.navigate(&trip);
+        pin(&mut app);
+
+        for label in ["Pictures", "Recents", "Trash"] {
+            go_to_place(&mut app, label);
+            press(&mut app, &[KeyCode::Delete]);
+        }
+        assert_eq!(sections(&app)[1], ("Pinned", vec!["Trip"]));
+        assert!(app.dialog.is_none());
+
+        go_to_place(&mut app, "Trip");
+        press(&mut app, &[KeyCode::Delete]);
+        assert_eq!(sections(&app), [home_places(), views()]);
+        assert_eq!(read(state.join("pinned")), "");
+        // Only the pin went: the folder and everything else is where it was.
+        assert!(trip.is_dir());
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
+        assert!(on_disk(&f.home.join(".Trash")).is_empty());
+        assert_eq!(app.pane().cwd, trip);
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert_eq!(app.sidebar_cursor, 2, "on what moved up into its row");
+    }
+
+    #[test]
+    fn recents_lists_what_spotlight_says_was_used_lately() {
+        let mut f = fixture();
+        let photo = f.home.join("Pictures").join("a.jpg");
+        let notes = f.home.join("notes.txt");
+        *f.system.recents.borrow_mut() =
+            vec![photo.clone(), f.home.join("gone.txt"), notes.clone()];
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(f.system.asked.get(), 0, "not before it is opened");
+
+        open_place(&mut f.app, "Recents");
+        assert!(f.app.pane().recents);
+        assert_eq!(names(&f.app), ["a.jpg", "notes.txt"], "Spotlight's order");
+        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(f.app.current_place(), place_of(&f.app, "Recents"));
+
+        // Enter opens a file and Space previews it.
+        press(
+            &mut f.app,
+            &[KeyCode::Down, KeyCode::Enter, KeyCode::Char(' ')],
+        );
+        let asked_for = [notes];
+        assert_eq!(*f.system.opened.borrow(), asked_for);
+        assert_eq!(*f.system.previewed.borrow(), asked_for);
+
+        // Back returns to where we were, and forward to Recents.
+        f.app.handle_key(alt(KeyCode::Left));
+        assert!(!f.app.pane().recents);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
+        f.app.handle_key(alt(KeyCode::Right));
+        assert!(f.app.pane().recents);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+    }
+
+    #[test]
+    fn up_from_recents_is_the_home_folder() {
+        let mut f = fixture();
+        *f.system.recents.borrow_mut() = vec![f.home.join("notes.txt")];
+        let leaving = [
+            key(KeyCode::Backspace),
+            key(KeyCode::Left),
+            alt(KeyCode::Home),
+        ];
+        for leave in leaving {
+            f.app.navigate(&f.home.join("Pictures"));
+            open_place(&mut f.app, "Recents");
+            assert!(f.app.pane().recents);
+            f.app.handle_key(leave);
+            assert!(!f.app.pane().recents);
+            assert_eq!(f.app.pane().cwd, f.home);
+            assert_eq!(names(&f.app), ["Documents", "Pictures", "notes.txt"]);
+            // Recents is one step back.
+            f.app.handle_key(alt(KeyCode::Left));
+            assert!(f.app.pane().recents);
+            assert_eq!(names(&f.app), ["notes.txt"]);
+        }
+    }
+
+    #[test]
+    fn f5_in_recents_asks_spotlight_again_and_drawing_never_does() {
+        let mut f = fixture();
+        open_place(&mut f.app, "Recents");
+        assert!(names(&f.app).is_empty());
+        assert_eq!(f.system.asked.get(), 1);
+
+        f.system.recents.borrow_mut().push(f.home.join("notes.txt"));
+        for _ in 0..3 {
+            f.app.tick();
+            crate::ui::testing::screen(&mut f.app, 120, 24);
+        }
+        assert_eq!(f.system.asked.get(), 1);
+        assert!(names(&f.app).is_empty());
+
+        press(&mut f.app, &[KeyCode::F(5)]);
+        assert_eq!(f.system.asked.get(), 2);
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        assert!(f.app.pane().recents);
+    }
+
+    #[test]
+    fn in_recents_nothing_is_pasted_or_made_and_the_rest_acts_on_the_real_files() {
+        let mut f = fixture();
+        let photo = f.home.join("Pictures").join("a.jpg");
+        let plan = f.home.join("Documents").join("plan.md");
+        let notes = f.home.join("notes.txt");
+        fs::write(&plan, "plan").unwrap();
+        *f.system.recents.borrow_mut() = vec![photo.clone(), plan.clone(), notes.clone()];
+        open_place(&mut f.app, "Recents");
+
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        assert_eq!(said(&f.app), ("Files can't be pasted here.", false));
+        assert_eq!(f.app.working(), None);
+        f.app.handle_key(ctrl_shift('n'));
+        assert_eq!(said(&f.app), ("Folders can't be made here.", false));
+        assert!(f.app.dialog.is_none());
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
+
+        // The path that is copied is the file's own, wherever it is.
+        f.app.handle_key(ctrl_shift('c'));
+        assert_eq!(*f.system.copied.borrow(), [photo.display().to_string()]);
+
+        // Ctrl+C takes the file for a paste somewhere else.
+        select(&mut f.app, "plan.md");
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(said(&f.app), ("1 item ready to paste.", false));
+
+        // F2 renames it where it is.
+        select(&mut f.app, "a.jpg");
+        press(&mut f.app, &[KeyCode::F(2)]);
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "b.jpg");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(on_disk(&f.home.join("Pictures")), ["Trip", "b.jpg"]);
+        assert!(f.app.pane().recents);
+
+        // Delete moves it to the trash.
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert_eq!(read(f.trash.join("notes.txt")), "hello");
+        assert!(!notes.exists());
+        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        assert!(f.app.pane().recents);
+        assert_eq!(names(&f.app), ["plan.md"]);
+
+        f.app.navigate(&f.home.join("Pictures"));
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("Pictures").join("plan.md")), "plan");
+        assert_eq!(read(plan), "plan");
+    }
+
+    #[test]
+    fn trash_opens_the_trash_folder_where_delete_asks_to_delete_for_good() {
+        let mut f = fixture();
+        for name in ["notes.txt", "Pictures"] {
+            select(&mut f.app, name);
+            press(&mut f.app, &[KeyCode::Delete]);
+        }
+        open_place(&mut f.app, "Trash");
+        assert_eq!(f.app.pane().cwd, f.trash);
+        assert_eq!(names(&f.app), ["Pictures", "notes.txt"]);
+        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(f.app.current_place(), place_of(&f.app, "Trash"));
+
+        // Delete doesn't move it to the trash again: it asks, like Shift+Delete.
+        select(&mut f.app, "notes.txt");
+        let command = KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER);
+        for delete in [key(KeyCode::Delete), command] {
+            f.app.handle_key(delete);
+            let Some(Dialog::Delete { paths, armed }) = &f.app.dialog else {
+                panic!("it didn't ask");
+            };
+            let asked = [f.trash.join("notes.txt")];
+            assert_eq!((paths.as_slice(), *armed), (asked.as_slice(), false));
+            press(&mut f.app, &[KeyCode::Esc]);
+            assert_eq!(on_disk(&f.trash), ["Pictures", "notes.txt"]);
+        }
+        press(
+            &mut f.app,
+            &[KeyCode::Delete, KeyCode::Right, KeyCode::Enter],
+        );
+        assert_eq!(on_disk(&f.trash), ["Pictures"]);
+        assert_eq!(said(&f.app), ("Deleted 1 item.", false));
+
+        // The same in a folder that is in the trash.
+        press(&mut f.app, &[KeyCode::Home, KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.trash.join("Pictures"));
+        select(&mut f.app, "a.jpg");
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert!(matches!(f.app.dialog, Some(Dialog::Delete { .. })));
+        assert_eq!(on_disk(&f.trash.join("Pictures")), ["Trip", "a.jpg"]);
+    }
+
+    #[test]
+    fn a_trash_nothing_was_ever_moved_to_opens_empty() {
+        let mut f = fixture();
+        assert!(!f.trash.exists());
+        open_place(&mut f.app, "Trash");
+        assert_eq!(f.app.pane().cwd, f.trash);
+        assert!(names(&f.app).is_empty());
+        assert_eq!(f.app.message, None);
+    }
+
+    #[test]
+    fn a_trash_that_cannot_be_listed_says_how_to_allow_it() {
+        let mut f = fixture();
+        fs::create_dir(&f.trash).unwrap();
+        fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o000)).unwrap();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        open_place(&mut f.app, "Trash");
+        fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
+        let refused = "Trash: Permission was refused. Give your terminal \
+                       Full Disk Access in System Settings to see it.";
+        assert_eq!(said(&f.app), (refused, true));
+    }
+
+    #[test]
+    fn drives_lists_the_mounted_volumes_except_the_systems_own() {
+        let mut f = fixture();
+        fs::create_dir_all(f.volumes.join("USB").join("Photos")).unwrap();
+        fs::create_dir(f.volumes.join("Backup")).unwrap();
+        fs::write(f.volumes.join("stray.txt"), "").unwrap();
+        // What `/Volumes/Macintosh HD` is: a link to the root.
+        std::os::unix::fs::symlink("/", f.volumes.join("Macintosh HD")).unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
+        let drives = ("Drives", vec!["Backup", "USB"]);
+        assert_eq!(sections(&f.app), [home_places(), views(), drives]);
+
+        open_place(&mut f.app, "USB");
+        assert_eq!(f.app.pane().cwd, f.volumes.join("USB"));
+        assert_eq!(names(&f.app), ["Photos"]);
+        assert_eq!(f.app.focus, Focus::Files);
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.volumes.join("USB").join("Photos"));
+        assert_eq!(f.app.current_place(), place_of(&f.app, "USB"));
+    }
+
+    #[test]
+    fn the_sidebar_is_read_again_on_f5_and_when_the_keyboard_moves_into_it() {
+        let mut f = fixture();
+        fs::create_dir(f.home.join("Music")).unwrap();
+        f.app.tick();
+        crate::ui::testing::screen(&mut f.app, 120, 24);
+        press(&mut f.app, &[KeyCode::Down]);
+        assert_eq!(sections(&f.app), [home_places(), views()], "not yet");
+        press(&mut f.app, &[KeyCode::F(5)]);
+        let home = ("Home", vec!["Documents", "Music", "Pictures"]);
+        assert_eq!(sections(&f.app), [home.clone(), views()]);
+
+        // A drive plugged in shows up when the keyboard gets there.
+        fs::create_dir_all(f.volumes.join("USB")).unwrap();
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.focus, Focus::Details);
+        assert_eq!(sections(&f.app), [home.clone(), views()]);
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.focus, Focus::Sidebar);
+        assert_eq!(sections(&f.app), [home, views(), ("Drives", vec!["USB"])]);
     }
 }

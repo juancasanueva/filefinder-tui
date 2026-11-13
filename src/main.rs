@@ -49,11 +49,12 @@ fn main() -> io::Result<()> {
         state_dir: Some(home.join(".config/filefinder-tui")),
         thumbs: Some(Thumbs::new(picker, Arc::new(thumbnailer))),
         trash_dir: home.join(".Trash"),
-        home,
+        volumes_dir: PathBuf::from("/Volumes"),
+        home: home.clone(),
         start,
         date_style: DateStyle::from_env(),
     };
-    let mut app = App::new(config, Box::new(MacSystem::default()));
+    let mut app = App::new(config, Box::new(MacSystem::new(&home)));
     // Tells Ctrl+I from Tab and Ctrl+Shift+N from Ctrl+N, where the terminal can.
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     if enhanced {

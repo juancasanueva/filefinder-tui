@@ -22,11 +22,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let [path, right] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(toggles_width + 1)]).areas(row);
 
-    let crumbs = breadcrumbs(
-        &app.pane().cwd,
-        &app.home,
-        path.width.saturating_sub(4) as usize,
-    );
+    let pane = app.pane();
+    let crumbs = if pane.recents {
+        // Not a folder: it has no way down from home to show.
+        vec!["Recents".to_string()]
+    } else {
+        breadcrumbs(&pane.cwd, &app.home, path.width.saturating_sub(4) as usize)
+    };
     let mut spans = vec![Span::raw("  ")];
     let last = crumbs.len().saturating_sub(1);
     for (index, crumb) in crumbs.iter().enumerate() {
@@ -119,5 +121,26 @@ mod tests {
         let home = Path::new("/Users/me");
         let deep = Path::new("/Users/me/Pictures/Lisbon 2026/Sintra day trip");
         assert_eq!(breadcrumbs(deep, home, 30), ["~", "…", "Sintra day trip"]);
+    }
+
+    #[test]
+    fn recents_is_a_breadcrumb_of_its_own() {
+        use crate::app::testing::{fixture, press};
+        use crate::ui::testing::screen;
+        use ratatui::crossterm::event::KeyCode;
+        let mut f = fixture();
+        // The sidebar's third place.
+        press(
+            &mut f.app,
+            &[
+                KeyCode::BackTab,
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+            ],
+        );
+        let lines = screen(&mut f.app, 120, 24);
+        assert!(lines[0].starts_with("  Recents  "), "{}", lines[0]);
+        assert!(!lines[0].contains('~'), "{}", lines[0]);
     }
 }

@@ -24,6 +24,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Shift+C", "Copy the path as text"),
     ("F2 / Ctrl+Shift+D", "Rename / duplicate"),
     ("Ctrl+Shift+N", "New folder"),
+    ("Ctrl+P", "Pin or unpin the folder"),
+    ("Delete in the sidebar", "Unpin the folder"),
     ("Delete (fn+⌫) / ⌘⌫", "Move to the trash"),
     ("Shift+Delete", "Delete permanently (asks first)"),
     (

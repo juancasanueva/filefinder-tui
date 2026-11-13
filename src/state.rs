@@ -1,12 +1,14 @@
-//! What is remembered between launches: the view and the size of the tiles.
+//! What is remembered between launches: the view, the size of the tiles and
+//! the pinned folders.
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::app::{TileSize, ViewMode};
 
 const FILE: &str = "state";
+const PINS: &str = "pinned";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Saved {
@@ -61,6 +63,26 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
     fs::write(dir.join(FILE), format!("view={view}\ntiles={tiles}\n"))
 }
 
+/// Reads the pinned folders, one path per line; none when the file is
+/// missing or unreadable.
+pub fn load_pins(dir: &Path) -> Vec<PathBuf> {
+    let text = fs::read_to_string(dir.join(PINS)).unwrap_or_default();
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Writes the pinned folders, making the folder of the file the first time.
+pub fn save_pins(dir: &Path, pins: &[PathBuf]) -> io::Result<()> {
+    let lines: String = pins
+        .iter()
+        .map(|path| format!("{}\n", path.display()))
+        .collect();
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join(PINS), lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +131,24 @@ mod tests {
                 tile: TileSize::Large,
             }
         );
+    }
+
+    #[test]
+    fn pins_are_kept_one_path_per_line() {
+        let dir = tempfile::tempdir().unwrap();
+        // The folder is made on the first save.
+        let folder = dir.path().join("filefinder-tui");
+        assert!(load_pins(&folder).is_empty());
+        let pins = [PathBuf::from("/a/Lisbon 2026"), PathBuf::from("/b")];
+        save_pins(&folder, &pins).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.join("pinned")).unwrap(),
+            "/a/Lisbon 2026\n/b\n"
+        );
+        assert_eq!(load_pins(&folder), pins);
+
+        // A blank line is no pin.
+        fs::write(folder.join("pinned"), "\n/b\n\n").unwrap();
+        assert_eq!(load_pins(&folder), [PathBuf::from("/b")]);
     }
 }
