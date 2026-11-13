@@ -1,12 +1,21 @@
-//! The port to everything outside the folder tree: launching apps, previews
-//! and what Spotlight knows.
+//! The port to everything outside the folder tree: launching apps, previews,
+//! terminals, the program that zips, and what Spotlight knows.
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
+use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
+/// What writes one zip archive. It is handed to the thread that does file
+/// work, and run there with the new file the archive goes in and the flag
+/// that stops it: once that is set it gives up, with an error.
+pub type Archiver = Box<dyn FnOnce(&Path, &AtomicBool) -> io::Result<()> + Send>;
 
 pub trait System {
     /// Opens a file with its default app.
@@ -21,6 +30,12 @@ pub trait System {
 
     /// The files used lately, the newest first and at most `limit` of them.
     fn recents(&self, limit: usize) -> Vec<PathBuf>;
+
+    /// Opens a terminal window in a folder.
+    fn open_terminal(&self, folder: &Path) -> io::Result<()>;
+
+    /// What zips these items, which are all in one folder, into one archive.
+    fn archiver(&self, items: &[PathBuf]) -> Archiver;
 }
 
 /// What Spotlight is asked for: everything opened in the last thirty days.
@@ -66,6 +81,92 @@ impl System for MacSystem {
         spotlight.arg("-onlyin").arg(&self.home).arg(USED_LATELY);
         found(&mut spotlight, limit)
     }
+
+    fn open_terminal(&self, folder: &Path) -> io::Result<()> {
+        let program = std::env::var("TERM_PROGRAM").ok();
+        let app = terminal_app(program.as_deref());
+        let status = quiet(&mut terminal_command(app, folder)).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("no terminal started"))
+        }
+    }
+
+    fn archiver(&self, items: &[PathBuf]) -> Archiver {
+        let items = items.to_vec();
+        Box::new(move |archive, stop| run_until(&mut zip_command(&items, archive)?, stop))
+    }
+}
+
+/// The app that opens a terminal window: the one this runs in, going by what
+/// it says in `TERM_PROGRAM`, and the system's own when it is another.
+fn terminal_app(term_program: Option<&str>) -> &'static str {
+    match term_program {
+        Some("ghostty") => "Ghostty",
+        Some("iTerm.app") => "iTerm",
+        Some("WezTerm") => "WezTerm",
+        Some("kitty") => "kitty",
+        _ => "Terminal",
+    }
+}
+
+fn terminal_command(app: &str, folder: &Path) -> Command {
+    let mut open = Command::new("open");
+    open.arg("-a").arg(app).arg(folder);
+    open
+}
+
+/// The command that zips items of one folder into `archive`, a file that
+/// isn't there yet. One file or folder goes through `ditto`, which keeps
+/// what macOS knows about it. Several can only go in by name, from their
+/// folder, through `zip`; so does a link, which `ditto` would follow to what
+/// it points at, and `zip` is told to keep as a link.
+fn zip_command(items: &[PathBuf], archive: &Path) -> io::Result<Command> {
+    let whole = |item: &PathBuf| {
+        let meta = fs::symlink_metadata(item).ok()?;
+        (meta.is_dir() || meta.is_file()).then_some(meta.is_dir())
+    };
+    if let [one] = items
+        && let Some(is_folder) = whole(one)
+    {
+        let mut ditto = Command::new("/usr/bin/ditto");
+        ditto.args(["-c", "-k"]);
+        if is_folder {
+            // The archive holds the folder itself, not just what is in it.
+            ditto.arg("--keepParent");
+        }
+        ditto.arg(one).arg(archive);
+        return Ok(ditto);
+    }
+    let nowhere = || io::Error::other("there is nothing to compress");
+    let folder = items.first().and_then(|item| item.parent());
+    let mut zip = Command::new("/usr/bin/zip");
+    zip.current_dir(folder.ok_or_else(nowhere)?);
+    // After `--` a name is a name, whatever it starts with.
+    zip.args(["-r", "-y", "-q"]).arg(archive).arg("--");
+    for item in items {
+        zip.arg(item.file_name().ok_or_else(nowhere)?);
+    }
+    Ok(zip)
+}
+
+/// Runs a command to its end, looking now and then whether it should stop:
+/// then it is killed, and that is an error like its failing is.
+fn run_until(command: &mut Command, stop: &AtomicBool) -> io::Result<()> {
+    let mut child = quiet(command).spawn()?;
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err(io::Error::other("the archive couldn't be written")),
+            Ok(None) if stop.load(Ordering::Relaxed) => break io::ErrorKind::Interrupted.into(),
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(error) => break error,
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(ended)
 }
 
 /// Runs a command that prints one path per line and returns the files among
@@ -249,5 +350,95 @@ mod tests {
         // A Spotlight that fails or isn't there finds nothing.
         assert!(found(&mut Command::new("false"), 200).is_empty());
         assert!(found(&mut Command::new("/nonexistent/mdfind"), 200).is_empty());
+    }
+
+    fn args(command: &Command) -> Vec<&OsStr> {
+        command.get_args().collect()
+    }
+
+    #[test]
+    fn the_terminal_to_start_is_the_one_the_app_runs_in() {
+        for (program, app) in [
+            ("ghostty", "Ghostty"),
+            ("Apple_Terminal", "Terminal"),
+            ("iTerm.app", "iTerm"),
+            ("WezTerm", "WezTerm"),
+            ("kitty", "kitty"),
+            // One it doesn't know, like tmux, gets the system's own.
+            ("tmux", "Terminal"),
+            ("", "Terminal"),
+        ] {
+            assert_eq!(terminal_app(Some(program)), app, "{program}");
+        }
+        assert_eq!(terminal_app(None), "Terminal");
+
+        let command = terminal_command("Ghostty", Path::new("/h/Lisbon 2026"));
+        assert_eq!(command.get_program(), "open");
+        assert_eq!(args(&command), ["-a", "Ghostty", "/h/Lisbon 2026"]);
+    }
+
+    #[test]
+    fn one_file_or_folder_is_zipped_whole_and_the_rest_by_name_from_their_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        let folder = dir.path().join("Trip");
+        let link = dir.path().join("link");
+        std::fs::write(&file, "hello").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let archive = dir.path().join(".part").join("out.zip");
+        let (file_arg, folder_arg, out) =
+            (file.as_os_str(), folder.as_os_str(), archive.as_os_str());
+
+        let one = zip_command(std::slice::from_ref(&file), &archive).unwrap();
+        assert_eq!(one.get_program(), "/usr/bin/ditto");
+        assert_eq!(
+            args(&one),
+            [OsStr::new("-c"), OsStr::new("-k"), file_arg, out]
+        );
+
+        // A folder's archive holds the folder, not just what is in it.
+        let whole = zip_command(std::slice::from_ref(&folder), &archive).unwrap();
+        assert_eq!(whole.get_program(), "/usr/bin/ditto");
+        let keep = ["-c", "-k", "--keepParent"].map(OsStr::new);
+        assert_eq!(args(&whole), [keep[0], keep[1], keep[2], folder_arg, out]);
+
+        // Several go in by name, from the folder they are in; links as links.
+        let several = zip_command(&[file, folder], &archive).unwrap();
+        assert_eq!(several.get_program(), "/usr/bin/zip");
+        assert_eq!(several.get_current_dir(), Some(dir.path()));
+        let named = ["-r", "-y", "-q", "--", "notes.txt", "Trip", "link"].map(OsStr::new);
+        assert_eq!(
+            args(&several),
+            [
+                named[0], named[1], named[2], out, named[3], named[4], named[5]
+            ]
+        );
+
+        // A link alone is never followed to what it points at.
+        let linked = zip_command(std::slice::from_ref(&link), &archive).unwrap();
+        assert_eq!(linked.get_program(), "/usr/bin/zip");
+        assert_eq!(linked.get_current_dir(), Some(dir.path()));
+        assert_eq!(
+            args(&linked),
+            [named[0], named[1], named[2], out, named[3], named[6]]
+        );
+    }
+
+    #[test]
+    fn a_command_runs_to_its_end_unless_it_is_stopped_first() {
+        let go = AtomicBool::new(false);
+        // Stand-ins for the archiver: one that works, one that fails, none.
+        assert!(run_until(&mut Command::new("true"), &go).is_ok());
+        let failed = run_until(&mut Command::new("false"), &go).unwrap_err();
+        assert_eq!(failed.to_string(), "the archive couldn't be written");
+        assert!(run_until(&mut Command::new("/nonexistent/zip"), &go).is_err());
+
+        // Stopped, it is killed instead of waited for.
+        let stop = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        let stopped = run_until(Command::new("sleep").arg("30"), &stop).unwrap_err();
+        assert_eq!(stopped.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

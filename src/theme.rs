@@ -110,6 +110,13 @@ pub fn bar_field(typing: bool) -> Style {
     Style::new().fg(fg).bg(LIGHTER_BACKGROUND)
 }
 
+/// A line of the menu: the one the keyboard is on in the selection's
+/// colors, and one that can't be used right now dim.
+pub fn menu_item(lit: bool, enabled: bool) -> Style {
+    let style = if lit { selected() } else { panel() };
+    if enabled { style } else { style.fg(DIM) }
+}
+
 /// A choice in a dialog: the lit one is what Enter takes.
 pub fn choice(lit: bool) -> Style {
     if lit { button() } else { notice() }

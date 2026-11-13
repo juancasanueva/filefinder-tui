@@ -27,6 +27,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ),
     ("⏎", "Open"),
     ("Space", "Preview the selected file"),
+    (
+        "Alt+⏎",
+        "Everything else, for files and for drives in the sidebar",
+    ),
     ("Backspace", "Go to the parent folder"),
     ("Alt+← / Alt+→", "Back / forward"),
     ("Alt+Home", "Go home"),

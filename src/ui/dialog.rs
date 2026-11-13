@@ -1,7 +1,6 @@
-//! Dialogs: a name being typed, and the question before deleting for good.
-//! They look like the `?` overlay: a dark panel with a hairline border.
-
-use std::path::PathBuf;
+//! Dialogs: a name being typed, and the question before deleting for good
+//! or emptying the trash. They look like the `?` overlay: a dark panel with
+//! a hairline border.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -21,7 +20,27 @@ pub fn draw(frame: &mut Frame, dialog: &Dialog, area: Rect) {
     match dialog {
         Dialog::Rename { input, .. } => name(frame, area, "Rename", input),
         Dialog::NewFolder { input, .. } => name(frame, area, "New Folder", input),
-        Dialog::Delete { paths, armed } => confirm(frame, area, paths, *armed),
+        Dialog::Delete { paths, armed } => {
+            let what = match paths.as_slice() {
+                [one] => {
+                    let name = one.file_name().unwrap_or(one.as_os_str());
+                    fit(&name.to_string_lossy(), 40)
+                }
+                several => ops::count(several.len()),
+            };
+            confirm(frame, area, "Delete for good?", &what, "Delete", *armed);
+        }
+        Dialog::EmptyTrash { paths, armed } => {
+            let what = ops::count(paths.len());
+            confirm(
+                frame,
+                area,
+                "Empty the trash?",
+                &what,
+                "Empty Trash",
+                *armed,
+            );
+        }
     }
 }
 
@@ -64,23 +83,17 @@ fn name(frame: &mut Frame, area: Rect, title: &str, input: &Input) {
     frame.set_cursor_position(Position::new(field.x + column, field.y));
 }
 
-/// The question before deleting for good, with its two choices.
-fn confirm(frame: &mut Frame, area: Rect, paths: &[PathBuf], armed: bool) {
+/// The question before deleting `what` for good, with its two choices:
+/// `yes`, which is lit once it is `armed`, and Cancel.
+fn confirm(frame: &mut Frame, area: Rect, asked: &str, what: &str, yes: &str, armed: bool) {
     let inner = panel(frame, area, 6);
     let rows = [1, 1, 2, 1, 1].map(Constraint::Length);
     let [title, _, text, _, choices] = Layout::vertical(rows).areas(inner);
-    let what = match paths {
-        [one] => {
-            let name = one.file_name().unwrap_or(one.as_os_str());
-            fit(&name.to_string_lossy(), 40)
-        }
-        several => ops::count(several.len()),
-    };
     let asks = format!("{what} will be deleted permanently. This can't be undone.");
-    frame.render_widget(Span::styled("Delete for good?", theme::title()), title);
+    frame.render_widget(Span::styled(asked, theme::title()), title);
     frame.render_widget(Paragraph::new(asks).wrap(Wrap { trim: true }), text);
     let line = Line::from(vec![
-        Span::styled("  Delete  ", theme::choice(armed)),
+        Span::styled(format!("  {yes}  "), theme::choice(armed)),
         Span::raw("  "),
         Span::styled("  Cancel  ", theme::choice(!armed)),
     ]);
@@ -205,6 +218,47 @@ mod tests {
         });
         let drawn = buffer(&mut f.app, 120, 30);
         let asks = "2 items will be deleted permanently. This can't be undone.";
+        assert!(find(&drawn, asks, 0..120).is_some());
+    }
+
+    #[test]
+    fn emptying_the_trash_asks_about_the_number_of_items_with_cancel_lit() {
+        let mut f = fixture();
+        let held = |name: &str| f.trash.join(name);
+        f.app.dialog = Some(Dialog::EmptyTrash {
+            paths: vec![held("a.txt"), held("b.txt"), held("Folder")],
+            armed: false,
+        });
+        let drawn = buffer(&mut f.app, 120, 30);
+        let title = find(&drawn, "Empty the trash?", 0..120).expect("the title");
+        assert_eq!(drawn[title].fg, theme::BRIGHT_FOREGROUND);
+        assert_eq!(drawn[title].bg, theme::DARK_BACKGROUND);
+        let asks = "3 items will be deleted permanently. This can't be undone.";
+        assert!(find(&drawn, asks, 0..120).is_some());
+        // The choice, not the title: it is followed by the gap before Cancel.
+        let empty = find(&drawn, "Empty Trash  ", 0..120).expect("the Empty Trash choice");
+        let cancel = find(&drawn, "Cancel", 0..120).expect("the Cancel choice");
+        assert_eq!(empty.1, cancel.1, "side by side");
+        assert_eq!(
+            drawn[cancel].bg,
+            theme::ACCENT,
+            "Cancel is what Enter takes"
+        );
+        assert_ne!(drawn[empty].bg, theme::ACCENT);
+        assert_eq!(find(&drawn, "Delete for good?", 0..120), None);
+
+        press(&mut f.app, &[KeyCode::Right]);
+        let drawn = buffer(&mut f.app, 120, 30);
+        assert_eq!(drawn[empty].bg, theme::ACCENT);
+        assert_ne!(drawn[cancel].bg, theme::ACCENT);
+
+        // One item is one item.
+        f.app.dialog = Some(Dialog::EmptyTrash {
+            paths: vec![held("a.txt")],
+            armed: false,
+        });
+        let drawn = buffer(&mut f.app, 120, 30);
+        let asks = "1 item will be deleted permanently. This can't be undone.";
         assert!(find(&drawn, asks, 0..120).is_some());
     }
 

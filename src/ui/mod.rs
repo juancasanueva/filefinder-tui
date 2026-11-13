@@ -6,6 +6,7 @@ mod dialog;
 mod grid;
 mod help;
 mod list;
+mod menu;
 mod sidebar;
 mod topbar;
 
@@ -30,7 +31,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(theme::base()), area);
     if let Some(thumbs) = &mut app.thumbs {
-        thumbs.cover(app.help_visible || app.dialog.is_some());
+        thumbs.cover(app.help_visible || app.dialog.is_some() || app.menu.is_some());
     }
 
     let [top, body] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
@@ -50,6 +51,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(body);
 
+    let mut place = Rect::new(side.x, side.y, 0, 0);
     if side.width > 0 {
         let block = Block::new()
             .borders(Borders::RIGHT)
@@ -57,8 +59,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let inner = block.inner(side);
         frame.render_widget(block, side);
         sidebar::draw(frame, app, inner);
+        place = place_cell(app, inner);
     }
-    draw_files(frame, app, files);
+    let item = draw_files(frame, app, files);
     // After the files: the selected item's big picture is asked for last, so
     // it is the first one made.
     if details.width > 0 {
@@ -70,6 +73,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         details::draw(frame, app, inner);
     }
 
+    if let Some(menu) = &app.menu {
+        // It opens next to what it is about: the place the keyboard is on
+        // in the sidebar, and otherwise the item under the cursor.
+        let anchor = if app.focus == Focus::Sidebar {
+            place
+        } else {
+            item
+        };
+        menu::draw(frame, menu, anchor, area);
+    }
     if app.help_visible {
         help::draw(frame, app, area);
     }
@@ -78,7 +91,62 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
+/// A column of the columns view with the hairline on its right, and the
+/// cells in front of a name in a row of the list or of a column, as those
+/// views draw them.
+const COLUMN_PITCH: u16 = 27;
+const NAME_INDENT: u16 = 4;
+
+/// The cells of the place the keyboard is on in the sidebar, which is drawn
+/// in `area`: two lines head each section, and a long sidebar is scrolled
+/// far enough for that place to show.
+fn place_cell(app: &App, area: Rect) -> Rect {
+    let (mut line, mut index, mut at) = (0usize, 0usize, 0usize);
+    for section in &app.sidebar {
+        line += 2;
+        for _ in &section.places {
+            if index == app.sidebar_cursor {
+                at = line;
+            }
+            line += 1;
+            index += 1;
+        }
+    }
+    let scrolled = (at + 1).saturating_sub(area.height as usize);
+    Rect::new(
+        area.x + 2,
+        area.y + at.saturating_sub(scrolled) as u16,
+        0,
+        1,
+    )
+}
+
+/// The cells of the item under the cursor of a pane whose view was just
+/// drawn in `area`: its row from the name on, or its tile's picture. With
+/// nothing under the cursor, the top of the pane.
+fn item_cell(app: &App, pane: usize, area: Rect) -> Rect {
+    let pane = &app.panes[pane];
+    let top = Rect::new(area.x + 2, area.y + 1, 0, 0);
+    if pane.entries.is_empty() {
+        return top;
+    }
+    // Lists have one row of air on top, and scroll by rows.
+    let row = area.y + 1 + pane.cursor.saturating_sub(pane.offset) as u16;
+    match app.view {
+        ViewMode::Grid => grid::thumb_rect(area, app.tile, pane.offset, pane.cursor).unwrap_or(top),
+        ViewMode::List => Rect::new(area.x + NAME_INDENT, row, 0, 1),
+        ViewMode::Columns => {
+            // The pane's own column is the last of the ones that fit.
+            let columns = pane.ancestors.len() as u16 + 1;
+            let before = (area.width / COLUMN_PITCH).clamp(1, columns) - 1;
+            Rect::new(area.x + before * COLUMN_PITCH + NAME_INDENT, row, 0, 1)
+        }
+    }
+}
+
+/// Draws the panes with what is said under them. Returns the cells of the
+/// item under the active pane's cursor.
+fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) -> Rect {
     // Under the view: what file work is under way, then what was last said.
     let [view, working, message] = Layout::vertical([
         Constraint::Min(0),
@@ -86,7 +154,7 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(u16::from(app.message.is_some())),
     ])
     .areas(area);
-    if app.panes.len() > 1 {
+    let item = if app.panes.len() > 1 {
         // Two panes side by side with a hairline between them, each under
         // its own path: the top bar only has room for the active one's.
         let left = view.width.saturating_sub(1).div_ceil(2);
@@ -100,15 +168,17 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
             .borders(Borders::LEFT)
             .border_style(theme::rule());
         frame.render_widget(hairline, rule);
+        let mut cells = [Rect::default(); 2];
         for (pane, area) in [left, right].into_iter().enumerate() {
             let [path, files] =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
             topbar::draw_pane_path(frame, app, pane, path);
-            draw_pane(frame, app, pane, files);
+            cells[pane] = draw_pane(frame, app, pane, files);
         }
+        cells[app.active.min(1)]
     } else {
-        draw_pane(frame, app, app.active, view);
-    }
+        draw_pane(frame, app, app.active, view)
+    };
 
     if let Some(label) = app.working() {
         let text = fit(&format!("  {label}"), working.width as usize);
@@ -126,10 +196,12 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
         let text = fit(&format!("  {}", note.text), message.width as usize);
         frame.render_widget(Paragraph::new(Line::from(text)).style(style), message);
     }
+    item
 }
 
-/// One pane's items in the view that is on.
-fn draw_pane(frame: &mut Frame, app: &mut App, pane: usize, area: Rect) {
+/// One pane's items in the view that is on. Returns the cells of the item
+/// under its cursor.
+fn draw_pane(frame: &mut Frame, app: &mut App, pane: usize, area: Rect) -> Rect {
     let focused = app.focus == Focus::Files && app.active == pane;
     // Lists show one blank row of air on top; the grid counts its own rows.
     app.panes[pane].page_rows = area.height.saturating_sub(1).max(1) as usize;
@@ -138,6 +210,7 @@ fn draw_pane(frame: &mut Frame, app: &mut App, pane: usize, area: Rect) {
         ViewMode::List => list::draw(frame, app, pane, area, focused),
         ViewMode::Columns => columns::draw(frame, app, pane, area, focused),
     }
+    item_cell(app, pane, area)
 }
 
 /// Draws a file's picture in the middle of `rect`, as much of it as is inside
@@ -379,6 +452,10 @@ mod tests {
             ("Ctrl+I", "Show or hide the details pane"),
             ("Ctrl+H", "Show hidden files"),
             ("Space", "Preview the selected file"),
+            (
+                "Alt+⏎",
+                "Everything else, for files and for drives in the sidebar",
+            ),
             ("Ctrl+C / X / V", "Copy, cut, paste"),
             ("Ctrl+Shift+C", "Copy the path as text"),
             ("F2 / Ctrl+Shift+D", "Rename / duplicate"),

@@ -7,16 +7,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::format::DateStyle;
 use crate::input::Input;
 use crate::model::{self, Entry, SortMode};
-use crate::ops::{self, Change, History, Kind, Report};
+use crate::ops::{self, Change, History, Kind, Report, Step};
 use crate::places::{self, Place, PlaceKind, Section};
 use crate::search::Walk;
-use crate::state::{self, Saved};
+use crate::state::{self, Saved, Trashed};
 use crate::system::System;
 use crate::thumbs::{Facts, Thumbs};
 
@@ -73,6 +74,106 @@ pub enum Dialog {
     /// Whether to delete `paths` for good. `armed` is whether Delete, rather
     /// than Cancel, is the lit choice.
     Delete { paths: Vec<PathBuf>, armed: bool },
+    /// Whether to empty the trash: to delete for good the `paths` it held
+    /// when the question was asked, and nothing that got there since.
+    EmptyTrash { paths: Vec<PathBuf>, armed: bool },
+}
+
+/// What a line of the menu does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Open,
+    Preview,
+    Rename,
+    Duplicate,
+    Copy,
+    Cut,
+    Paste,
+    PasteInto,
+    CopyPath,
+    Compress,
+    Pin,
+    Terminal,
+    Trash,
+    Delete,
+    NewFolder,
+    Restore,
+    EmptyTrash,
+    OpenPlace,
+    Unpin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuRow {
+    Item {
+        label: &'static str,
+        action: Action,
+        /// Whether it can be used right now; one that can't is shown dim.
+        enabled: bool,
+    },
+    /// The hairline between two groups.
+    Separator,
+}
+
+/// The menu for the selection, or for a place in the sidebar. While it is
+/// open every key goes to it.
+pub struct Menu {
+    pub rows: Vec<MenuRow>,
+    /// The line the keyboard is on: never a hairline.
+    pub cursor: usize,
+}
+
+impl Menu {
+    /// Groups of lines with a hairline between each two; the groups with
+    /// nothing in them are left out.
+    fn new(groups: Vec<Vec<MenuRow>>) -> Self {
+        let mut rows = Vec::new();
+        for group in groups.into_iter().filter(|group| !group.is_empty()) {
+            if !rows.is_empty() {
+                rows.push(MenuRow::Separator);
+            }
+            rows.extend(group);
+        }
+        Self { rows, cursor: 0 }
+    }
+
+    /// Moves to the next line up or down, over the hairlines; at either end
+    /// it stays where it is.
+    fn step(&mut self, down: bool) {
+        let is_item = |index: &usize| matches!(self.rows[*index], MenuRow::Item { .. });
+        let next = if down {
+            (self.cursor + 1..self.rows.len()).find(is_item)
+        } else {
+            (0..self.cursor).rev().find(is_item)
+        };
+        self.cursor = next.unwrap_or(self.cursor);
+    }
+
+    /// What Enter does on the line the keyboard is on: nothing on a dim one.
+    fn chosen(&self) -> Option<Action> {
+        match self.rows.get(self.cursor)? {
+            MenuRow::Item {
+                action,
+                enabled: true,
+                ..
+            } => Some(*action),
+            _ => None,
+        }
+    }
+}
+
+/// A line of the menu.
+fn item(label: &'static str, action: Action) -> MenuRow {
+    item_if(true, label, action)
+}
+
+/// A line of the menu that is dim unless `enabled`.
+fn item_if(enabled: bool, label: &'static str, action: Action) -> MenuRow {
+    MenuRow::Item {
+        label,
+        action,
+        enabled,
+    }
 }
 
 /// A field in the top bar. While one has the keyboard every key goes to it.
@@ -443,6 +544,8 @@ pub struct App {
     /// Lines of shortcuts shown last time, for Page Up and Page Down.
     pub help_rows: usize,
     pub dialog: Option<Dialog>,
+    /// The menu that is open: Alt+Enter.
+    pub menu: Option<Menu>,
     /// The field in the top bar that has the keyboard.
     pub field: Option<Field>,
     pub message: Option<Message>,
@@ -457,6 +560,9 @@ pub struct App {
     /// Every pinned folder, the ones that are gone included: they keep their
     /// line in the file and are only left out of the sidebar.
     pins: Vec<PathBuf>,
+    /// Where what this app moved to the trash came from, and when: one
+    /// record for each item, as long as it is there.
+    trashed: Vec<Trashed>,
     trash_dir: PathBuf,
     volumes_dir: PathBuf,
     state_dir: Option<PathBuf>,
@@ -475,6 +581,11 @@ impl App {
             .as_deref()
             .map(state::load_pins)
             .unwrap_or_default();
+        let trashed = config
+            .state_dir
+            .as_deref()
+            .map(state::load_trashed)
+            .unwrap_or_default();
         let mut app = Self {
             sidebar: Vec::new(),
             panes: vec![Pane::new(config.home.clone(), Vec::new())],
@@ -491,6 +602,7 @@ impl App {
             help_scroll: 0,
             help_rows: 1,
             dialog: None,
+            menu: None,
             field: None,
             message: None,
             should_quit: false,
@@ -501,6 +613,7 @@ impl App {
             history: History::default(),
             work: None,
             pins,
+            trashed,
             trash_dir: config.trash_dir,
             volumes_dir: config.volumes_dir,
             state_dir: config.state_dir,
@@ -603,6 +716,10 @@ impl App {
         // A key is the user taking over: the cursor is no longer moved to
         // what a search under way was asked to find again.
         self.pane_mut().want(Vec::new());
+        if let Some(menu) = self.menu.take() {
+            self.menu_key(menu, key);
+            return;
+        }
         if self.help_visible {
             // The shortcuts keep every key: these scroll or close them, and
             // no other reaches the files underneath.
@@ -626,6 +743,10 @@ impl App {
                 Field::Path(input) => self.path_key(input, key),
                 Field::Search => self.search_key(key),
             }
+            return;
+        }
+        if opens_menu(key) {
+            self.open_menu();
             return;
         }
         if self.file_key(key) {
@@ -712,6 +833,144 @@ impl App {
         true
     }
 
+    /// Alt+Enter: opens the menu for the selection, or for the place under
+    /// the cursor while the keyboard is in the sidebar.
+    fn open_menu(&mut self) {
+        let groups = if self.focus == Focus::Sidebar {
+            self.place_menu()
+        } else {
+            self.files_menu()
+        };
+        let menu = Menu::new(groups);
+        if !menu.rows.is_empty() {
+            self.menu = Some(menu);
+        }
+    }
+
+    /// The menu's lines for what is selected in the active pane, in groups.
+    fn files_menu(&self) -> Vec<Vec<MenuRow>> {
+        let pane = self.pane();
+        let empty_trash = item("Empty Trash…", Action::EmptyTrash);
+        let pasting = self.clipboard.is_some();
+        let Some(entry) = pane.selected() else {
+            if self.in_trash() {
+                return vec![vec![empty_trash]];
+            }
+            // Nothing to act on but the folder itself, where there is one.
+            let here = pane.is_folder();
+            return vec![vec![
+                item_if(here && pasting, "Paste", Action::Paste),
+                item_if(here, "New Folder", Action::NewFolder),
+                item_if(here, "Open Terminal Here", Action::Terminal),
+            ]];
+        };
+        if self.in_trash() {
+            let selection = vec![
+                item("Restore", Action::Restore),
+                item("Delete…", Action::Delete),
+            ];
+            return vec![selection, vec![empty_trash]];
+        }
+        let selection = self.selection();
+        let one = selection.len() == 1;
+        // An archive goes beside its items: they have to be in one folder.
+        let together = selection
+            .iter()
+            .all(|path| path.parent() == selection[0].parent());
+        let (mut paste_into, mut pin) = (None, None);
+        if entry.is_dir {
+            let label = if self.pins.contains(&entry.path) {
+                "Unpin"
+            } else {
+                "Pin"
+            };
+            paste_into = Some(item_if(
+                one && pasting,
+                "Paste Into Folder",
+                Action::PasteInto,
+            ));
+            pin = Some(item_if(one, label, Action::Pin));
+        }
+        let open = if entry.is_dir { "Open Folder" } else { "Open" };
+        let clipboard = [
+            Some(item("Copy", Action::Copy)),
+            Some(item("Cut", Action::Cut)),
+            paste_into,
+            Some(item("Copy Path", Action::CopyPath)),
+        ];
+        vec![
+            vec![item(open, Action::Open), item("Preview", Action::Preview)],
+            vec![
+                item_if(one, "Rename", Action::Rename),
+                item("Duplicate", Action::Duplicate),
+            ],
+            clipboard.into_iter().flatten().collect(),
+            vec![item_if(together, "Compress", Action::Compress)],
+            pin.into_iter().collect(),
+            vec![item("Open Terminal Here", Action::Terminal)],
+            vec![
+                item("Move to Trash", Action::Trash),
+                item("Delete…", Action::Delete),
+            ],
+        ]
+    }
+
+    /// The menu's lines for the sidebar place the keyboard is on.
+    fn place_menu(&self) -> Vec<Vec<MenuRow>> {
+        let Some(place) = self.places().nth(self.sidebar_cursor) else {
+            return Vec::new();
+        };
+        let more = match place.kind {
+            PlaceKind::Pinned => vec![item("Unpin", Action::Unpin)],
+            PlaceKind::Trash => vec![item("Empty Trash…", Action::EmptyTrash)],
+            _ => Vec::new(),
+        };
+        vec![vec![item("Open", Action::OpenPlace)], more]
+    }
+
+    /// A key pressed while the menu is open: it goes nowhere else.
+    fn menu_key(&mut self, mut menu: Menu, key: KeyEvent) {
+        match key.code {
+            // Closed, with nothing done.
+            KeyCode::Esc => return,
+            KeyCode::Up => menu.step(false),
+            KeyCode::Down => menu.step(true),
+            KeyCode::Enter => {
+                if let Some(action) = menu.chosen() {
+                    self.run(action);
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.menu = Some(menu);
+    }
+
+    /// Does what a line of the menu says, with the code its key runs.
+    fn run(&mut self, action: Action) {
+        match action {
+            Action::Open => self.open_selected(),
+            Action::Preview => self.preview_selected(),
+            Action::Rename => self.ask_rename(),
+            Action::Duplicate => self.duplicate(),
+            Action::Copy => self.take(false),
+            Action::Cut => self.take(true),
+            Action::Paste => self.paste(),
+            Action::PasteInto => self.paste_into_selected(),
+            Action::CopyPath => self.copy_path(),
+            Action::Compress => self.compress(),
+            Action::Pin => self.pin_selected(),
+            Action::Terminal => self.open_terminal(),
+            Action::Trash => self.trash(),
+            Action::Delete => self.ask_delete(),
+            Action::NewFolder => self.ask_new_folder(),
+            Action::Restore => self.restore(),
+            Action::EmptyTrash => self.ask_empty_trash(),
+            Action::OpenPlace => self.open_place(),
+            Action::Unpin => self.unpin_place(),
+        }
+    }
+
     /// A key pressed while a dialog is open: it goes nowhere else.
     fn dialog_key(&mut self, mut dialog: Dialog, key: KeyEvent) {
         match key.code {
@@ -727,7 +986,7 @@ impl App {
             Dialog::Rename { input, .. } | Dialog::NewFolder { input, .. } => {
                 input.handle_key(key);
             }
-            Dialog::Delete { armed, .. } => {
+            Dialog::Delete { armed, .. } | Dialog::EmptyTrash { armed, .. } => {
                 let switches = [
                     KeyCode::Left,
                     KeyCode::Right,
@@ -888,6 +1147,15 @@ impl App {
                 }
                 return;
             }
+            // The menu is for what was found: the keyboard moves on to
+            // that, as with Tab, and the menu opens.
+            _ if opens_menu(key) => {
+                if self.pane().results().is_none() {
+                    self.leave_search();
+                }
+                self.open_menu();
+                return;
+            }
             KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                 self.files_key(key)
             }
@@ -964,13 +1232,163 @@ impl App {
             Dialog::Delete { paths, armed: true } => {
                 let neighbour = self.neighbour(&paths);
                 let deleted = ops::delete(&paths);
+                self.keep_trash_records(None);
                 self.relist(&[], neighbour);
                 match deleted.error {
                     Some(error) => self.fail(error.to_string()),
                     None => self.note(&format!("Deleted {}.", ops::count(deleted.done))),
                 }
             }
-            Dialog::Delete { armed: false, .. } => {}
+            Dialog::EmptyTrash { paths, armed: true } => self.empty_trash(paths),
+            Dialog::Delete { armed: false, .. } | Dialog::EmptyTrash { armed: false, .. } => {}
+        }
+    }
+
+    /// Empty Trash…, in the menu: asks before deleting for good what the
+    /// trash folder holds. A trash that can't be listed is left alone.
+    fn ask_empty_trash(&mut self) {
+        if self.busy() {
+            return;
+        }
+        match ops::trash_items(&self.trash_dir) {
+            Ok(paths) if paths.is_empty() => self.note("The trash is already empty."),
+            Ok(paths) => {
+                self.dialog = Some(Dialog::EmptyTrash {
+                    paths,
+                    armed: false,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                self.fail(TRASH_REFUSED.to_string());
+            }
+            Err(error) => self.fail(read_error(&self.trash_dir, &error)),
+        }
+    }
+
+    /// Deletes for good what the trash held when the question was asked.
+    /// Only what is directly in the trash folder is ever deleted here.
+    fn empty_trash(&mut self, mut paths: Vec<PathBuf>) {
+        paths.retain(|path| path.parent() == Some(self.trash_dir.as_path()));
+        let deleted = ops::delete(&paths);
+        self.keep_trash_records(None);
+        if self.in_trash() && !self.pane().cwd.is_dir() {
+            // The pane was in a folder that went with the rest.
+            let trash = self.trash_dir.clone();
+            self.show_folder(&trash, None);
+        }
+        self.relist(&[], None);
+        match deleted.error {
+            Some(error) => self.fail(error.to_string()),
+            None => {
+                let items = ops::count(deleted.done);
+                self.note(&format!("Emptied the trash: {items} deleted."));
+            }
+        }
+    }
+
+    /// Where an item in the trash came from and when, if this app put it there.
+    pub fn trashed(&self, path: &Path) -> Option<&Trashed> {
+        self.trashed.iter().find(|record| record.at == path)
+    }
+
+    /// Brings the records of what is in the trash up to date after a change
+    /// to files: what `change` left in the trash is on record from now on,
+    /// with where it was before, and what is no longer there is forgotten.
+    /// The file is written when that changed anything.
+    fn keep_trash_records(&mut self, change: Option<&Change>) {
+        let before = self.trashed.clone();
+        // To the second, which is as fine as the file keeps it.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH);
+        let when = UNIX_EPOCH + Duration::from_secs(now.map_or(0, |now| now.as_secs()));
+        let steps = change.map(|change| change.steps.as_slice()).unwrap_or(&[]);
+        for step in steps {
+            let (at, from) = match step {
+                Step::Trashed { from, to } => (to, from),
+                // A copy or a new folder that was undone waits in the trash.
+                Step::Created {
+                    at,
+                    parked: Some(parked),
+                } => (parked, at),
+                // A restore that was undone: back in the trash, from where
+                // it had been restored to. A new name given inside the
+                // trash is no place it came from.
+                Step::Moved { from, to }
+                    if from.starts_with(&self.trash_dir) && !to.starts_with(&self.trash_dir) =>
+                {
+                    (from, to)
+                }
+                _ => continue,
+            };
+            self.trashed.retain(|record| record.at != *at);
+            self.trashed.push(Trashed {
+                at: at.clone(),
+                from: from.clone(),
+                when,
+            });
+        }
+        // Whichever way the change went, only what is in the trash now counts.
+        self.trashed
+            .retain(|record| std::fs::symlink_metadata(&record.at).is_ok());
+        if self.trashed != before
+            && let Some(dir) = &self.state_dir
+        {
+            // Without its record an item can still be deleted or moved by
+            // hand: no reason to interrupt.
+            let _ = state::save_trashed(dir, &self.trashed);
+        }
+    }
+
+    /// Restore, in the trash's menu: moves the selection back to where it
+    /// was before it was moved to the trash.
+    fn restore(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let paths = self.selection();
+        if paths.is_empty() {
+            return;
+        }
+        let neighbour = self.neighbour(&paths);
+        let place = |path: &PathBuf| self.trashed(path).map(|record| record.from.clone());
+        let items: Vec<_> = paths
+            .iter()
+            .map(|path| (path.clone(), place(path)))
+            .collect();
+        let report = ops::restore(&items, &self.trash_dir);
+        self.settle(report, neighbour);
+    }
+
+    /// Compress, in the menu: zips the selection into one archive beside it.
+    fn compress(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let paths = self.selection();
+        if paths.is_empty() {
+            return;
+        }
+        let name = match ops::archive_name(&paths) {
+            Ok(name) => name,
+            Err(error) => return self.fail(error.to_string()),
+        };
+        let zip = self.system.archiver(&paths);
+        self.start(format!("Compressing into {name}…"), move |cancel| {
+            ops::compress(&paths, cancel, |archive| zip(archive, cancel))
+        });
+    }
+
+    /// Open Terminal Here, in the menu: a terminal in the folder under the
+    /// cursor, in the folder of the file under it, or else in the folder
+    /// that is showing.
+    fn open_terminal(&mut self) {
+        let folder = match self.selected() {
+            Some(entry) if entry.is_dir => Some(entry.path.as_path()),
+            Some(entry) => entry.path.parent(),
+            None => Some(self.pane().cwd.as_path()),
+        };
+        let started = folder.is_some_and(|folder| self.system.open_terminal(folder).is_ok());
+        if !started {
+            self.fail("Couldn't start a terminal.".to_string());
         }
     }
 
@@ -1014,12 +1432,29 @@ impl App {
             self.note("Files can't be pasted here.");
             return;
         }
+        let folder = self.pane().cwd.clone();
+        self.paste_into(folder);
+    }
+
+    /// Paste Into Folder, in the menu: Ctrl+V with the folder under the
+    /// cursor in place of the one that is showing.
+    fn paste_into_selected(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let folder = self.selected().filter(|entry| entry.is_dir);
+        if let Some(folder) = folder.map(|entry| entry.path.clone()) {
+            self.paste_into(folder);
+        }
+    }
+
+    /// Copies what was taken into a folder, or moves it there when it was cut.
+    fn paste_into(&mut self, folder: PathBuf) {
         let Some(clipboard) = &self.clipboard else {
             self.note("There's nothing to paste.");
             return;
         };
         let (paths, cut) = (clipboard.paths.clone(), clipboard.cut);
-        let folder = self.pane().cwd.clone();
         let what = ops::count(paths.len());
         if cut {
             // A cut is pasted once.
@@ -1158,11 +1593,13 @@ impl App {
         }
         match self.history.undo(&self.trash_dir) {
             Ok(Some(change)) => {
+                self.keep_trash_records(Some(&change));
                 self.relist(&change.origins(), None);
                 self.note(&told("Undid", &change));
             }
             Ok(None) => self.note("There's nothing to undo."),
             Err(error) => {
+                self.keep_trash_records(None);
                 self.relist(&[], None);
                 self.fail(error.to_string());
             }
@@ -1175,11 +1612,13 @@ impl App {
         }
         match self.history.redo(&self.trash_dir) {
             Ok(Some(change)) => {
+                self.keep_trash_records(Some(&change));
                 self.relist(&change.landed(), None);
                 self.note(&told("Redid", &change));
             }
             Ok(None) => self.note("There's nothing to redo."),
             Err(error) => {
+                self.keep_trash_records(None);
                 self.relist(&[], None);
                 self.fail(error.to_string());
             }
@@ -1233,6 +1672,7 @@ impl App {
     fn settle(&mut self, report: Report, neighbour: Option<PathBuf>) {
         let message = outcome(&report);
         let landed = report.change.landed();
+        self.keep_trash_records(Some(&report.change));
         self.history.record(report.change);
         self.relist(&landed, neighbour);
         self.message = Some(message);
@@ -1401,19 +1841,23 @@ impl App {
         match key.code {
             KeyCode::Up => self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1),
             KeyCode::Down => self.sidebar_cursor = (self.sidebar_cursor + 1).min(last),
-            KeyCode::Enter | KeyCode::Right => {
-                let place = self.places().nth(self.sidebar_cursor);
-                let Some((kind, path)) = place.map(|place| (place.kind, place.path.clone())) else {
-                    return;
-                };
-                match kind {
-                    PlaceKind::Recents => self.open_recents(),
-                    _ => self.navigate(&path),
-                }
-                self.focus = Focus::Files;
-            }
+            KeyCode::Enter | KeyCode::Right => self.open_place(),
             _ => {}
         }
+    }
+
+    /// Enter in the sidebar: goes to the place the keyboard is on, and
+    /// hands the keyboard to the files.
+    fn open_place(&mut self) {
+        let place = self.places().nth(self.sidebar_cursor);
+        let Some((kind, path)) = place.map(|place| (place.kind, place.path.clone())) else {
+            return;
+        };
+        match kind {
+            PlaceKind::Recents => self.open_recents(),
+            _ => self.navigate(&path),
+        }
+        self.focus = Focus::Files;
     }
 
     fn details_key(&mut self, key: KeyEvent) {
@@ -1450,9 +1894,23 @@ impl App {
             self.note("Only folders can be pinned.");
             return;
         }
+        let folder = self.pane().cwd.clone();
+        self.toggle_pin_of(folder);
+    }
+
+    /// Pin, in the menu: Ctrl+P with the folder under the cursor in place
+    /// of the one that is showing.
+    fn pin_selected(&mut self) {
+        let folder = self.selected().filter(|entry| entry.is_dir);
+        if let Some(folder) = folder.map(|entry| entry.path.clone()) {
+            self.toggle_pin_of(folder);
+        }
+    }
+
+    /// Pins a folder to the sidebar, or unpins it when it is pinned.
+    fn toggle_pin_of(&mut self, folder: PathBuf) {
         // What Home lists is read again, so a folder made since counts.
         self.rebuild_sidebar();
-        let folder = self.pane().cwd.clone();
         let name = places::label(&folder);
         let mut pins = self.pins.clone();
         let under_home = |place: &Place| place.kind == PlaceKind::Home && place.path == folder;
@@ -1768,6 +2226,13 @@ impl App {
     }
 }
 
+/// Whether a key asks for the menu: Alt+Enter, or the Menu key where a
+/// keyboard has one and the terminal sends it.
+fn opens_menu(key: KeyEvent) -> bool {
+    let alt_enter = key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::ALT);
+    alt_enter || key.code == KeyCode::Menu
+}
+
 /// How a command over several items went, for the band.
 fn outcome(report: &Report) -> Message {
     if let Some(error) = &report.error {
@@ -1777,7 +2242,10 @@ fn outcome(report: &Report) -> Message {
         };
     }
     let done = ops::count(report.done);
-    let text = if report.stopped {
+    let text = if report.stopped && report.change.kind == Kind::Compress {
+        // One archive is made whole or not at all: there is no part to count.
+        "Stopped compressing.".to_string()
+    } else if report.stopped {
         let asked = ops::count(report.asked);
         format!("Stopped after {} of {asked}.", report.done)
     } else if report.done == 0 && report.skipped > 0 {
@@ -1787,6 +2255,8 @@ fn outcome(report: &Report) -> Message {
             Kind::Copy => format!("Copied {done}."),
             Kind::Duplicate => format!("Duplicated {done}."),
             Kind::Trash => format!("Moved {done} to the trash."),
+            Kind::Compress => format!("Compressed into {}.", report.change.name()),
+            Kind::Restore => format!("Restored {done}."),
             Kind::Move | Kind::Rename | Kind::NewFolder => format!("Moved {done}."),
         }
     };
@@ -1808,6 +2278,8 @@ fn told(verb: &str, change: &Change) -> String {
         Kind::Duplicate => format!("{verb} duplicating {name}."),
         Kind::Rename => format!("{verb} renaming {name}."),
         Kind::NewFolder => format!("{verb} making {name}."),
+        Kind::Compress => format!("{verb} compressing into {name}."),
+        Kind::Restore => format!("{verb} restoring {items}."),
     }
 }
 
@@ -1843,6 +2315,7 @@ fn read_error(path: &Path, error: &io::Error) -> String {
 #[cfg(test)]
 pub mod testing {
     use super::*;
+    use crate::system::Archiver;
     use crate::thumbs::testing::FakeThumbnailer;
     use std::cell::{Cell, RefCell};
     use std::fs;
@@ -1861,6 +2334,24 @@ pub mod testing {
         pub recents: Rc<RefCell<Vec<PathBuf>>>,
         /// How many times it was asked.
         pub asked: Rc<Cell<usize>>,
+        /// Every folder a terminal was opened in.
+        pub terminals: Rc<RefCell<Vec<PathBuf>>>,
+        /// Whether no terminal can be started.
+        pub no_terminal: Rc<Cell<bool>>,
+        /// How the stand-in for the program that zips behaves.
+        pub archiving: Rc<Cell<Archiving>>,
+    }
+
+    /// What the stand-in for the program that zips does with an archive. One
+    /// it writes holds the names of what went in, a line each.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum Archiving {
+        #[default]
+        Works,
+        /// Writes half an archive, then fails.
+        Fails,
+        /// Writes half an archive, then goes on until it is stopped.
+        Hangs,
     }
 
     impl System for FakeSystem {
@@ -1882,6 +2373,32 @@ pub mod testing {
         fn recents(&self, limit: usize) -> Vec<PathBuf> {
             self.asked.set(self.asked.get() + 1);
             self.recents.borrow().iter().take(limit).cloned().collect()
+        }
+
+        fn open_terminal(&self, folder: &Path) -> io::Result<()> {
+            if self.no_terminal.get() {
+                return Err(io::Error::other("no terminal started"));
+            }
+            self.terminals.borrow_mut().push(folder.to_path_buf());
+            Ok(())
+        }
+
+        fn archiver(&self, items: &[PathBuf]) -> Archiver {
+            let names: Vec<String> = items.iter().map(|item| name_of(item)).collect();
+            let archiving = self.archiving.get();
+            Box::new(move |archive, stop| {
+                if archiving == Archiving::Works {
+                    return fs::write(archive, names.join("\n"));
+                }
+                fs::write(archive, "half an archive")?;
+                while archiving == Archiving::Hangs && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(match archiving {
+                    Archiving::Hangs => io::ErrorKind::Interrupted.into(),
+                    _ => io::Error::other("the archive couldn't be written"),
+                })
+            })
         }
     }
 
@@ -4758,5 +5275,879 @@ mod tests {
         );
         press(&mut f.app, &[KeyCode::F(2)]);
         assert!(matches!(f.app.dialog, Some(Dialog::Rename { .. })));
+    }
+
+    // The menu. The program that zips and the terminal are fakes, the trash
+    // is the fixture's own folder, and so is where its records are kept.
+
+    /// The lines of the menu that is open: the labels, and a dash for each
+    /// hairline between two groups.
+    fn menu(app: &App) -> Vec<&str> {
+        let rows = &app.menu.as_ref().expect("no menu is open").rows;
+        let line = |row: &MenuRow| match row {
+            MenuRow::Item { label, .. } => *label,
+            MenuRow::Separator => "-",
+        };
+        rows.iter().map(line).collect()
+    }
+
+    /// The labels of the lines that can't be used right now.
+    fn dim(app: &App) -> Vec<&str> {
+        let rows = &app.menu.as_ref().expect("no menu is open").rows;
+        let unusable = |row: &MenuRow| match row {
+            MenuRow::Item {
+                label,
+                enabled: false,
+                ..
+            } => Some(*label),
+            _ => None,
+        };
+        rows.iter().filter_map(unusable).collect()
+    }
+
+    fn menu_cursor(app: &App) -> usize {
+        app.menu.as_ref().expect("no menu is open").cursor
+    }
+
+    /// Alt+Enter, down to the line with this label, and Enter.
+    fn pick(app: &mut App, label: &str) {
+        app.handle_key(alt(KeyCode::Enter));
+        let lines = menu(app);
+        let row = lines.iter().position(|line| *line == label);
+        let row = row.unwrap_or_else(|| panic!("{label} isn't in {lines:?}"));
+        while menu_cursor(app) != row {
+            let before = menu_cursor(app);
+            press(app, &[KeyCode::Down]);
+            assert_ne!(menu_cursor(app), before, "{label} can't be reached");
+        }
+        press(app, &[KeyCode::Enter]);
+    }
+
+    /// Every name in a folder on disk, the hidden ones too.
+    fn all_on_disk(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(folder)
+            .unwrap()
+            .map(|item| item.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    const FILE_MENU: [&str; 16] = [
+        "Open",
+        "Preview",
+        "-",
+        "Rename",
+        "Duplicate",
+        "-",
+        "Copy",
+        "Cut",
+        "Copy Path",
+        "-",
+        "Compress",
+        "-",
+        "Open Terminal Here",
+        "-",
+        "Move to Trash",
+        "Delete…",
+    ];
+
+    const FOLDER_MENU: [&str; 19] = [
+        "Open Folder",
+        "Preview",
+        "-",
+        "Rename",
+        "Duplicate",
+        "-",
+        "Copy",
+        "Cut",
+        "Paste Into Folder",
+        "Copy Path",
+        "-",
+        "Compress",
+        "-",
+        "Pin",
+        "-",
+        "Open Terminal Here",
+        "-",
+        "Move to Trash",
+        "Delete…",
+    ];
+
+    #[test]
+    fn alt_enter_and_the_menu_key_open_a_menu_for_the_item_under_the_cursor() {
+        let mut f = fixture();
+        select(&mut f.app, "notes.txt");
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert_eq!(menu(&f.app), FILE_MENU);
+        assert!(dim(&f.app).is_empty());
+        assert_eq!(menu_cursor(&f.app), 0);
+        // Escape closes it with nothing done.
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.menu.is_none());
+        assert!(f.system.opened.borrow().is_empty());
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+
+        // A folder has more to offer; with nothing copied, nothing to paste.
+        select(&mut f.app, "Pictures");
+        press(&mut f.app, &[KeyCode::Menu]);
+        assert_eq!(menu(&f.app), FOLDER_MENU);
+        assert_eq!(dim(&f.app), ["Paste Into Folder"]);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.app.pane().cwd, f.home, "it was not opened");
+
+        // From the details pane it is the same item's menu.
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.focus, Focus::Details);
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert_eq!(menu(&f.app), FOLDER_MENU);
+    }
+
+    #[test]
+    fn the_menu_keeps_every_key_to_itself_and_up_and_down_skip_the_hairlines() {
+        let mut f = fixture();
+        select(&mut f.app, "notes.txt");
+        f.app.handle_key(ctrl_shift('c'));
+        assert!(f.app.message.is_some());
+        f.app.handle_key(alt(KeyCode::Enter));
+
+        let mut stops = Vec::new();
+        for code in [
+            KeyCode::Down,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Up,
+            KeyCode::Up,
+        ] {
+            press(&mut f.app, &[code]);
+            stops.push(menu_cursor(&f.app));
+        }
+        assert_eq!(stops, [1, 3, 1, 0, 0], "over the hairline, and no further");
+        press(&mut f.app, &[KeyCode::Down; 30]);
+        assert_eq!(menu_cursor(&f.app), FILE_MENU.len() - 1);
+
+        // No other key reaches what is underneath.
+        for other in [
+            key(KeyCode::Char('q')),
+            key(KeyCode::Char('?')),
+            key(KeyCode::Char('/')),
+            key(KeyCode::Char(' ')),
+            key(KeyCode::Delete),
+            key(KeyCode::F(2)),
+            key(KeyCode::Tab),
+            key(KeyCode::Backspace),
+            key(KeyCode::Home),
+            ctrl(KeyCode::Char('a')),
+            ctrl(KeyCode::Char('l')),
+            ctrl_shift('n'),
+            alt(KeyCode::Left),
+        ] {
+            f.app.handle_key(other);
+            assert_eq!(menu_cursor(&f.app), FILE_MENU.len() - 1, "{other:?}");
+        }
+        assert!(!f.app.should_quit && !f.app.help_visible);
+        assert!(f.app.dialog.is_none() && f.app.field.is_none());
+        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+        assert!(f.system.previewed.borrow().is_empty());
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
+
+        // Escape closes the menu first; what was said goes with the next one.
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.menu.is_none());
+        assert_eq!(said(&f.app), ("Copied the path.", false));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.app.message, None);
+    }
+
+    #[test]
+    fn the_menu_items_run_what_their_keys_run() {
+        let mut f = fixture();
+        let notes = f.home.join("notes.txt");
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Open");
+        assert!(f.app.menu.is_none(), "chosen, it closes");
+        let only_notes = std::slice::from_ref(&notes);
+        assert_eq!(f.system.opened.borrow().as_slice(), only_notes);
+        pick(&mut f.app, "Preview");
+        assert_eq!(f.system.previewed.borrow().as_slice(), only_notes);
+        pick(&mut f.app, "Copy Path");
+        assert_eq!(*f.system.copied.borrow(), [notes.display().to_string()]);
+        assert_eq!(said(&f.app), ("Copied the path.", false));
+
+        pick(&mut f.app, "Rename");
+        assert_eq!(field(&f.app), ("notes.txt".to_string(), 5));
+        press(&mut f.app, &[KeyCode::Esc]);
+
+        pick(&mut f.app, "Duplicate");
+        assert_eq!(f.app.working(), Some("Duplicating notes.txt…"));
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("notes (copy).txt")), "hello");
+
+        select(&mut f.app, "notes (copy).txt");
+        pick(&mut f.app, "Move to Trash");
+        assert_eq!(on_disk(&f.trash), ["notes (copy).txt"]);
+        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
+
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Delete…");
+        let Some(Dialog::Delete { paths, armed }) = &f.app.dialog else {
+            panic!("it didn't ask");
+        };
+        assert_eq!((paths.as_slice(), *armed), ([notes].as_slice(), false));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+
+        select(&mut f.app, "Pictures");
+        pick(&mut f.app, "Open Folder");
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+    }
+
+    #[test]
+    fn copy_cut_and_paste_work_from_the_menu_and_paste_into_folder_pastes_into_it() {
+        let mut f = fixture();
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Copy");
+        assert_eq!(said(&f.app), ("1 item ready to paste.", false));
+
+        select(&mut f.app, "Pictures");
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert!(dim(&f.app).is_empty(), "now there is something to paste");
+        press(&mut f.app, &[KeyCode::Esc]);
+        pick(&mut f.app, "Paste Into Folder");
+        assert_eq!(f.app.working(), Some("Copying 1 item…"));
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("Pictures").join("notes.txt")), "hello");
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
+        assert_eq!(f.app.pane().cwd, f.home, "the pane stays where it was");
+
+        // Cut here, pasted in a folder with nothing in it to open a menu on.
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Cut");
+        assert_eq!(said(&f.app), ("1 item ready to move.", false));
+        select(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Enter]);
+        pick(&mut f.app, "Paste");
+        assert_eq!(f.app.working(), Some("Moving 1 item…"));
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&f.home.join("Documents")), ["notes.txt"]);
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
+    }
+
+    #[test]
+    fn in_an_empty_folder_the_menu_offers_paste_a_new_folder_and_a_terminal() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert!(names(&f.app).is_empty());
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert_eq!(menu(&f.app), ["Paste", "New Folder", "Open Terminal Here"]);
+        assert_eq!(dim(&f.app), ["Paste"], "nothing was copied or cut");
+        // A dim line does nothing, and the menu stays.
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(menu_cursor(&f.app), 0);
+        assert_eq!((f.app.working(), &f.app.message), (None, &None));
+        press(&mut f.app, &[KeyCode::Esc]);
+
+        pick(&mut f.app, "New Folder");
+        assert_eq!(field(&f.app), ("New Folder".to_string(), 10));
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(on_disk(&f.home.join("Documents")), ["New Folder"]);
+    }
+
+    #[test]
+    fn what_the_listing_forbids_is_dim_in_the_menu_and_does_nothing() {
+        let mut f = several();
+        select(&mut f.app, "a.txt");
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        // Two folders selected, the cursor on the second.
+        press(&mut f.app, &[KeyCode::Home]);
+        f.app.handle_key(shift(KeyCode::Down));
+        assert_eq!(chosen(&f.app), ["Documents", "Pictures"]);
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert_eq!(menu(&f.app), FOLDER_MENU);
+        assert_eq!(dim(&f.app), ["Rename", "Paste Into Folder", "Pin"]);
+        press(&mut f.app, &[KeyCode::Esc]);
+        for refused in ["Rename", "Paste Into Folder", "Pin"] {
+            pick(&mut f.app, refused);
+            assert!(f.app.menu.is_some(), "{refused}");
+            assert!(f.app.dialog.is_none() && f.app.working().is_none());
+            press(&mut f.app, &[KeyCode::Esc]);
+        }
+        assert_eq!(chosen(&f.app), ["Documents", "Pictures"]);
+        assert_eq!(sections(&f.app), [home_places(), views()]);
+
+        // What a search found in several folders has no one folder for an archive.
+        fs::write(f.home.join("Pictures").join("b.txt"), "b").unwrap();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "b.txt");
+        finish_search(&mut f.app);
+        press(&mut f.app, &[KeyCode::Tab]);
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(chosen(&f.app).len(), 2);
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert_eq!(dim(&f.app), ["Rename", "Compress"]);
+        press(&mut f.app, &[KeyCode::Esc, KeyCode::Esc]);
+
+        // Recents with nothing in them: nothing is pasted or made there.
+        open_place(&mut f.app, "Recents");
+        assert!(names(&f.app).is_empty());
+        f.app.handle_key(alt(KeyCode::Enter));
+        let nothing = ["Paste", "New Folder", "Open Terminal Here"];
+        assert_eq!(menu(&f.app), nothing);
+        assert_eq!(dim(&f.app), nothing);
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        assert!(f.app.dialog.is_none() && f.app.menu.is_some());
+        assert_eq!(on_disk(&f.home).len(), 8);
+    }
+
+    #[test]
+    fn in_the_sidebar_the_menu_is_for_the_place_under_the_cursor() {
+        let mut f = fixture();
+        let trip = f.home.join("Pictures").join("Trip");
+        f.app.navigate(&trip);
+        pin(&mut f.app);
+        for (place, lines) in [
+            ("Documents", vec!["Open"]),
+            ("Trip", vec!["Open", "-", "Unpin"]),
+            ("Recents", vec!["Open"]),
+            ("Trash", vec!["Open", "-", "Empty Trash…"]),
+        ] {
+            go_to_place(&mut f.app, place);
+            f.app.handle_key(alt(KeyCode::Enter));
+            assert_eq!(menu(&f.app), lines, "{place}");
+            assert!(dim(&f.app).is_empty());
+            press(&mut f.app, &[KeyCode::Esc]);
+            assert_eq!(f.app.focus, Focus::Sidebar);
+        }
+        assert_eq!(f.app.pane().cwd, trip, "nothing was opened yet");
+
+        // Open goes there, as Enter does.
+        go_to_place(&mut f.app, "Documents");
+        pick(&mut f.app, "Open");
+        assert_eq!(f.app.pane().cwd, f.home.join("Documents"));
+        assert_eq!(f.app.focus, Focus::Files);
+        go_to_place(&mut f.app, "Recents");
+        pick(&mut f.app, "Open");
+        assert!(f.app.pane().recents());
+
+        // Unpin takes the pin away, as Delete does there.
+        go_to_place(&mut f.app, "Trip");
+        pick(&mut f.app, "Unpin");
+        assert_eq!(sections(&f.app), [home_places(), views()]);
+        assert!(trip.is_dir(), "the folder itself is left alone");
+    }
+
+    #[test]
+    fn open_terminal_here_starts_one_in_the_folder_or_in_the_files_folder() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        select(&mut f.app, "Pictures");
+        pick(&mut f.app, "Open Terminal Here");
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Open Terminal Here");
+        // With nothing under the cursor it is the folder that is showing.
+        select(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Enter]);
+        pick(&mut f.app, "Open Terminal Here");
+        assert_eq!(
+            *f.system.terminals.borrow(),
+            [pictures, f.home.clone(), f.home.join("Documents")]
+        );
+        assert_eq!(f.app.message, None);
+
+        f.system.no_terminal.set(true);
+        pick(&mut f.app, "Open Terminal Here");
+        assert_eq!(said(&f.app), ("Couldn't start a terminal.", true));
+        assert_eq!(f.system.terminals.borrow().len(), 3);
+    }
+
+    #[test]
+    fn pin_in_the_menu_pins_the_folder_under_the_cursor() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(selected_name(&f.app), Some("Trip"));
+        pick(&mut f.app, "Pin");
+        assert_eq!(sections(&f.app)[1], ("Pinned", vec!["Trip"]));
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+
+        // Pinned, the line takes the pin away again.
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert!(menu(&f.app).contains(&"Unpin") && !menu(&f.app).contains(&"Pin"));
+        press(&mut f.app, &[KeyCode::Esc]);
+        pick(&mut f.app, "Unpin");
+        assert_eq!(sections(&f.app), [home_places(), views()]);
+
+        // What Home already lists is refused in the words Ctrl+P uses.
+        press(&mut f.app, &[KeyCode::Backspace]);
+        select(&mut f.app, "Documents");
+        pick(&mut f.app, "Pin");
+        assert_eq!(said(&f.app), ("Documents is already under Home.", false));
+        assert_eq!(sections(&f.app), [home_places(), views()]);
+    }
+
+    #[test]
+    fn compress_makes_a_zip_beside_the_item_and_undo_moves_it_to_the_trash() {
+        let mut f = fixture();
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Compress");
+        assert_eq!(f.app.working(), Some("Compressing into notes.txt.zip…"));
+        finish_work(&mut f.app);
+        assert_eq!(
+            all_on_disk(&f.home),
+            [
+                ".hidden",
+                "Documents",
+                "Pictures",
+                "notes.txt",
+                "notes.txt.zip"
+            ],
+            "the archive, and nothing left over from making it"
+        );
+        assert_eq!(read(f.home.join("notes.txt.zip")), "notes.txt");
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+        assert_eq!(said(&f.app), ("Compressed into notes.txt.zip.", false));
+        // The folder was listed again, the cursor on the archive.
+        assert_eq!(
+            names(&f.app),
+            ["Documents", "Pictures", "notes.txt", "notes.txt.zip"]
+        );
+        assert_eq!(selected_name(&f.app), Some("notes.txt.zip"));
+
+        f.app.handle_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
+        assert_eq!(read(f.trash.join("notes.txt.zip")), "notes.txt");
+        let undid = "Undid compressing into notes.txt.zip.";
+        assert_eq!(said(&f.app), (undid, false));
+        // There it is known like anything else this app moved to the trash.
+        let known = f.app.trashed(&f.trash.join("notes.txt.zip"));
+        assert_eq!(
+            known.map(|record| &record.from),
+            Some(&f.home.join("notes.txt.zip"))
+        );
+        f.app.handle_key(ctrl_shift('z'));
+        assert_eq!(read(f.home.join("notes.txt.zip")), "notes.txt");
+        assert!(on_disk(&f.trash).is_empty());
+        let redid = "Redid compressing into notes.txt.zip.";
+        assert_eq!(said(&f.app), (redid, false));
+    }
+
+    #[test]
+    fn compressing_several_items_makes_archive_zip_and_a_taken_name_keeps_both() {
+        let mut f = fixture();
+        f.app.handle_key(shift(KeyCode::Down));
+        assert_eq!(chosen(&f.app), ["Documents", "Pictures"]);
+        pick(&mut f.app, "Compress");
+        assert_eq!(f.app.working(), Some("Compressing into Archive.zip…"));
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("Archive.zip")), "Documents\nPictures");
+        assert_eq!(selected_name(&f.app), Some("Archive.zip"));
+        assert_eq!(said(&f.app), ("Compressed into Archive.zip.", false));
+
+        // Again: the name is taken, and what has it is not written over.
+        fs::write(f.home.join("Archive.zip"), "the first one").unwrap();
+        press(&mut f.app, &[KeyCode::Home]);
+        f.app.handle_key(shift(KeyCode::Down));
+        pick(&mut f.app, "Compress");
+        let second = "Compressing into Archive (copy).zip…";
+        assert_eq!(f.app.working(), Some(second));
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("Archive.zip")), "the first one");
+        assert_eq!(
+            read(f.home.join("Archive (copy).zip")),
+            "Documents\nPictures"
+        );
+        assert_eq!(selected_name(&f.app), Some("Archive (copy).zip"));
+
+        // The same for one item.
+        fs::write(f.home.join("notes.txt.zip"), "someone else's").unwrap();
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Compress");
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("notes.txt.zip")), "someone else's");
+        assert_eq!(read(f.home.join("notes.txt (copy).zip")), "notes.txt");
+        assert_eq!(
+            all_on_disk(&f.home),
+            [
+                ".hidden",
+                "Archive (copy).zip",
+                "Archive.zip",
+                "Documents",
+                "Pictures",
+                "notes.txt",
+                "notes.txt (copy).zip",
+                "notes.txt.zip",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_compress_that_is_stopped_or_fails_leaves_nothing_behind() {
+        let mut f = fixture();
+        let untouched = [".hidden", "Documents", "Pictures", "notes.txt"];
+        f.system.archiving.set(Archiving::Hangs);
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Compress");
+        assert_eq!(f.app.working(), Some("Compressing into notes.txt.zip…"));
+        // The window isn't frozen meanwhile, and other changes wait.
+        f.app.tick();
+        press(&mut f.app, &[KeyCode::Delete]);
+        let wait = ("Try again once the work under way is done.", false);
+        assert_eq!(said(&f.app), wait);
+        assert_eq!(f.app.working(), Some("Compressing into notes.txt.zip…"));
+
+        press(&mut f.app, &[KeyCode::Esc]);
+        finish_work(&mut f.app);
+        assert_eq!(said(&f.app), ("Stopped compressing.", false));
+        assert_eq!(all_on_disk(&f.home), untouched);
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+        f.app.handle_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("There's nothing to undo.", false));
+
+        f.system.archiving.set(Archiving::Fails);
+        pick(&mut f.app, "Compress");
+        finish_work(&mut f.app);
+        let why = "Couldn't compress: The archive couldn't be written.";
+        assert_eq!(said(&f.app), (why, true));
+        assert_eq!(all_on_disk(&f.home), untouched);
+        f.app.handle_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("There's nothing to undo.", false));
+    }
+
+    /// The fixture's home with an app of its own that remembers things in
+    /// `.state`, showing a list.
+    fn remembering(f: &Fixture) -> (App, PathBuf) {
+        let state = f.home.join(".state");
+        let mut app = launch(&f.home, Some(&state));
+        app.view = ViewMode::List;
+        (app, state)
+    }
+
+    #[test]
+    fn what_goes_to_the_trash_is_on_record_with_where_it_came_from_until_it_leaves() {
+        let f = fixture();
+        let (mut app, state) = remembering(&f);
+        let (notes, in_trash) = (f.home.join("notes.txt"), f.trash.join("notes.txt"));
+        select(&mut app, "notes.txt");
+        press(&mut app, &[KeyCode::Delete]);
+        let records = state::load_trashed(&state);
+        let [record] = records.as_slice() else {
+            panic!("not one record: {records:?}");
+        };
+        assert_eq!((&record.at, &record.from), (&in_trash, &notes));
+        let age = std::time::SystemTime::now().duration_since(record.when);
+        assert!(age.unwrap() < std::time::Duration::from_secs(60));
+        // One line: when, where it is, where it was.
+        let line = format!("\t{}\t{}\n", in_trash.display(), notes.display());
+        let written = read(state.join("trashed"));
+        assert!(written.ends_with(&line), "{written}");
+        assert_eq!(written.lines().count(), 1);
+        assert_eq!(app.trashed(&in_trash), Some(record));
+
+        // Undoing the trash removes its record; redoing it records it again.
+        app.handle_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+        assert_eq!(read(state.join("trashed")), "");
+        assert_eq!(app.trashed(&in_trash), None);
+        app.handle_key(ctrl_shift('z'));
+        assert_eq!(state::load_trashed(&state).len(), 1);
+
+        // What left the trash behind the app's back is dropped the next
+        // time the file is written.
+        fs::remove_file(&in_trash).unwrap();
+        select(&mut app, "Pictures");
+        press(&mut app, &[KeyCode::Delete]);
+        let records = state::load_trashed(&state);
+        let kept: Vec<&PathBuf> = records.iter().map(|record| &record.at).collect();
+        assert_eq!(kept, [&f.trash.join("Pictures")]);
+
+        // The records are there after a restart.
+        let (again, _) = remembering(&f);
+        let from = again.trashed(&f.trash.join("Pictures"));
+        assert_eq!(
+            from.map(|record| &record.from),
+            Some(&f.home.join("Pictures"))
+        );
+    }
+
+    const TRASH_MENU: [&str; 4] = ["Restore", "Delete…", "-", "Empty Trash…"];
+
+    #[test]
+    fn restore_moves_what_is_selected_back_to_where_it_came_from() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        select(&mut f.app, "a.jpg");
+        press(&mut f.app, &[KeyCode::Delete, KeyCode::Backspace]);
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
+
+        open_place(&mut f.app, "Trash");
+        assert_eq!(names(&f.app), ["a.jpg", "notes.txt"]);
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert_eq!(menu(&f.app), TRASH_MENU);
+        assert!(dim(&f.app).is_empty());
+        press(&mut f.app, &[KeyCode::Esc]);
+
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        pick(&mut f.app, "Restore");
+        assert_eq!(said(&f.app), ("Restored 2 items.", false));
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+        assert_eq!(read(pictures.join("a.jpg")), "jpg");
+        assert!(on_disk(&f.trash).is_empty());
+        assert!(names(&f.app).is_empty(), "the trash was listed again");
+        assert_eq!(f.app.trashed(&f.trash.join("a.jpg")), None);
+
+        // Undone, they are in the trash again, and still known there.
+        f.app.handle_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("Undid restoring 2 items.", false));
+        assert_eq!(on_disk(&f.trash), ["a.jpg", "notes.txt"]);
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
+        assert_eq!(on_disk(&pictures), ["Trip"]);
+        let known = f.app.trashed(&f.trash.join("a.jpg"));
+        assert_eq!(
+            known.map(|record| &record.from),
+            Some(&pictures.join("a.jpg"))
+        );
+
+        // One at a time works the same.
+        select(&mut f.app, "a.jpg");
+        pick(&mut f.app, "Restore");
+        assert_eq!(said(&f.app), ("Restored 1 item.", false));
+        assert_eq!(on_disk(&pictures), ["Trip", "a.jpg"]);
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        assert_eq!(on_disk(&f.trash), ["notes.txt"]);
+    }
+
+    #[test]
+    fn a_restore_that_cannot_be_done_says_why_and_leaves_the_item_in_the_trash() {
+        let mut f = fixture();
+        // Its name was taken since.
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Delete]);
+        fs::write(f.home.join("notes.txt"), "written since").unwrap();
+        // The folder it was in is gone.
+        let trip = f.home.join("Pictures").join("Trip");
+        fs::write(trip.join("day.jpg"), "day").unwrap();
+        f.app.navigate(&trip);
+        press(&mut f.app, &[KeyCode::Delete]);
+        f.app.navigate(&f.home.clone());
+        fs::remove_dir(&trip).unwrap();
+        // Something else put it in the trash.
+        fs::write(f.trash.join("stray.txt"), "stray").unwrap();
+
+        open_place(&mut f.app, "Trash");
+        let in_trash = ["day.jpg", "notes.txt", "stray.txt"];
+        assert_eq!(names(&f.app), in_trash);
+        let home = f.home.file_name().unwrap().to_string_lossy().into_owned();
+        let taken = format!("Couldn't restore notes.txt: notes.txt already exists in {home}.");
+        for (item, why) in [
+            ("notes.txt", taken.as_str()),
+            (
+                "day.jpg",
+                "Couldn't restore day.jpg: Trip isn't there any more.",
+            ),
+            (
+                "stray.txt",
+                "stray.txt has no record of where it came from.",
+            ),
+        ] {
+            select(&mut f.app, item);
+            pick(&mut f.app, "Restore");
+            assert_eq!(said(&f.app), (why, true));
+            assert_eq!(on_disk(&f.trash), in_trash, "{item} stays");
+            assert_eq!(names(&f.app), in_trash);
+        }
+        assert_eq!(read(f.home.join("notes.txt")), "written since");
+        assert_eq!(read(f.trash.join("notes.txt")), "hello");
+        assert!(!trip.exists(), "the folder is not made again");
+        // Nothing was moved, so the last thing to undo is still the trashing.
+        assert!(f.app.trashed(&f.trash.join("day.jpg")).is_some());
+    }
+
+    #[test]
+    fn empty_trash_asks_first_and_deletes_only_what_the_trash_holds() {
+        let f = fixture();
+        let (mut app, state) = remembering(&f);
+        let kept = f.home.join("Documents").join("kept.txt");
+        fs::write(&kept, "keep").unwrap();
+        select(&mut app, "notes.txt");
+        press(&mut app, &[KeyCode::Delete]);
+        select(&mut app, "Pictures");
+        press(&mut app, &[KeyCode::Delete]);
+        // Links someone put there, to things that have to outlive them.
+        std::os::unix::fs::symlink(f.home.join("Documents"), f.trash.join("to folder")).unwrap();
+        std::os::unix::fs::symlink(&kept, f.trash.join("to file")).unwrap();
+        fs::write(f.trash.join(".DS_Store"), "Finder's").unwrap();
+        let held = ["Pictures", "notes.txt", "to file", "to folder"];
+        assert_eq!(on_disk(&f.trash), held);
+        assert_eq!(state::load_trashed(&state).len(), 2);
+
+        open_place(&mut app, "Trash");
+        pick(&mut app, "Empty Trash…");
+        let Some(Dialog::EmptyTrash { paths, armed }) = &app.dialog else {
+            panic!("it didn't ask");
+        };
+        assert_eq!((paths.len(), *armed), (4, false));
+        // Cancel is what Enter takes, and Escape is a cancel too.
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.dialog.is_none());
+        assert_eq!(on_disk(&f.trash), held);
+        pick(&mut app, "Empty Trash…");
+        press(&mut app, &[KeyCode::Right, KeyCode::Left, KeyCode::Esc]);
+        assert_eq!(on_disk(&f.trash), held);
+        assert_eq!(app.message, None);
+
+        pick(&mut app, "Empty Trash…");
+        press(&mut app, &[KeyCode::Right, KeyCode::Enter]);
+        assert_eq!(said(&app), ("Emptied the trash: 4 items deleted.", false));
+        assert!(on_disk(&f.trash).is_empty());
+        assert!(f.trash.is_dir(), "the trash itself stays");
+        assert!(names(&app).is_empty(), "and is listed again");
+        // What the links led to is untouched, and so is everything else.
+        assert_eq!(read(kept), "keep");
+        assert_eq!(on_disk(&f.home.join("Documents")), ["kept.txt"]);
+        assert_eq!(on_disk(&f.home), ["Documents"]);
+        assert_eq!(read(f.trash.join(".DS_Store")), "Finder's");
+        // The records went with it.
+        assert_eq!(read(state.join("trashed")), "");
+        assert_eq!(app.trashed(&f.trash.join("notes.txt")), None);
+
+        // There is no taking it back.
+        app.handle_key(ctrl(KeyCode::Char('z')));
+        let (text, is_error) = said(&app);
+        assert!(is_error && text.starts_with("Can't undo that:"), "{text}");
+        assert_eq!(on_disk(&f.home), ["Documents"]);
+        assert!(on_disk(&f.trash).is_empty());
+    }
+
+    #[test]
+    fn emptying_the_trash_from_the_sidebar_says_one_item_for_one() {
+        let mut f = fixture();
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Delete]);
+        go_to_place(&mut f.app, "Trash");
+        pick(&mut f.app, "Empty Trash…");
+        assert!(matches!(f.app.dialog, Some(Dialog::EmptyTrash { .. })));
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Enter]);
+        assert_eq!(said(&f.app), ("Emptied the trash: 1 item deleted.", false));
+        assert!(on_disk(&f.trash).is_empty());
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
+        assert_eq!(f.app.pane().cwd, f.home);
+    }
+
+    #[test]
+    fn an_empty_trash_and_one_that_cannot_be_listed_are_not_asked_about() {
+        let mut f = fixture();
+        let already = ("The trash is already empty.", false);
+        // One nothing was ever moved to.
+        go_to_place(&mut f.app, "Trash");
+        pick(&mut f.app, "Empty Trash…");
+        assert!(f.app.dialog.is_none());
+        assert_eq!(said(&f.app), already);
+        // One that holds nothing but Finder's notes about it.
+        fs::create_dir(&f.trash).unwrap();
+        fs::write(f.trash.join(".DS_Store"), "").unwrap();
+        f.app.message = None;
+        pick(&mut f.app, "Empty Trash…");
+        assert!(f.app.dialog.is_none());
+        assert_eq!(said(&f.app), already);
+        // And from inside it, where there is nothing to open a menu on.
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.trash);
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert_eq!(menu(&f.app), ["Empty Trash…"]);
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(said(&f.app), already);
+        assert!(f.trash.join(".DS_Store").exists());
+
+        // One macOS keeps the terminal out of: nothing is deleted, and it
+        // says what the sidebar says.
+        fs::write(f.trash.join("notes.txt"), "still here").unwrap();
+        fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o000)).unwrap();
+        pick(&mut f.app, "Empty Trash…");
+        fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(f.app.dialog.is_none());
+        let refused = "Trash: Permission was refused. Give your terminal \
+                       Full Disk Access in System Settings to see it.";
+        assert_eq!(said(&f.app), (refused, true));
+        assert_eq!(read(f.trash.join("notes.txt")), "still here");
+    }
+
+    #[test]
+    fn alt_enter_in_the_search_field_opens_the_menu_for_what_was_found() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "notes");
+        finish_search(&mut f.app);
+        assert!(typing_a_search(&f.app));
+        f.app.handle_key(alt(KeyCode::Enter));
+        assert_eq!(menu(&f.app), FILE_MENU);
+        // The keyboard moved on to what was found, which is still listed.
+        assert!(!typing_a_search(&f.app));
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(*f.system.opened.borrow(), [f.home.join("notes.txt")]);
+        assert_eq!(search_text(&f.app), "notes");
+    }
+
+    #[test]
+    fn the_keys_the_menu_shares_code_with_do_what_they_did() {
+        let mut f = fixture();
+        let (pictures, documents) = (f.home.join("Pictures"), f.home.join("Documents"));
+        // Enter opens, and Alt with an arrow walks the history.
+        select(&mut f.app, "Pictures");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, pictures);
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(f.app.pane().cwd, f.home);
+        f.app.handle_key(alt(KeyCode::Right));
+        assert_eq!(f.app.pane().cwd, pictures);
+        f.app.handle_key(alt(KeyCode::Char('b')));
+        assert_eq!(f.app.pane().cwd, f.home);
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(*f.system.opened.borrow(), [f.home.join("notes.txt")]);
+        assert!(f.app.menu.is_none());
+
+        // Ctrl+V pastes into the folder that is showing, whatever is under
+        // the cursor; Ctrl+P pins that folder.
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        f.app.navigate(&pictures);
+        assert_eq!(selected_name(&f.app), Some("Trip"));
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&pictures), ["Trip", "a.jpg", "notes.txt"]);
+        assert!(on_disk(&pictures.join("Trip")).is_empty());
+        f.app.navigate(&pictures.join("Trip"));
+        pin(&mut f.app);
+        assert_eq!(sections(&f.app)[1], ("Pinned", vec!["Trip"]));
+
+        // Enter in the sidebar goes to the place, and Delete there unpins.
+        open_place(&mut f.app, "Documents");
+        assert_eq!(
+            (f.app.pane().cwd.clone(), f.app.focus),
+            (documents, Focus::Files)
+        );
+        go_to_place(&mut f.app, "Trip");
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert_eq!(sections(&f.app), [home_places(), views()]);
+
+        // Delete moves to the trash, and asks in the trash itself.
+        open_place(&mut f.app, "Pictures");
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert_eq!(on_disk(&f.trash), ["notes.txt"]);
+        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        // Escape dismisses what was said, then has nothing left to do.
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.app.message, None);
+        open_place(&mut f.app, "Trash");
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert!(matches!(f.app.dialog, Some(Dialog::Delete { .. })));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(on_disk(&f.trash), ["notes.txt"]);
     }
 }

@@ -102,6 +102,17 @@ fn item_lines(app: &App, entry: &Entry, facts: Option<&Facts>, width: usize) -> 
         let room = width.saturating_sub("Where ".width());
         lines.push(field("Where", &fit(&app.shown_path(folder), room), width));
     }
+    // In the trash, what this app moved there says where it was and when
+    // it went. The place has lines of its own: it is too long to share one.
+    if let Some(record) = app.trashed(&entry.path) {
+        lines.push(Line::from(Span::styled("Original location", theme::dim())));
+        lines.push(Line::from(Span::styled(
+            app.shown_path(&record.from),
+            theme::base(),
+        )));
+        let deleted = format::date_time(record.when, app.date_style);
+        lines.push(field("Deleted", &deleted, width));
+    }
     lines
 }
 
@@ -310,6 +321,52 @@ mod tests {
         let folder = buffer(&mut f.app, 120, 24);
         assert_eq!(find(&folder, "notes.txt", 86..120), Some((89, 10)));
         assert_eq!(find(&folder, "Where", 86..120), None);
+    }
+
+    #[test]
+    fn in_the_trash_an_item_shows_where_it_came_from_and_when_it_was_deleted() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::End, KeyCode::Delete]);
+        fs::write(f.trash.join("stray.txt"), "").unwrap();
+        let trash = f.trash.clone();
+        f.app.navigate(&trash);
+        f.app.tick();
+        let shown = buffer(&mut f.app, 120, 24);
+        let row = |shown: &ratatui::buffer::Buffer, y: u16| -> String {
+            let cells = (89..118).map(|x| shown[(x, y)].symbol());
+            cells.collect::<String>().trim_end().to_string()
+        };
+        assert_eq!(find(&shown, "notes.txt", 86..120), Some((89, 10)));
+        assert_eq!(find(&shown, "Modified", 86..120), Some((89, 13)));
+        // Under it: where it was, home as a tilde, on a line of its own.
+        assert_eq!(row(&shown, 14), "Original location");
+        assert_eq!(shown[(89, 14)].fg, theme::DIM);
+        assert_eq!(row(&shown, 15), "~/notes.txt");
+        assert_eq!(shown[(89, 15)].fg, theme::FOREGROUND);
+        // And when it went, in the app's date style, against the right edge.
+        let record = f.app.trashed(&trash.join("notes.txt")).expect("its record");
+        let when = crate::format::date_time(record.when, crate::format::DateStyle::MonthFirst);
+        let deleted = row(&shown, 16);
+        assert!(deleted.starts_with("Deleted  "), "{deleted}");
+        assert!(deleted.ends_with(&when), "{deleted}");
+        assert_eq!(deleted.chars().count(), 29, "from edge to edge");
+        assert_eq!(shown[(89, 16)].fg, theme::DIM);
+        assert_eq!(shown[(117, 16)].fg, theme::FOREGROUND);
+
+        // What something else put in the trash has neither.
+        press(&mut f.app, &[KeyCode::Down]);
+        f.app.tick();
+        let stray = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&stray, "stray.txt", 86..120), Some((89, 10)));
+        assert_eq!(find(&stray, "Original location", 86..120), None);
+        assert_eq!(find(&stray, "Deleted", 86..120), None);
+
+        // Outside the trash nothing has.
+        let home = f.home.clone();
+        f.app.navigate(&home);
+        f.app.tick();
+        let outside = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&outside, "Original location", 86..120), None);
     }
 
     #[test]

@@ -54,6 +54,8 @@ pub enum Kind {
     Rename,
     NewFolder,
     Trash,
+    Compress,
+    Restore,
 }
 
 /// One thing that was done to one item, with what it takes to take it back.
@@ -185,6 +187,162 @@ pub fn delete(items: &[PathBuf]) -> Deleted {
     let failed = items.len() - done;
     let error = (failed > 0).then(|| Error(format!("Couldn't delete {}.", count(failed))));
     Deleted { done, error }
+}
+
+/// The name the archive of these items would get right now: the item's own
+/// with `.zip` after it, `Archive.zip` for several, or the first "keep both"
+/// name after that which is free in their folder.
+pub fn archive_name(items: &[PathBuf]) -> Result<String, Error> {
+    let named = archive_place(items).and_then(|(folder, name)| {
+        let mut free =
+            candidates(OsStr::new(&name), false).filter(|name| !exists(&folder.join(name)));
+        free.next()
+            .ok_or_else(|| io::ErrorKind::AlreadyExists.into())
+    });
+    match named {
+        Ok(name) => Ok(name.to_string_lossy().into_owned()),
+        Err(error) => Err(not_compressed(&error)),
+    }
+}
+
+/// Makes one zip archive of the items, beside them. `zip` is what writes it,
+/// to the path it is given: a new file in a folder made for it alone, which
+/// takes its "keep both" name next to the items only once it is whole.
+/// Nothing is overwritten, and an archive that fails or is stopped halfway
+/// is removed again.
+pub fn compress(
+    items: &[PathBuf],
+    cancel: &dyn Cancel,
+    zip: impl FnOnce(&Path) -> io::Result<()>,
+) -> Report {
+    let mut report = Report {
+        change: Change {
+            kind: Kind::Compress,
+            steps: Vec::new(),
+        },
+        asked: items.len(),
+        done: 0,
+        skipped: 0,
+        stopped: false,
+        error: None,
+    };
+    if cancel.cancelled() {
+        report.stopped = true;
+        return report;
+    }
+    match archive(items, zip) {
+        Ok(at) => {
+            report.done = items.len();
+            report.change.steps.push(created(at));
+        }
+        Err(_) if cancel.cancelled() => report.stopped = true,
+        Err(error) => report.error = Some(not_compressed(&error)),
+    }
+    report
+}
+
+fn not_compressed(error: &io::Error) -> Error {
+    Error(format!("Couldn't compress: {}", why_failed(error)))
+}
+
+/// The folder an archive of these items goes in, and the name it asks for.
+fn archive_place(items: &[PathBuf]) -> io::Result<(PathBuf, String)> {
+    let nowhere = || io::Error::other("there is nothing to compress");
+    let first = items.first().ok_or_else(nowhere)?;
+    let folder = first.parent().ok_or_else(nowhere)?;
+    if items.iter().any(|item| item.parent() != Some(folder)) {
+        return Err(io::Error::other("the items are in different folders"));
+    }
+    let name = match items {
+        [one] => format!("{}.zip", shown(one)),
+        _ => "Archive.zip".to_string(),
+    };
+    Ok((folder.to_path_buf(), name))
+}
+
+/// Has the archive written and puts it in place. Where it ended up.
+fn archive(items: &[PathBuf], zip: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<PathBuf> {
+    let (folder, name) = archive_place(items)?;
+    let scratch = scratch_folder(&folder, &name)?;
+    let part = scratch.join(&name);
+    let placed = zip(&part).and_then(|()| park(&part, &folder, &rename_new));
+    // The folder was made a moment ago for this archive alone: what is left
+    // in it is the half of one that failed, or nothing.
+    let _ = remove(&scratch);
+    placed
+}
+
+/// Makes a hidden folder of our own in `folder`, for the archive `name` to
+/// be written in. It is made only under a name that is free.
+fn scratch_folder(folder: &Path, name: &str) -> io::Result<PathBuf> {
+    for n in 0..TRIES {
+        let scratch = folder.join(format!(".{name}.part-{n}"));
+        match fs::create_dir(&scratch) {
+            Ok(()) => return Ok(scratch),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::ErrorKind::AlreadyExists.into())
+}
+
+/// Moves items out of the trash, each back to the exact place given for it:
+/// where it was before. An item with no such place, one whose folder is
+/// gone and one whose name was taken since stay in the trash.
+pub fn restore(items: &[(PathBuf, Option<PathBuf>)], trash_dir: &Path) -> Report {
+    let in_trash: Vec<PathBuf> = items.iter().map(|(item, _)| item.clone()).collect();
+    let mut places = items.iter().map(|(_, place)| place.as_deref());
+    each(Kind::Restore, &in_trash, &Never, |item| {
+        restore_one(item, places.next().flatten(), trash_dir)
+    })
+}
+
+fn restore_one(item: &Path, place: Option<&Path>, trash_dir: &Path) -> Turn {
+    let name = shown(item);
+    let Some(place) = place else {
+        return Turn::failed(format!("{name} has no record of where it came from."));
+    };
+    let refused = |why: String| Turn::failed(format!("Couldn't restore {name}: {why}"));
+    let folder = folder_name(place);
+    if !place.parent().is_some_and(Path::is_dir) {
+        return refused(format!("{folder} isn't there any more."));
+    }
+    if exists(place) {
+        return refused(format!("{} already exists in {folder}.", shown(place)));
+    }
+    // The move itself takes the name only if it is still free.
+    match put(item, place, trash_dir) {
+        Ok(()) => Turn::done(Step::Moved {
+            from: item.to_path_buf(),
+            to: place.to_path_buf(),
+        }),
+        Err(error) => Turn {
+            step: None,
+            end: End::Failed(error),
+        },
+    }
+}
+
+/// What the trash folder directly holds, by name: what emptying it deletes.
+/// Finder's own notes about the folder are left out, and a trash that was
+/// never made holds nothing. A trash that can't be listed is an error, and so
+/// is anything but a real folder in its place: a link is never followed.
+pub fn trash_items(trash_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    match fs::symlink_metadata(trash_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+        Ok(meta) if !meta.is_dir() => return Err(io::ErrorKind::NotADirectory.into()),
+        Ok(_) => {}
+    }
+    let mut items = Vec::new();
+    for child in fs::read_dir(trash_dir)? {
+        let name = child?.file_name();
+        if name != ".DS_Store" {
+            items.push(trash_dir.join(name));
+        }
+    }
+    items.sort();
+    Ok(items)
 }
 
 /// Gives an item a new name in its folder. An empty or unchanged name does nothing.
@@ -2561,5 +2719,273 @@ mod tests {
         assert_eq!(split_name("odd.", false), ("odd.", ""));
         assert_eq!(split_name("My.Stuff", true), ("My.Stuff", ""));
         assert_eq!(split_name("añb.txt", false), ("añb", ".txt"));
+    }
+
+    // Compressing. The archiver is a stand-in that writes what it is told to:
+    // the real one is another program, behind the `System` port.
+
+    #[test]
+    fn compressing_one_item_makes_a_zip_beside_it_under_its_name() {
+        let w = world();
+        let notes = w.file("Docs/notes.txt", "hello");
+        let trip = w.folder("Docs/Trip");
+        assert_eq!(
+            archive_name(std::slice::from_ref(&notes)).unwrap(),
+            "notes.txt.zip"
+        );
+        let report = compress(std::slice::from_ref(&notes), &go(), |archive| {
+            fs::write(archive, "zip of notes")
+        });
+        assert_eq!(w.names("Docs"), ["Trip", "notes.txt", "notes.txt.zip"]);
+        assert_eq!(w.read("Docs/notes.txt.zip"), "zip of notes");
+        assert_eq!(w.read("Docs/notes.txt"), "hello");
+        assert_eq!((report.asked, report.done, report.stopped), (1, 1, false));
+        assert_eq!(said(&report), None);
+        assert_eq!(report.change.kind, Kind::Compress);
+        let archive = w.path("Docs/notes.txt.zip");
+        assert_eq!(report.change.steps, [created(archive.clone())]);
+        assert_eq!(report.change.landed(), [archive]);
+
+        // A folder's archive has the folder's whole name.
+        let report = compress(&[trip], &go(), |archive| fs::write(archive, "zip of Trip"));
+        assert_eq!(said(&report), None);
+        assert_eq!(w.read("Docs/Trip.zip"), "zip of Trip");
+        assert_eq!(
+            w.names("Docs"),
+            ["Trip", "Trip.zip", "notes.txt", "notes.txt.zip"]
+        );
+    }
+
+    #[test]
+    fn compressing_several_items_makes_one_archive_in_their_folder() {
+        let w = world();
+        let items = [w.file("Docs/a.txt", "a"), w.folder("Docs/Trip")];
+        assert_eq!(archive_name(&items).unwrap(), "Archive.zip");
+        let report = compress(&items, &go(), |archive| fs::write(archive, "zip of both"));
+        assert_eq!(w.names("Docs"), ["Archive.zip", "Trip", "a.txt"]);
+        assert_eq!(w.read("Docs/Archive.zip"), "zip of both");
+        assert_eq!((report.asked, report.done, said(&report)), (2, 2, None));
+        assert_eq!(
+            report.change.steps,
+            [created(w.path("Docs/Archive.zip"))],
+            "one archive, one thing to undo"
+        );
+    }
+
+    #[test]
+    fn a_taken_archive_name_keeps_both_and_nothing_is_overwritten() {
+        let w = world();
+        let notes = w.file("notes.txt", "hello");
+        w.file("notes.txt.zip", "old archive");
+        let items = [notes];
+        assert_eq!(archive_name(&items).unwrap(), "notes.txt (copy).zip");
+        let report = compress(&items, &go(), |archive| fs::write(archive, "second"));
+        assert_eq!(said(&report), None);
+        assert_eq!(
+            report.change.steps,
+            [created(w.path("notes.txt (copy).zip"))]
+        );
+        assert_eq!(w.read("notes.txt.zip"), "old archive");
+        assert_eq!(w.read("notes.txt (copy).zip"), "second");
+
+        // A file that takes the name while the archive is being written is
+        // not written over either.
+        let late = w.path("notes.txt (copy 2).zip");
+        let report = compress(&items, &go(), |archive| {
+            fs::write(&late, "appeared meanwhile")?;
+            fs::write(archive, "third")
+        });
+        assert_eq!(said(&report), None);
+        assert_eq!(w.read("notes.txt (copy 2).zip"), "appeared meanwhile");
+        assert_eq!(w.read("notes.txt (copy 3).zip"), "third");
+        assert_eq!(
+            w.names(""),
+            [
+                ".Trash",
+                "notes.txt",
+                "notes.txt (copy 2).zip",
+                "notes.txt (copy 3).zip",
+                "notes.txt (copy).zip",
+                "notes.txt.zip",
+            ],
+            "and nothing else is left behind"
+        );
+    }
+
+    #[test]
+    fn a_compress_that_fails_or_is_stopped_leaves_no_archive_and_nothing_to_undo() {
+        let w = world();
+        let notes = w.file("Docs/notes.txt", "hello");
+        let items = [notes];
+        let report = compress(&items, &go(), |archive| {
+            fs::write(archive, "half an archive")?;
+            Err(io::Error::other("the archive couldn't be written"))
+        });
+        assert_eq!(
+            said(&report).as_deref(),
+            Some("Couldn't compress: The archive couldn't be written.")
+        );
+        assert_eq!((report.done, report.stopped), (0, false));
+        assert!(report.change.steps.is_empty());
+        assert_eq!(w.names("Docs"), ["notes.txt"], "hidden leftovers included");
+
+        // Stopped: the same, without it being a failure.
+        let stop = AtomicBool::new(false);
+        let report = compress(&items, &stop, |archive| {
+            fs::write(archive, "half an archive")?;
+            stop.store(true, Ordering::Relaxed);
+            Err(io::ErrorKind::Interrupted.into())
+        });
+        assert_eq!(
+            (report.done, report.stopped, said(&report)),
+            (0, true, None)
+        );
+        assert!(report.change.steps.is_empty());
+        assert_eq!(w.names("Docs"), ["notes.txt"]);
+        assert_eq!(w.read("Docs/notes.txt"), "hello");
+
+        // A folder that takes nothing new: said, and the archiver never runs.
+        fs::set_permissions(w.path("Docs"), Permissions::from_mode(0o555)).unwrap();
+        let report = compress(&items, &go(), |_| panic!("there is nowhere to write"));
+        fs::set_permissions(w.path("Docs"), Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            said(&report).as_deref(),
+            Some("Couldn't compress: Permission was refused.")
+        );
+        assert_eq!(w.names("Docs"), ["notes.txt"]);
+    }
+
+    #[test]
+    fn items_from_different_folders_are_not_compressed_together() {
+        let w = world();
+        let items = [w.file("One/a.txt", "a"), w.file("Two/b.txt", "b")];
+        let why = "Couldn't compress: The items are in different folders.";
+        assert_eq!(archive_name(&items).unwrap_err().to_string(), why);
+        let report = compress(&items, &go(), |_| panic!("nothing to write"));
+        assert_eq!(said(&report).as_deref(), Some(why));
+        assert_eq!(w.names("One"), ["a.txt"]);
+        assert_eq!(w.names("Two"), ["b.txt"]);
+        assert_eq!(w.names(""), [".Trash", "One", "Two"]);
+    }
+
+    // Restoring from the trash, and emptying it.
+
+    /// Trashes one item and says where it is in the trash.
+    fn trashed(w: &World, item: &Path) -> PathBuf {
+        let report = trash(&[item.to_path_buf()], &w.trash);
+        match report.change.steps.as_slice() {
+            [Step::Trashed { to, .. }] => to.clone(),
+            steps => panic!("not trashed: {steps:?}"),
+        }
+    }
+
+    #[test]
+    fn restoring_moves_an_item_back_to_where_it_came_from_and_can_be_undone() {
+        let w = world();
+        let notes = w.file("Docs/notes.txt", "hello");
+        let trip = w
+            .file("Docs/Trip/a.jpg", "jpg")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let (in_trash, trip_in_trash) = (trashed(&w, &notes), trashed(&w, &trip));
+        assert!(w.names("Docs").is_empty());
+
+        let items = [
+            (in_trash.clone(), Some(notes.clone())),
+            (trip_in_trash.clone(), Some(trip.clone())),
+        ];
+        let report = restore(&items, &w.trash);
+        assert_eq!((report.asked, report.done, said(&report)), (2, 2, None));
+        assert_eq!(report.change.kind, Kind::Restore);
+        assert_eq!(w.read("Docs/notes.txt"), "hello");
+        assert_eq!(w.read("Docs/Trip/a.jpg"), "jpg");
+        assert!(w.names(".Trash").is_empty());
+        let moved = |from: &PathBuf, to: &PathBuf| Step::Moved {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        assert_eq!(
+            report.change.steps,
+            [moved(&in_trash, &notes), moved(&trip_in_trash, &trip)]
+        );
+
+        // Undone, they are in the trash again; redone, back out.
+        let mut history = History::default();
+        history.record(report.change);
+        history.undo(&w.trash).unwrap();
+        assert_eq!(w.names(".Trash"), ["Trip", "notes.txt"]);
+        assert!(w.names("Docs").is_empty());
+        history.redo(&w.trash).unwrap();
+        assert_eq!(w.names("Docs"), ["Trip", "notes.txt"]);
+    }
+
+    #[test]
+    fn a_restore_never_overwrites_and_needs_the_folder_it_came_from() {
+        let w = world();
+        // The name was taken since.
+        let notes = w.file("Docs/notes.txt", "hello");
+        let notes_in_trash = trashed(&w, &notes);
+        w.file("Docs/notes.txt", "written since");
+        let report = restore(&[(notes_in_trash.clone(), Some(notes))], &w.trash);
+        assert_eq!(
+            said(&report).as_deref(),
+            Some("Couldn't restore notes.txt: notes.txt already exists in Docs.")
+        );
+        assert_eq!(w.read("Docs/notes.txt"), "written since");
+        assert_eq!(w.read(".Trash/notes.txt"), "hello");
+        assert!(report.change.steps.is_empty());
+
+        // The folder it was in is gone.
+        let b = w.file("Gone/b.txt", "beta");
+        let b_in_trash = trashed(&w, &b);
+        fs::remove_dir(w.path("Gone")).unwrap();
+        let report = restore(&[(b_in_trash.clone(), Some(b))], &w.trash);
+        assert_eq!(
+            said(&report).as_deref(),
+            Some("Couldn't restore b.txt: Gone isn't there any more.")
+        );
+        assert!(!w.has("Gone"), "it is not made again");
+        assert_eq!(w.read(".Trash/b.txt"), "beta");
+
+        // Nobody knows where it came from.
+        let c = w.file(".Trash/c.txt", "gamma");
+        let report = restore(&[(c, None)], &w.trash);
+        assert_eq!(
+            said(&report).as_deref(),
+            Some("c.txt has no record of where it came from.")
+        );
+        assert_eq!((report.done, report.change.steps.len()), (0, 0));
+        assert_eq!(w.names(".Trash"), ["b.txt", "c.txt", "notes.txt"]);
+    }
+
+    #[test]
+    fn the_trash_holds_what_is_directly_in_it_and_a_link_is_no_trash() {
+        let w = world();
+        w.file(".Trash/a.txt", "a");
+        w.file(".Trash/Folder/inside.txt", "in");
+        w.file(".Trash/.env", "hidden, but trashed like the rest");
+        // Finder's own notes about the folder are nobody's trash.
+        w.file(".Trash/.DS_Store", "");
+        let held = |name: &str| w.trash.join(name);
+        assert_eq!(
+            trash_items(&w.trash).unwrap(),
+            [held(".env"), held("Folder"), held("a.txt")]
+        );
+
+        // One that was never made holds nothing.
+        assert!(trash_items(&w.path("never-made")).unwrap().is_empty());
+
+        // One that can't be listed says so.
+        fs::set_permissions(&w.trash, Permissions::from_mode(0o000)).unwrap();
+        let refused = trash_items(&w.trash).unwrap_err();
+        fs::set_permissions(&w.trash, Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+
+        // A link is not followed to the folder it leads to.
+        let elsewhere = w.file("Elsewhere/keep.txt", "keep");
+        let link = w.path("Linked Trash");
+        symlink(elsewhere.parent().unwrap(), &link).unwrap();
+        assert!(trash_items(&link).is_err());
     }
 }
