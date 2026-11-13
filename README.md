@@ -1,4 +1,4 @@
-# FileFinder (TUI)
+# filefinder-tui
 
 A keyboard-first terminal file manager for macOS, written in Rust with [ratatui](https://ratatui.rs/). It follows the looks and behavior of Omarchy's [folio](https://github.com/omacom/folio): one quiet window with breadcrumbs, a sidebar, a roomy grid with real previews, and a details pane.
 
@@ -25,15 +25,33 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 - A terminal with the kitty keyboard protocol for chords such as Ctrl+1/2/3, Ctrl+I and Ctrl+Shift+N. Ghostty, kitty, WezTerm and iTerm2 have it.
 - A [Nerd Font](https://www.nerdfonts.com/) for the icons. Without one, run with `FILEFINDER_ICONS=plain` for plain Unicode symbols.
 
+## Installing
+
+Straight from GitHub:
+
+```sh
+cargo install --git https://github.com/juancasanueva/filefinder-tui
+```
+
+Or from a clone:
+
+```sh
+git clone https://github.com/juancasanueva/filefinder-tui.git
+cd filefinder-tui
+cargo install --path .
+```
+
+Either way the binary lands in `~/.cargo/bin`, which needs to be on your `PATH`. Run the same command again to update.
+
 ## Running
 
 ```sh
-cargo run --release            # opens the current folder
-cargo run --release -- ~/Pictures
-cargo run --release -- ~/Pictures/photo.jpg   # opens its folder with the file selected
+filefinder-tui                          # opens the current folder
+filefinder-tui ~/Pictures
+filefinder-tui ~/Pictures/photo.jpg     # opens its folder with the file selected
 ```
 
-To install it on your `PATH`: `cargo install --path .`, then run `filefinder-tui`.
+From a clone, without installing: `cargo run --release -- ~/Pictures`.
 
 ## Keys
 
