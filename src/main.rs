@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::supports_keyboard_enhancement;
@@ -61,18 +61,27 @@ fn main() -> io::Result<()> {
     if enhanced {
         let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
         execute!(stdout(), PushKeyboardEnhancementFlags(flags))?;
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-            hook(info);
-        }));
     }
+    // Clicks and the wheel come to the app; selecting text then takes the
+    // terminal's own modifier (Shift-drag in Ghostty, Option-drag in Terminal).
+    execute!(stdout(), EnableMouseCapture)?;
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        give_back(enhanced);
+        hook(info);
+    }));
     let result = run(&mut terminal, &mut app);
+    give_back(enhanced);
+    ratatui::restore();
+    result
+}
+
+/// Hands the mouse back to the terminal, and the keyboard as it was.
+fn give_back(enhanced: bool) {
+    let _ = execute!(stdout(), DisableMouseCapture);
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
-    ratatui::restore();
-    result
 }
 
 /// Asks the terminal how it shows pictures. It has to be asked before any key
@@ -99,11 +108,12 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         app.tick();
         terminal.draw(|frame| ui::draw(frame, app))?;
         // Short enough for thumbnails to show up as they are made.
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind != KeyEventKind::Release
-        {
-            app.handle_key(key);
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                _ => {}
+            }
         }
     }
     Ok(())

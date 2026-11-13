@@ -1,7 +1,7 @@
 //! The top bar: where you are, the path or the search being typed, and the
 //! view toggles.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
@@ -10,14 +10,15 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::pad;
-use crate::app::{App, Field, Pane, ViewMode};
+use crate::app::{App, Field, HitMap, Pane, Spot, Toggle, ViewMode};
 use crate::input::Input;
 use crate::theme;
 
 /// The widest the search field gets, and the room the breadcrumbs leave it.
 const SEARCH_WIDTH: u16 = 30;
 
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+/// Draws the bar; each breadcrumb, field and switch is a spot for the mouse.
+pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let [row, rule] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
     let toggles = toggles(app);
@@ -36,8 +37,19 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             ..path
         };
         field(frame, area, "", input, true);
+        hits.add(area, Spot::PathField);
     } else {
-        draw_crumbs(frame, app, path);
+        draw_crumbs(frame, app, path, hits);
+    }
+    let switches = [Toggle::View, Toggle::Sort, Toggle::Hidden, Toggle::Details];
+    let mut x = right.x;
+    for (span, switch) in toggles.iter().zip(switches) {
+        let width = span.content.width() as u16;
+        hits.add(
+            Rect::new(x, right.y, width, 1).intersection(right),
+            Spot::Toggle(switch),
+        );
+        x = x.saturating_add(width);
     }
     frame.render_widget(
         Paragraph::new(Line::from(toggles)).alignment(Alignment::Left),
@@ -50,7 +62,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Where the pane is, and after it the search field when one is open.
-fn draw_crumbs(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_crumbs(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let pane = app.pane();
     let search = pane.search();
     // A search keeps room for its field: its folder's crumbs give way first.
@@ -60,7 +72,7 @@ fn draw_crumbs(frame: &mut Frame, app: &App, area: Rect) {
         0
     };
     let room = area.width.saturating_sub(4 + kept) as usize;
-    let spans = path_spans(app, pane, room, true);
+    let spans = path_spans(app, app.active, room, true, area, hits);
     let used = spans.iter().map(|span| span.content.width()).sum::<usize>() as u16;
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
@@ -73,40 +85,78 @@ fn draw_crumbs(frame: &mut Frame, app: &App, area: Rect) {
         };
         let typing = matches!(app.field, Some(Field::Search));
         field(frame, area, "/", &search.input, typing);
+        hits.add(area, Spot::SearchField);
     }
 }
 
 /// One pane's path on a row of its own above its files, for when two panes
 /// share the window: bright in the active pane, dim in the other.
-pub fn draw_pane_path(frame: &mut Frame, app: &App, pane: usize, area: Rect) {
+pub fn draw_pane_path(frame: &mut Frame, app: &App, pane: usize, area: Rect, hits: &mut HitMap) {
     let room = area.width.saturating_sub(4) as usize;
-    let spans = path_spans(app, &app.panes[pane], room, pane == app.active);
+    let spans = path_spans(app, pane, room, pane == app.active, area, hits);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Where a pane is, as crumbs that fit in `room` after two cells of air.
-/// The last one is bright where `lit`; elsewhere all of them are dim.
-fn path_spans(app: &App, pane: &Pane, room: usize, lit: bool) -> Vec<Span<'static>> {
-    let crumbs = if pane.recents() {
-        // Not a folder: it has no way down from home to show.
-        vec!["Recents".to_string()]
-    } else {
-        breadcrumbs(&pane.cwd, &app.home, room)
-    };
+/// Where a pane is, as crumbs that fit in `room` after two cells of air,
+/// drawn on the first row of `area`. The last one is bright where `lit`;
+/// elsewhere all of them are dim. Each one that stands for a folder is a
+/// spot for the mouse.
+fn path_spans(
+    app: &App,
+    index: usize,
+    room: usize,
+    lit: bool,
+    area: Rect,
+    hits: &mut HitMap,
+) -> Vec<Span<'static>> {
+    let crumbs = crumbs(app, &app.panes[index], room);
     let mut spans = vec![Span::raw("  ")];
+    let mut x = area.x.saturating_add(2);
     let last = crumbs.len().saturating_sub(1);
-    for (index, crumb) in crumbs.into_iter().enumerate() {
-        if index > 0 {
+    for (at, (crumb, path)) in crumbs.into_iter().enumerate() {
+        if at > 0 {
             spans.push(Span::styled(" / ", theme::faint()));
+            x = x.saturating_add(3);
         }
-        let style = if lit && index == last {
+        let style = if lit && at == last {
             theme::title()
         } else {
             theme::dim()
         };
+        let width = crumb.width() as u16;
+        if let Some(path) = path {
+            let cells = Rect::new(x, area.y, width, 1).intersection(area);
+            hits.add(cells, Spot::Crumb { pane: index, path });
+        }
+        x = x.saturating_add(width);
         spans.push(Span::styled(crumb, style));
     }
     spans
+}
+
+/// A pane's breadcrumbs that fit in `room`, each with the folder it stands
+/// for: none for the `…` in place of the ones left out, nor for Recents.
+fn crumbs(app: &App, pane: &Pane, room: usize) -> Vec<(String, Option<PathBuf>)> {
+    if pane.recents() {
+        // Not a folder: it has no way down from home to show.
+        return vec![("Recents".to_string(), None)];
+    }
+    let shown = breadcrumbs(&pane.cwd, &app.home, room);
+    let cut = shown != breadcrumbs(&pane.cwd, &app.home, usize::MAX);
+    let root = if pane.cwd.starts_with(&app.home) {
+        app.home.clone()
+    } else {
+        PathBuf::from("/")
+    };
+    let last = shown.len() - 1;
+    let folder = |at: usize| match at {
+        0 => Some(root.clone()),
+        1 if cut => None,
+        // The last one is the pane's folder; each before it, its parent.
+        _ => pane.cwd.ancestors().nth(last - at).map(Path::to_path_buf),
+    };
+    let crumbs = shown.into_iter().enumerate();
+    crumbs.map(|(at, crumb)| (crumb, folder(at))).collect()
 }
 
 /// A field in the bar: what is being typed after its `lead`, with the

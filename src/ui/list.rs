@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::{empty_text, fit, icon_style, pad, pad_left, row_style, scroll};
-use crate::app::{App, Pane};
+use crate::app::{App, HitMap, Pane, Spot};
 use crate::format;
 use crate::icons::Icon;
 use crate::model::Entry;
@@ -19,9 +19,17 @@ const SIZE_WIDTH: usize = 11;
 const DATE_WIDTH: usize = 10;
 
 /// Draws one pane's items as rows; `focused` is whether it has the keyboard.
-pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: bool) {
+/// Each row is a spot for the mouse.
+pub fn draw(
+    frame: &mut Frame,
+    app: &mut App,
+    index: usize,
+    area: Rect,
+    focused: bool,
+    hits: &mut HitMap,
+) {
     let date_style = app.date_style;
-    let pane = &mut app.panes[pane];
+    let pane = &mut app.panes[index];
     if pane.entries.is_empty() {
         empty(frame, area, pane);
         return;
@@ -41,8 +49,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: 
     let now = SystemTime::now();
 
     let mut lines = vec![Line::default()];
-    for (index, entry) in pane.entries.iter().enumerate().skip(pane.offset).take(rows) {
-        let selected = pane.is_selected(index);
+    for (item, entry) in pane.entries.iter().enumerate().skip(pane.offset).take(rows) {
+        let y = area.y + lines.len() as u16;
+        let row = Rect::new(area.x, y, area.width, 1);
+        hits.add(
+            row,
+            Spot::Item {
+                pane: index,
+                index: item,
+            },
+        );
+        let selected = pane.is_selected(item);
         let row = row_style(selected, focused);
         let icon = icon_style(row, entry.is_dir, selected && focused);
         let meta = if selected { row } else { row.fg(theme::DIM) };

@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::list::{self, size_text};
 use super::{fit, picture, scroll};
-use crate::app::{App, TileSize};
+use crate::app::{App, HitMap, Spot, TileSize};
 use crate::format::{self, DateStyle};
 use crate::icons::Icon;
 use crate::model::{self, Entry};
@@ -89,12 +89,20 @@ fn clip(rect: Rect, area: Rect) -> Option<Rect> {
 }
 
 /// Draws one pane's items as tiles; `focused` is whether it has the keyboard.
-pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: bool) {
+/// Each tile, as much of it as shows, is a spot for the mouse.
+pub fn draw(
+    frame: &mut Frame,
+    app: &mut App,
+    pane_index: usize,
+    area: Rect,
+    focused: bool,
+    hits: &mut HitMap,
+) {
     let size = app.tile;
     let columns = columns(area.width, size);
     let rows = visible_rows(area.height, size);
     let date_style = app.date_style;
-    let pane = &mut app.panes[pane];
+    let pane = &mut app.panes[pane_index];
     pane.grid_columns = columns;
     pane.page_rows = rows;
     if pane.entries.is_empty() {
@@ -110,6 +118,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: 
         let Some(tile) = tile_rect(area, size, pane.offset, index) else {
             break;
         };
+        if let Some(showing) = clip(tile, area) {
+            let item = Spot::Item {
+                pane: pane_index,
+                index,
+            };
+            hits.add(showing, item);
+        }
         let selected = pane.is_selected(index);
 
         let thumb = thumb_of(tile, size);

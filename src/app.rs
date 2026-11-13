@@ -7,9 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position as Point, Rect};
 
 use crate::format::DateStyle;
 use crate::input::Input;
@@ -101,6 +104,8 @@ pub enum Action {
     EmptyTrash,
     OpenPlace,
     Unpin,
+    /// Open Terminal Here, in the menu for the folder itself.
+    TerminalHere,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +126,9 @@ pub struct Menu {
     pub rows: Vec<MenuRow>,
     /// The line the keyboard is on: never a hairline.
     pub cursor: usize,
+    /// Where a right click opened it; one opened from the keyboard goes
+    /// next to what it is about.
+    pub at: Option<Point>,
 }
 
 impl Menu {
@@ -134,7 +142,11 @@ impl Menu {
             }
             rows.extend(group);
         }
-        Self { rows, cursor: 0 }
+        Self {
+            rows,
+            cursor: 0,
+            at: None,
+        }
     }
 
     /// Moves to the next line up or down, over the hairlines; at either end
@@ -182,6 +194,106 @@ pub enum Field {
     Path(Input),
     /// `/`: what the active pane searches for. The pane holds the text.
     Search,
+}
+
+/// What a part of the window stands for, as the last frame drew it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Spot {
+    /// The sidebar, wherever no place is.
+    Sidebar,
+    /// A place in the sidebar, by its number among them all.
+    Place(usize),
+    /// A pane's files, wherever no item is.
+    Pane(usize),
+    /// An item of a pane: a row of the list or of its own column, or a tile.
+    Item {
+        pane: usize,
+        index: usize,
+    },
+    /// A row of a folder above the pane's own in the columns view: item
+    /// `index` of `ancestors[depth]`.
+    Above {
+        pane: usize,
+        depth: usize,
+        index: usize,
+    },
+    /// A breadcrumb, and the folder it stands for.
+    Crumb {
+        pane: usize,
+        path: PathBuf,
+    },
+    /// The path field, Ctrl+L.
+    PathField,
+    /// The search field, `/`.
+    SearchField,
+    Toggle(Toggle),
+    /// The details pane, wherever its Open button isn't.
+    Details,
+    OpenButton,
+    /// The menu, wherever no line is.
+    Menu,
+    /// A line of the menu, by its number among its rows.
+    MenuRow(usize),
+    /// A dialog, wherever no button is.
+    Dialog,
+    /// A dialog's button: the one that does what it asks, or Cancel.
+    Choice(bool),
+    /// The shortcuts overlay.
+    Help,
+}
+
+/// The switches at the right end of the top bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Toggle {
+    View,
+    Sort,
+    Hidden,
+    Details,
+}
+
+/// Where the last frame drew what a click can land on. Drawing writes it;
+/// the mouse reads it and nothing else, so a click lands on what was on
+/// screen under it.
+#[derive(Clone, Debug, Default)]
+pub struct HitMap {
+    /// In the order drawn: a later one is on top of an earlier one.
+    spots: Vec<(Rect, Spot)>,
+    /// The sidebar's lines, the ones scrolled out of sight included.
+    pub sidebar_lines: usize,
+}
+
+impl HitMap {
+    pub fn add(&mut self, rect: Rect, spot: Spot) {
+        if !rect.is_empty() {
+            self.spots.push((rect, spot));
+        }
+    }
+
+    /// What is on top at a cell.
+    pub fn at(&self, x: u16, y: u16) -> Option<&Spot> {
+        let under = |(rect, _): &&(Rect, Spot)| rect.contains(Point::new(x, y));
+        self.spots.iter().rev().find(under).map(|(_, spot)| spot)
+    }
+
+    /// Where something was drawn.
+    pub fn rect_of(&self, spot: &Spot) -> Option<Rect> {
+        let found = self.spots.iter().find(|(_, drawn)| drawn == spot);
+        found.map(|(rect, _)| *rect)
+    }
+}
+
+/// How soon a second click on the same item makes it a double click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// Rows of a list, or lines of the sidebar or the shortcuts, that one turn
+/// of the wheel scrolls; the grid scrolls by one row of tiles.
+const WHEEL_ROWS: usize = 3;
+
+/// A left click on an item, for telling a double click.
+struct Click {
+    pane: usize,
+    path: PathBuf,
+    at: Instant,
 }
 
 /// What a pane lists.
@@ -494,6 +606,57 @@ impl Pane {
         self.cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
     }
 
+    /// Moves the cursor onto an item, the way the arrows would.
+    fn point_at(&mut self, index: usize) {
+        self.move_cursor(index as isize - self.cursor as isize);
+    }
+
+    /// Alt+click: adds an item to the selection, with the cursor on it, or
+    /// takes it out. The last one selected stays: something always is.
+    fn toggle(&mut self, index: usize) {
+        if index >= self.entries.len() {
+            return;
+        }
+        if self.marks.is_empty() {
+            self.marks.insert(self.cursor);
+        }
+        if self.marks.insert(index) {
+            self.cursor = index;
+        } else if self.marks.len() > 1 {
+            self.marks.remove(&index);
+            if self.cursor == index {
+                let after = self.marks.range(index..).next();
+                let before = self.marks.range(..index).next_back();
+                self.cursor = *after.or(before).unwrap_or(&index);
+            }
+        }
+        self.anchor = Some(self.cursor);
+        // One is the item under the cursor, which needs no marks.
+        if self.marks.len() == 1 {
+            self.marks.clear();
+        }
+    }
+
+    /// One turn of the wheel: `step` rows of `across` items further down or
+    /// up, as far as there are. The cursor moves only to stay in sight, in
+    /// its column; a selection of several items stays as it is.
+    fn wheel(&mut self, down: bool, step: usize, across: usize) {
+        let across = across.max(1);
+        let rows = self.page_rows.max(1);
+        let last = self.entries.len().div_ceil(across).saturating_sub(rows);
+        self.offset = if down {
+            (self.offset + step).min(last)
+        } else {
+            self.offset.min(last).saturating_sub(step)
+        };
+        let row = self.cursor / across;
+        let kept = row.clamp(self.offset, self.offset + rows - 1);
+        if kept != row {
+            let column = self.cursor % across;
+            self.cursor = (kept * across + column).min(self.entries.len().saturating_sub(1));
+        }
+    }
+
     /// Moves one row up or down in a grid. Down from above a shorter last row
     /// lands on the last item.
     fn move_row(&mut self, down: bool, columns: usize) {
@@ -567,6 +730,14 @@ pub struct App {
     volumes_dir: PathBuf,
     state_dir: Option<PathBuf>,
     system: Box<dyn System>,
+    /// Where the last frame drew what a click can land on.
+    pub hits: HitMap,
+    /// Lines of the sidebar the wheel scrolled away; drawing keeps it in range.
+    pub sidebar_scroll: usize,
+    /// The last left click on an item, for telling a double click.
+    last_click: Option<Click>,
+    /// What time it is: the real clock, or a test's.
+    clock: Box<dyn Fn() -> Instant>,
 }
 
 impl App {
@@ -618,6 +789,10 @@ impl App {
             volumes_dir: config.volumes_dir,
             state_dir: config.state_dir,
             system,
+            hits: HitMap::default(),
+            sidebar_scroll: 0,
+            last_click: None,
+            clock: Box::new(Instant::now),
         };
         app.rebuild_sidebar();
         let (folder, select) = if config.start.is_dir() {
@@ -800,6 +975,271 @@ impl App {
         }
     }
 
+    /// The mouse twin of `handle_key`: a click, a double click, a right click
+    /// or a turn of the wheel lands on what the last frame drew under it and
+    /// does what the key for the same thing does. Drags, moves, releases and
+    /// the buttons crossterm has no name for do nothing.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let spot = self.hits.at(mouse.column, mouse.row).cloned();
+        let at = Point::new(mouse.column, mouse.row);
+        let down = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Middle) => return,
+            MouseEventKind::Down(_) => None,
+            MouseEventKind::ScrollDown => Some(true),
+            MouseEventKind::ScrollUp => Some(false),
+            _ => return,
+        };
+        // As with a key, the user takes over from a search that was asked
+        // to put the cursor somewhere.
+        for pane in &mut self.panes {
+            pane.want(Vec::new());
+        }
+        match (mouse.kind, down) {
+            (_, Some(down)) => self.wheel(spot, down),
+            (MouseEventKind::Down(button), None) => self.click(button, spot, at, mouse.modifiers),
+            _ => {}
+        }
+    }
+
+    fn click(&mut self, button: MouseButton, spot: Option<Spot>, at: Point, held: KeyModifiers) {
+        let last = self.last_click.take();
+        let left = button == MouseButton::Left;
+        // The menu, the shortcuts and a dialog keep the clicks to themselves.
+        if self.menu.is_some() {
+            match spot {
+                Some(Spot::MenuRow(row)) if left => self.choose_row(row),
+                Some(Spot::Menu | Spot::MenuRow(_)) => {}
+                // Anywhere else it closes, with nothing done.
+                _ => self.menu = None,
+            }
+            return;
+        }
+        if self.help_visible {
+            return;
+        }
+        if self.dialog.is_some() {
+            if let (true, Some(Spot::Choice(yes))) = (left, spot) {
+                self.choose(yes);
+            }
+            return;
+        }
+        let Some(spot) = spot else { return };
+        if !matches!(spot, Spot::PathField | Spot::SearchField) {
+            self.leave_field();
+        }
+        match (left, spot) {
+            (true, Spot::Item { pane, index }) => self.click_item(pane, index, held, last),
+            (true, Spot::Above { pane, depth, index }) => {
+                self.click_above(pane, depth, index);
+            }
+            (true, Spot::Pane(pane)) => self.enter_pane(pane),
+            (true, Spot::Place(place)) => {
+                self.sidebar_cursor = place;
+                self.open_place();
+            }
+            (true, Spot::Crumb { pane, path }) => {
+                self.active = pane.min(self.panes.len() - 1);
+                self.navigate(&path);
+            }
+            (true, Spot::SearchField) => self.search(),
+            (true, Spot::Toggle(toggle)) => self.flip(toggle),
+            (true, Spot::OpenButton) => self.open_selected(),
+            (false, Spot::Item { pane, index }) => {
+                self.enter_pane(pane);
+                let pane = self.pane_mut();
+                if index < pane.entries.len() {
+                    // Inside the selection it is about all of it.
+                    if !pane.is_selected(index) {
+                        pane.collapse();
+                    }
+                    pane.point_at(index);
+                    let groups = self.files_menu();
+                    self.show_menu(groups, Some(at));
+                }
+            }
+            (false, Spot::Above { pane, depth, index }) => {
+                if self.click_above(pane, depth, index) {
+                    let groups = self.files_menu();
+                    self.show_menu(groups, Some(at));
+                }
+            }
+            (false, Spot::Pane(pane)) => {
+                self.enter_pane(pane);
+                let groups = self.folder_menu();
+                self.show_menu(groups, Some(at));
+            }
+            (false, Spot::Place(place)) => {
+                self.focus = Focus::Sidebar;
+                self.sidebar_cursor = place;
+                let groups = self.place_menu();
+                self.show_menu(groups, Some(at));
+            }
+            _ => {}
+        }
+    }
+
+    /// A click on a line of the menu: Enter on it. A dim line does nothing.
+    fn choose_row(&mut self, row: usize) {
+        let Some(menu) = &mut self.menu else { return };
+        if matches!(menu.rows.get(row), Some(MenuRow::Item { .. })) {
+            menu.cursor = row;
+            self.handle_key(KeyEvent::from(KeyCode::Enter));
+        }
+    }
+
+    /// A click on a dialog's button: Enter on the choice that does what it
+    /// asks, or Escape.
+    fn choose(&mut self, yes: bool) {
+        if !yes {
+            return self.handle_key(KeyEvent::from(KeyCode::Esc));
+        }
+        if let Some(Dialog::Delete { armed, .. } | Dialog::EmptyTrash { armed, .. }) =
+            &mut self.dialog
+        {
+            *armed = true;
+        }
+        self.handle_key(KeyEvent::from(KeyCode::Enter));
+    }
+
+    /// A click away from the field in the top bar that has the keyboard:
+    /// the path field closes as with Escape, and the search hands the
+    /// keyboard to what it found as with Tab.
+    fn leave_field(&mut self) {
+        let key = match self.field {
+            Some(Field::Path(_)) => KeyCode::Esc,
+            Some(Field::Search) => KeyCode::Tab,
+            None => return,
+        };
+        self.handle_key(KeyEvent::from(key));
+    }
+
+    /// The keyboard goes to a pane's files.
+    fn enter_pane(&mut self, pane: usize) {
+        self.focus = Focus::Files;
+        self.active = pane.min(self.panes.len() - 1);
+    }
+
+    /// A left click on an item: the cursor there and only it selected; with
+    /// Shift the range from where it started; with Alt (or Cmd) one more or
+    /// one less. A second plain click on it soon after opens it like Enter.
+    fn click_item(&mut self, pane: usize, index: usize, held: KeyModifiers, last: Option<Click>) {
+        let now = (self.clock)();
+        self.enter_pane(pane);
+        let pane = self.pane_mut();
+        let Some(path) = pane.entries.get(index).map(|entry| entry.path.clone()) else {
+            return;
+        };
+        if held.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) {
+            return pane.toggle(index);
+        }
+        let anchor = pane.anchor.unwrap_or(pane.cursor);
+        pane.point_at(index);
+        if held.contains(KeyModifiers::SHIFT) {
+            return pane.select_from(anchor);
+        }
+        pane.collapse();
+        let again = |click: &Click| {
+            click.pane == self.active
+                && click.path == path
+                && now.saturating_duration_since(click.at) <= DOUBLE_CLICK
+        };
+        if last.as_ref().is_some_and(again) {
+            self.open_selected();
+        } else {
+            let pane = self.active;
+            self.last_click = Some(Click {
+                pane,
+                path,
+                at: now,
+            });
+        }
+    }
+
+    /// A click on a row of a folder above the pane's own in the columns
+    /// view: goes to that folder with the row selected. False when it couldn't.
+    fn click_above(&mut self, pane: usize, depth: usize, index: usize) -> bool {
+        let now = (self.clock)();
+        let above = self.panes.get(pane).and_then(|it| it.ancestors.get(depth));
+        let Some(entry) = above.and_then(|above| above.entries.get(index)) else {
+            return false;
+        };
+        let (path, name) = (entry.path.clone(), entry.name.clone());
+        let Some(folder) = path.parent().map(Path::to_path_buf) else {
+            return false;
+        };
+        self.enter_pane(pane);
+        let arrived = self.go_to(&folder, Some(&name));
+        if arrived {
+            let pane = self.active;
+            self.last_click = Some(Click {
+                pane,
+                path,
+                at: now,
+            });
+        }
+        arrived
+    }
+
+    /// A click on a switch in the top bar: what its key does. The view goes
+    /// round from the grid to the list to the columns.
+    fn flip(&mut self, toggle: Toggle) {
+        match toggle {
+            Toggle::View => self.set_view(match self.view {
+                ViewMode::Grid => ViewMode::List,
+                ViewMode::List => ViewMode::Columns,
+                ViewMode::Columns => ViewMode::Grid,
+            }),
+            Toggle::Sort => self.set_sort(self.sort.step(1)),
+            Toggle::Hidden => self.toggle_hidden(),
+            Toggle::Details => self.toggle_details(),
+        }
+    }
+
+    /// A turn of the wheel over a pane, the sidebar or the shortcuts
+    /// scrolls it; under the menu or a dialog nothing does.
+    fn wheel(&mut self, spot: Option<Spot>, down: bool) {
+        if self.menu.is_some() || self.dialog.is_some() {
+            return;
+        }
+        if self.help_visible {
+            if spot == Some(Spot::Help) {
+                let key = if down { KeyCode::Down } else { KeyCode::Up };
+                for _ in 0..WHEEL_ROWS {
+                    self.handle_key(KeyEvent::from(key));
+                }
+            }
+            return;
+        }
+        match spot {
+            Some(Spot::Item { pane, .. } | Spot::Above { pane, .. } | Spot::Pane(pane)) => {
+                let grid = self.view == ViewMode::Grid;
+                let Some(pane) = self.panes.get_mut(pane) else {
+                    return;
+                };
+                if grid {
+                    let across = pane.grid_columns;
+                    pane.wheel(down, 1, across);
+                } else {
+                    pane.wheel(down, WHEEL_ROWS, 1);
+                }
+            }
+            Some(Spot::Sidebar | Spot::Place(_)) => {
+                let rows = self
+                    .hits
+                    .rect_of(&Spot::Sidebar)
+                    .map_or(0, |rect| rect.height);
+                let most = self.hits.sidebar_lines.saturating_sub(rows as usize);
+                let scroll = self.sidebar_scroll.min(most);
+                self.sidebar_scroll = if down {
+                    (scroll + WHEEL_ROWS).min(most)
+                } else {
+                    scroll.saturating_sub(WHEEL_ROWS)
+                };
+            }
+            _ => {}
+        }
+    }
+
     /// The keys that change files. True when the key was one of them.
     fn file_key(&mut self, key: KeyEvent) -> bool {
         let held = key.modifiers;
@@ -841,7 +1281,14 @@ impl App {
         } else {
             self.files_menu()
         };
-        let menu = Menu::new(groups);
+        self.show_menu(groups, None);
+    }
+
+    /// Opens a menu of these lines, at a right click or, without one, next
+    /// to what it is about.
+    fn show_menu(&mut self, groups: Vec<Vec<MenuRow>>, at: Option<Point>) {
+        let mut menu = Menu::new(groups);
+        menu.at = at;
         if !menu.rows.is_empty() {
             self.menu = Some(menu);
         }
@@ -853,16 +1300,7 @@ impl App {
         let empty_trash = item("Empty Trash…", Action::EmptyTrash);
         let pasting = self.clipboard.is_some();
         let Some(entry) = pane.selected() else {
-            if self.in_trash() {
-                return vec![vec![empty_trash]];
-            }
-            // Nothing to act on but the folder itself, where there is one.
-            let here = pane.is_folder();
-            return vec![vec![
-                item_if(here && pasting, "Paste", Action::Paste),
-                item_if(here, "New Folder", Action::NewFolder),
-                item_if(here, "Open Terminal Here", Action::Terminal),
-            ]];
+            return self.folder_menu();
         };
         if self.in_trash() {
             let selection = vec![
@@ -915,6 +1353,21 @@ impl App {
         ]
     }
 
+    /// The menu's lines for the active pane's folder itself: what an empty
+    /// folder offers, and what a right click beside the items offers.
+    fn folder_menu(&self) -> Vec<Vec<MenuRow>> {
+        if self.in_trash() {
+            return vec![vec![item("Empty Trash…", Action::EmptyTrash)]];
+        }
+        let here = self.pane().is_folder();
+        let pasting = self.clipboard.is_some();
+        vec![vec![
+            item_if(here && pasting, "Paste", Action::Paste),
+            item_if(here, "New Folder", Action::NewFolder),
+            item_if(here, "Open Terminal Here", Action::TerminalHere),
+        ]]
+    }
+
     /// The menu's lines for the sidebar place the keyboard is on.
     fn place_menu(&self) -> Vec<Vec<MenuRow>> {
         let Some(place) = self.places().nth(self.sidebar_cursor) else {
@@ -961,6 +1414,7 @@ impl App {
             Action::Compress => self.compress(),
             Action::Pin => self.pin_selected(),
             Action::Terminal => self.open_terminal(),
+            Action::TerminalHere => self.open_terminal_here(),
             Action::Trash => self.trash(),
             Action::Delete => self.ask_delete(),
             Action::NewFolder => self.ask_new_folder(),
@@ -1386,7 +1840,19 @@ impl App {
             Some(entry) => entry.path.parent(),
             None => Some(self.pane().cwd.as_path()),
         };
-        let started = folder.is_some_and(|folder| self.system.open_terminal(folder).is_ok());
+        let folder = folder.map(Path::to_path_buf);
+        self.terminal_in(folder);
+    }
+
+    /// Open Terminal Here, in the folder's own menu: a terminal in the
+    /// folder that is showing, whatever is under the cursor.
+    fn open_terminal_here(&mut self) {
+        let folder = self.pane().cwd.clone();
+        self.terminal_in(Some(folder));
+    }
+
+    fn terminal_in(&mut self, folder: Option<PathBuf>) {
+        let started = folder.is_some_and(|folder| self.system.open_terminal(&folder).is_ok());
         if !started {
             self.fail("Couldn't start a terminal.".to_string());
         }
@@ -6149,5 +6615,678 @@ mod tests {
         assert!(matches!(f.app.dialog, Some(Dialog::Delete { .. })));
         press(&mut f.app, &[KeyCode::Esc]);
         assert_eq!(on_disk(&f.trash), ["notes.txt"]);
+    }
+}
+
+/// The mouse: every click lands on what the last frame drew under it, and
+/// does what the key for the same thing does.
+#[cfg(test)]
+mod mouse_tests {
+    use super::testing::*;
+    use super::*;
+    use crate::ui::testing::{buffer, find};
+    use ratatui::buffer::Buffer;
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use std::cell::Cell;
+    use std::fs;
+    use std::ops::Range;
+    use std::rc::Rc;
+    use std::time::Instant;
+
+    fn draw(app: &mut App) -> Buffer {
+        buffer(app, 120, 40)
+    }
+
+    /// Draws the window and says where a piece of text starts in it.
+    fn spot(app: &mut App, text: &str, columns: Range<u16>) -> (u16, u16) {
+        let drawn = draw(app);
+        find(&drawn, text, columns).unwrap_or_else(|| panic!("{text} isn't drawn"))
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, (column, row): (u16, u16), held: KeyModifiers) {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: held,
+        });
+    }
+
+    fn click(app: &mut App, at: (u16, u16)) {
+        click_with(app, at, KeyModifiers::NONE);
+    }
+
+    fn click_with(app: &mut App, at: (u16, u16), held: KeyModifiers) {
+        mouse(app, MouseEventKind::Down(MouseButton::Left), at, held);
+    }
+
+    fn right_click(app: &mut App, at: (u16, u16)) {
+        mouse(
+            app,
+            MouseEventKind::Down(MouseButton::Right),
+            at,
+            KeyModifiers::NONE,
+        );
+    }
+
+    fn wheel(app: &mut App, at: (u16, u16), down: bool) {
+        let kind = if down {
+            MouseEventKind::ScrollDown
+        } else {
+            MouseEventKind::ScrollUp
+        };
+        mouse(app, kind, at, KeyModifiers::NONE);
+    }
+
+    /// A clock the test moves on by hand.
+    fn clock(app: &mut App) -> Rc<Cell<Instant>> {
+        let now = Rc::new(Cell::new(Instant::now()));
+        let read = now.clone();
+        app.clock = Box::new(move || read.get());
+        now
+    }
+
+    fn wait(clock: &Cell<Instant>, millis: u64) {
+        clock.set(clock.get() + Duration::from_millis(millis));
+    }
+
+    fn cursor_name(app: &App) -> &str {
+        app.selected().map_or("", |entry| entry.name.as_str())
+    }
+
+    fn selection(app: &App) -> Vec<&str> {
+        let selected = app.pane().selection();
+        selected.map(|entry| entry.name.as_str()).collect()
+    }
+
+    fn labels(app: &App) -> Vec<&str> {
+        let rows = &app.menu.as_ref().expect("no menu is open").rows;
+        let line = |row: &MenuRow| match row {
+            MenuRow::Item { label, .. } => *label,
+            MenuRow::Separator => "-",
+        };
+        rows.iter().map(line).collect()
+    }
+
+    const VIEWS: [char; 3] = ['2', '1', '3'];
+
+    #[test]
+    fn a_click_on_an_item_puts_the_keyboard_and_the_cursor_on_it_alone_in_every_view() {
+        for view in VIEWS {
+            let mut f = several();
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            f.app.handle_key(shift(KeyCode::Down));
+            press(&mut f.app, &[KeyCode::BackTab]);
+            assert_eq!(f.app.focus, Focus::Sidebar);
+            let (x, y) = spot(&mut f.app, "c.txt", 24..86);
+            // A tile is its picture as much as its name.
+            let at = if view == '1' { (x, y - 3) } else { (x, y) };
+            click(&mut f.app, at);
+            assert_eq!(f.app.focus, Focus::Files, "view {view}");
+            assert_eq!(f.app.active, 0);
+            assert_eq!(cursor_name(&f.app), "c.txt", "view {view}");
+            assert_eq!(selection(&f.app), ["c.txt"], "view {view}");
+            assert_eq!(f.app.pane().cwd, f.home);
+            assert!(f.app.pane().back.is_empty(), "nothing was opened");
+        }
+    }
+
+    #[test]
+    fn in_split_a_click_makes_its_pane_the_active_one_and_empty_space_leaves_the_cursor() {
+        for view in VIEWS {
+            let mut f = several();
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            split(&mut f.app);
+            press(&mut f.app, &[KeyCode::Down]);
+            assert_eq!(f.app.active, 1);
+            let at = spot(&mut f.app, "a.txt", 24..55);
+            click(&mut f.app, at);
+            assert_eq!(
+                (f.app.active, f.app.focus),
+                (0, Focus::Files),
+                "view {view}"
+            );
+            assert_eq!(cursor_name(&f.app), "a.txt", "view {view}");
+            assert_eq!(f.app.panes[1].cursor, 1, "the other pane's cursor stays");
+
+            // Empty space in the right pane: active, its cursor where it was.
+            press(&mut f.app, &[KeyCode::BackTab]);
+            assert_eq!(f.app.focus, Focus::Sidebar);
+            draw(&mut f.app);
+            click(&mut f.app, (57, 36));
+            assert_eq!(
+                (f.app.active, f.app.focus),
+                (1, Focus::Files),
+                "view {view}"
+            );
+            assert_eq!(f.app.panes[1].cursor, 1, "view {view}");
+            assert_eq!(f.app.panes[0].cursor, 2, "view {view}");
+        }
+    }
+
+    #[test]
+    fn a_click_on_empty_space_makes_the_pane_active_and_leaves_the_selection_alone() {
+        for view in VIEWS {
+            let mut f = several();
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            f.app.handle_key(shift(KeyCode::Down));
+            press(&mut f.app, &[KeyCode::Tab]);
+            assert_eq!(f.app.focus, Focus::Details);
+            draw(&mut f.app);
+            click(&mut f.app, (25, 37));
+            assert_eq!(f.app.focus, Focus::Files, "view {view}");
+            assert_eq!(selection(&f.app), ["Documents", "Pictures"], "view {view}");
+            assert_eq!(cursor_name(&f.app), "Pictures", "view {view}");
+        }
+    }
+
+    #[test]
+    fn in_columns_a_click_above_goes_to_that_folder_and_one_in_the_last_column_selects() {
+        let mut f = fixture();
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Right]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        let trip = spot(&mut f.app, "Trip", 51..86);
+        let jpg = spot(&mut f.app, "a.jpg", 51..86);
+        click(&mut f.app, jpg);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert_eq!(cursor_name(&f.app), "a.jpg");
+        click(&mut f.app, trip);
+        assert_eq!(cursor_name(&f.app), "Trip");
+
+        // The home column, left of it: there, with the row clicked selected.
+        let notes = spot(&mut f.app, "notes.txt", 24..51);
+        click(&mut f.app, notes);
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(cursor_name(&f.app), "notes.txt");
+        assert_eq!(f.app.focus, Focus::Files);
+        // Ordinary navigation: Back returns.
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+    }
+
+    #[test]
+    fn two_clicks_on_one_item_within_400_ms_open_it_like_enter_in_every_view() {
+        for view in VIEWS {
+            let mut f = fixture();
+            let now = clock(&mut f.app);
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            let pictures = spot(&mut f.app, "Pictures", 24..86);
+            click(&mut f.app, pictures);
+            wait(&now, 400);
+            draw(&mut f.app);
+            click(&mut f.app, pictures);
+            assert_eq!(f.app.pane().cwd, f.home.join("Pictures"), "view {view}");
+            assert_eq!(f.app.pane().back.len(), 1, "in the history");
+
+            // A file opens with its app.
+            let jpg = spot(&mut f.app, "a.jpg", 24..86);
+            click(&mut f.app, jpg);
+            wait(&now, 150);
+            draw(&mut f.app);
+            click(&mut f.app, jpg);
+            let opened = vec![f.home.join("Pictures").join("a.jpg")];
+            assert_eq!(*f.system.opened.borrow(), opened, "view {view}");
+
+            // Too slow: two clicks.
+            wait(&now, 1000);
+            click(&mut f.app, jpg);
+            wait(&now, 401);
+            draw(&mut f.app);
+            click(&mut f.app, jpg);
+            assert_eq!(*f.system.opened.borrow(), opened, "view {view}");
+
+            // Quick, on two different items: two clicks.
+            let trip = spot(&mut f.app, "Trip", 24..86);
+            wait(&now, 1000);
+            click(&mut f.app, trip);
+            wait(&now, 100);
+            draw(&mut f.app);
+            click(&mut f.app, jpg);
+            assert_eq!(*f.system.opened.borrow(), opened, "view {view}");
+            assert_eq!(f.app.pane().cwd, f.home.join("Pictures"), "view {view}");
+            assert_eq!(cursor_name(&f.app), "a.jpg");
+        }
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_from_where_it_started() {
+        for view in VIEWS {
+            let mut f = several();
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            let a = spot(&mut f.app, "a.txt", 24..86);
+            let b = spot(&mut f.app, "b.txt", 24..86);
+            let d = spot(&mut f.app, "d.txt", 24..86);
+            click(&mut f.app, a);
+            click_with(&mut f.app, d, KeyModifiers::SHIFT);
+            assert_eq!(selection(&f.app), ["a.txt", "b.txt", "c.txt", "d.txt"]);
+            assert_eq!(cursor_name(&f.app), "d.txt", "view {view}");
+            // The range still starts at a.txt.
+            click_with(&mut f.app, b, KeyModifiers::SHIFT);
+            assert_eq!(selection(&f.app), ["a.txt", "b.txt"], "view {view}");
+            // And Shift+arrows go on from there.
+            let next = if view == '1' {
+                KeyCode::Right
+            } else {
+                KeyCode::Down
+            };
+            f.app.handle_key(shift(next));
+            assert_eq!(
+                selection(&f.app),
+                ["a.txt", "b.txt", "c.txt"],
+                "view {view}"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_click_adds_or_removes_one_item_and_cmd_click_does_the_same() {
+        for view in VIEWS {
+            let mut f = several();
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            let at = |f: &mut Fixture, name| spot(&mut f.app, name, 24..86);
+            let (a, c, e) = (
+                at(&mut f, "a.txt"),
+                at(&mut f, "c.txt"),
+                at(&mut f, "e.txt"),
+            );
+            click(&mut f.app, a);
+            click_with(&mut f.app, c, KeyModifiers::ALT);
+            assert_eq!(selection(&f.app), ["a.txt", "c.txt"], "view {view}");
+            assert_eq!(cursor_name(&f.app), "c.txt");
+            click_with(&mut f.app, e, KeyModifiers::SUPER);
+            assert_eq!(selection(&f.app), ["a.txt", "c.txt", "e.txt"]);
+            click_with(&mut f.app, a, KeyModifiers::ALT);
+            assert_eq!(selection(&f.app), ["c.txt", "e.txt"], "view {view}");
+            click_with(&mut f.app, e, KeyModifiers::ALT);
+            assert_eq!(selection(&f.app), ["c.txt"], "view {view}");
+            assert_eq!(cursor_name(&f.app), "c.txt");
+            // The last one selected stays: something always is.
+            click_with(&mut f.app, c, KeyModifiers::ALT);
+            assert_eq!(selection(&f.app), ["c.txt"], "view {view}");
+        }
+    }
+
+    #[test]
+    fn right_click_selects_what_is_outside_the_selection_and_opens_its_menu_at_the_click() {
+        for view in VIEWS {
+            let mut f = several();
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            let at = |f: &mut Fixture, name| spot(&mut f.app, name, 24..86);
+            let (a, b, c, e) = (
+                at(&mut f, "a.txt"),
+                at(&mut f, "b.txt"),
+                at(&mut f, "c.txt"),
+                at(&mut f, "e.txt"),
+            );
+            click(&mut f.app, a);
+            click_with(&mut f.app, c, KeyModifiers::SHIFT);
+            press(&mut f.app, &[KeyCode::BackTab]);
+
+            let at = (e.0 + 2, e.1);
+            right_click(&mut f.app, at);
+            assert_eq!(selection(&f.app), ["e.txt"], "view {view}");
+            assert_eq!(f.app.focus, Focus::Files);
+            assert_eq!(&labels(&f.app)[..4], ["Open", "Preview", "-", "Rename"]);
+            // Right under the click, or right above it without room below.
+            let drawn = draw(&mut f.app);
+            let below = drawn[(at.0, at.1 + 1)].symbol() == "┌";
+            let above = drawn[(at.0, at.1 - 1)].symbol() == "└";
+            assert!(below || above, "view {view}");
+
+            // Inside the selection it stays as it is, for all of it.
+            press(&mut f.app, &[KeyCode::Esc]);
+            draw(&mut f.app);
+            click(&mut f.app, a);
+            click_with(&mut f.app, c, KeyModifiers::SHIFT);
+            right_click(&mut f.app, b);
+            assert_eq!(
+                selection(&f.app),
+                ["a.txt", "b.txt", "c.txt"],
+                "view {view}"
+            );
+            assert_eq!(cursor_name(&f.app), "b.txt");
+            assert!(labels(&f.app).contains(&"Compress"));
+            let rows = &f.app.menu.as_ref().unwrap().rows;
+            let rename = MenuRow::Item {
+                label: "Rename",
+                action: Action::Rename,
+                enabled: false,
+            };
+            assert!(rows.contains(&rename), "one name for several items");
+        }
+
+        // Alt+Enter after it opens next to the item again, not at the click.
+        let mut f = several();
+        let e = spot(&mut f.app, "e.txt", 24..86);
+        right_click(&mut f.app, (e.0 + 10, e.1));
+        press(&mut f.app, &[KeyCode::Esc]);
+        f.app.handle_key(alt(KeyCode::Enter));
+        let drawn = draw(&mut f.app);
+        assert_eq!(drawn[(e.0, e.1 + 1)].symbol(), "┌");
+        assert_eq!(find(&drawn, "Open", 24..86), Some((e.0 + 2, e.1 + 2)));
+    }
+
+    #[test]
+    fn right_click_on_empty_space_opens_the_folders_menu_whose_terminal_opens_there() {
+        let mut f = several();
+        draw(&mut f.app);
+        right_click(&mut f.app, (40, 30));
+        assert_eq!(
+            labels(&f.app),
+            ["Paste", "New Folder", "Open Terminal Here"]
+        );
+        assert_eq!(cursor_name(&f.app), "Documents", "nothing selected anew");
+
+        // Paste is dim with nothing copied: a click on it does nothing.
+        let paste = spot(&mut f.app, "Paste", 24..86);
+        click(&mut f.app, paste);
+        assert!(f.app.menu.is_some() && f.app.message.is_none());
+        // The terminal opens in the folder showing, not the one under the cursor.
+        let terminal = spot(&mut f.app, "Open Terminal Here", 24..86);
+        click(&mut f.app, terminal);
+        assert!(f.app.menu.is_none());
+        assert_eq!(*f.system.terminals.borrow(), [f.home.clone()]);
+
+        draw(&mut f.app);
+        right_click(&mut f.app, (40, 30));
+        let new = spot(&mut f.app, "New Folder", 24..86);
+        click(&mut f.app, new);
+        assert!(matches!(f.app.dialog, Some(Dialog::NewFolder { .. })));
+    }
+
+    #[test]
+    fn a_click_on_a_menu_line_runs_it_and_one_outside_only_closes_the_menu() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::End]);
+        f.app.handle_key(alt(KeyCode::Enter));
+        let documents = spot(&mut f.app, "Documents", 24..86);
+        click(&mut f.app, documents);
+        assert!(f.app.menu.is_none());
+        assert_eq!(
+            cursor_name(&f.app),
+            "notes.txt",
+            "nothing reached the files"
+        );
+
+        f.app.handle_key(alt(KeyCode::Enter));
+        let copy_path = spot(&mut f.app, "Copy Path", 24..86);
+        click(&mut f.app, copy_path);
+        assert!(f.app.menu.is_none());
+        let path = f.home.join("notes.txt").display().to_string();
+        assert_eq!(*f.system.copied.borrow(), [path]);
+
+        // A right click on another item while it is open only closes it too.
+        f.app.handle_key(alt(KeyCode::Enter));
+        draw(&mut f.app);
+        right_click(&mut f.app, documents);
+        assert!(f.app.menu.is_none());
+        assert_eq!(cursor_name(&f.app), "notes.txt");
+    }
+
+    #[test]
+    fn right_click_on_a_place_opens_its_menu_and_a_click_on_one_opens_it() {
+        let mut f = fixture();
+        let place = spot(&mut f.app, "Pictures", 0..24);
+        right_click(&mut f.app, place);
+        assert_eq!(f.app.focus, Focus::Sidebar);
+        assert_eq!(labels(&f.app), ["Open"]);
+        assert_eq!(f.app.pane().cwd, f.home, "not opened yet");
+        let open = spot(&mut f.app, "Open", 0..86);
+        assert_eq!(open, (place.0 + 2, place.1 + 2), "at the click");
+        click(&mut f.app, open);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert_eq!(f.app.focus, Focus::Files);
+
+        // A plain click opens a place, the way Enter in the sidebar does.
+        let documents = spot(&mut f.app, "Documents", 0..24);
+        click(&mut f.app, documents);
+        assert_eq!(f.app.pane().cwd, f.home.join("Documents"));
+        assert_eq!(f.app.focus, Focus::Files);
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+    }
+
+    #[test]
+    fn a_click_on_a_breadcrumb_goes_there_and_back_returns() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
+        let crumb = spot(&mut f.app, "Pictures", 0..86);
+        assert_eq!(crumb.1, 0, "in the top bar");
+        click(&mut f.app, crumb);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
+        let home = spot(&mut f.app, "~", 0..10);
+        click(&mut f.app, home);
+        assert_eq!(f.app.pane().cwd, f.home);
+
+        // Split, each pane's own path above it.
+        split(&mut f.app);
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        let crumb = spot(&mut f.app, "~", 56..86);
+        assert_eq!(crumb.1, 2);
+        click(&mut f.app, crumb);
+        assert_eq!(f.app.panes[1].cwd, f.home);
+        assert_eq!(f.app.active, 1);
+    }
+
+    #[test]
+    fn the_top_bar_toggles_do_what_their_keys_do() {
+        let mut f = fixture();
+        for (now, next) in [
+            ("≡", ViewMode::Columns),
+            ("▥", ViewMode::Grid),
+            ("▦", ViewMode::List),
+        ] {
+            let toggle = spot(&mut f.app, now, 86..120);
+            click(&mut f.app, toggle);
+            assert_eq!(f.app.view, next);
+        }
+        let sort = spot(&mut f.app, "⇅", 86..120);
+        click(&mut f.app, sort);
+        assert_eq!(f.app.sort, SortMode::Name.step(1));
+        assert_eq!(said(&f.app), Some(SortMode::Name.step(1).tip()));
+        let hidden = spot(&mut f.app, "◉", 86..120);
+        click(&mut f.app, hidden);
+        assert!(f.app.show_hidden && names(&f.app).contains(&".hidden".to_string()));
+        let details = spot(&mut f.app, "◨", 86..120);
+        click(&mut f.app, details);
+        assert!(!f.app.details_visible);
+    }
+
+    fn said(app: &App) -> Option<&str> {
+        app.message.as_ref().map(|message| message.text.as_str())
+    }
+
+    #[test]
+    fn the_open_button_of_the_details_opens_the_item_under_the_cursor() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::End]);
+        let open = spot(&mut f.app, "Open", 86..120);
+        click(&mut f.app, open);
+        assert_eq!(*f.system.opened.borrow(), [f.home.join("notes.txt")]);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_list_by_three_rows_keeping_the_cursor_in_sight() {
+        let mut f = fixture();
+        for n in 10..70 {
+            fs::write(f.home.join(format!("{n}.txt")), "").unwrap();
+        }
+        press(&mut f.app, &[KeyCode::F(5)]);
+        // 63 items, 37 rows.
+        let top = spot(&mut f.app, "Documents", 24..86);
+        wheel(&mut f.app, top, true);
+        assert_eq!(f.app.pane().offset, 3);
+        assert_eq!(f.app.pane().cursor, 3, "moved down into sight");
+        let drawn = draw(&mut f.app);
+        assert_eq!(
+            find(&drawn, "11.txt", 24..86),
+            Some((28, 3)),
+            "the fourth item on top"
+        );
+        for _ in 0..20 {
+            wheel(&mut f.app, top, true);
+        }
+        assert_eq!(f.app.pane().offset, 26, "as far as it goes");
+        assert_eq!(f.app.pane().cursor, 26);
+        wheel(&mut f.app, top, false);
+        assert_eq!(f.app.pane().offset, 23);
+        assert_eq!(f.app.pane().cursor, 26, "still in sight: left alone");
+        draw(&mut f.app);
+        press(&mut f.app, &[KeyCode::Down]);
+        draw(&mut f.app);
+        assert_eq!((f.app.pane().offset, f.app.pane().cursor), (23, 27));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_grid_by_a_row_of_tiles() {
+        let mut f = grid_fixture();
+        // Ten tiles, three across: four rows, two showing.
+        let drawn = buffer(&mut f.app, 120, 24);
+        let first = find(&drawn, "Documents", 24..86).unwrap();
+        wheel(&mut f.app, first, true);
+        assert_eq!((f.app.pane().offset, f.app.pane().cursor), (1, 3));
+        buffer(&mut f.app, 120, 24);
+        wheel(&mut f.app, first, true);
+        wheel(&mut f.app, first, true);
+        assert_eq!((f.app.pane().offset, f.app.pane().cursor), (2, 6));
+        wheel(&mut f.app, first, false);
+        assert_eq!((f.app.pane().offset, f.app.pane().cursor), (1, 6));
+    }
+
+    #[test]
+    fn the_wheel_over_the_sidebar_scrolls_it() {
+        let mut f = fixture();
+        for n in 0..20 {
+            fs::create_dir(f.home.join(format!("Folder {n:02}"))).unwrap();
+        }
+        press(&mut f.app, &[KeyCode::F(5)]);
+        let row = |drawn: &Buffer, text: &str| find(drawn, text, 0..23).map(|(_, y)| y);
+        let drawn = buffer(&mut f.app, 120, 14);
+        assert_eq!(row(&drawn, "HOME"), Some(3));
+        wheel(&mut f.app, (5, 8), true);
+        let drawn = buffer(&mut f.app, 120, 14);
+        assert_eq!(row(&drawn, "HOME"), None);
+        assert_eq!(row(&drawn, "Folder 00"), Some(2));
+        assert_eq!(f.app.focus, Focus::Files, "the keyboard stays");
+        wheel(&mut f.app, (5, 8), false);
+        let drawn = buffer(&mut f.app, 120, 14);
+        assert_eq!(row(&drawn, "HOME"), Some(3));
+    }
+
+    #[test]
+    fn the_wheel_over_the_shortcuts_scrolls_them_and_clicks_reach_nothing_under_them() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        let top = crate::ui::testing::screen(&mut f.app, 120, 24);
+        wheel(&mut f.app, (60, 12), true);
+        let wheeled = crate::ui::testing::screen(&mut f.app, 120, 24);
+        assert_ne!(wheeled, top);
+        press(&mut f.app, &[KeyCode::Up, KeyCode::Up, KeyCode::Up]);
+        assert_eq!(crate::ui::testing::screen(&mut f.app, 120, 24), top);
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Down, KeyCode::Down]);
+        assert_eq!(crate::ui::testing::screen(&mut f.app, 120, 24), wheeled);
+
+        // Nothing underneath hears a click, wherever it is.
+        for at in [(60, 12), (1, 1), (5, 5), (100, 23)] {
+            click(&mut f.app, at);
+            right_click(&mut f.app, at);
+            wheel(&mut f.app, (1, 23), true);
+        }
+        assert!(f.app.help_visible && f.app.menu.is_none());
+        assert_eq!(crate::ui::testing::screen(&mut f.app, 120, 24), wheeled);
+        assert_eq!((f.app.pane().cursor, f.app.focus), (0, Focus::Files));
+        assert_eq!(f.app.pane().cwd, f.home);
+    }
+
+    #[test]
+    fn a_click_on_a_dialogs_button_chooses_it_and_one_outside_does_nothing() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::End]);
+        f.app.handle_key(shift(KeyCode::Delete));
+        let documents = spot(&mut f.app, "Documents", 24..86);
+        click(&mut f.app, documents);
+        right_click(&mut f.app, documents);
+        assert!(matches!(
+            f.app.dialog,
+            Some(Dialog::Delete { armed: false, .. })
+        ));
+        assert!(f.app.menu.is_none());
+        assert_eq!(cursor_name(&f.app), "notes.txt");
+
+        let cancel = spot(&mut f.app, "Cancel", 24..96);
+        click(&mut f.app, cancel);
+        assert!(f.app.dialog.is_none());
+        assert!(f.home.join("notes.txt").exists());
+
+        f.app.handle_key(shift(KeyCode::Delete));
+        let delete = spot(&mut f.app, "Delete  ", 24..96);
+        click(&mut f.app, delete);
+        assert!(f.app.dialog.is_none());
+        assert!(!f.home.join("notes.txt").exists());
+        assert_eq!(said(&f.app), Some("Deleted 1 item."));
+
+        // A name: Apply and Cancel are what Enter and Escape are.
+        press(&mut f.app, &[KeyCode::Home, KeyCode::F(2)]);
+        let cancel = spot(&mut f.app, "Esc Cancel", 24..96);
+        click(&mut f.app, cancel);
+        assert!(f.app.dialog.is_none());
+        press(&mut f.app, &[KeyCode::F(2), KeyCode::Char('s')]);
+        let apply = spot(&mut f.app, "⏎ Apply", 24..96);
+        click(&mut f.app, apply);
+        assert!(f.app.dialog.is_none());
+        assert!(f.home.join("Documentss").is_dir());
+    }
+
+    #[test]
+    fn a_click_in_the_files_closes_the_path_field_or_hands_the_search_over_then_acts() {
+        let mut f = fixture();
+        f.app.handle_key(ctrl(KeyCode::Char('l')));
+        let notes = spot(&mut f.app, "notes.txt", 24..86);
+        click(&mut f.app, notes);
+        assert!(f.app.field.is_none());
+        assert_eq!(cursor_name(&f.app), "notes.txt");
+
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "jpg");
+        finish_search(&mut f.app);
+        let found = spot(&mut f.app, "a.jpg", 24..86);
+        click(&mut f.app, found);
+        assert!(f.app.field.is_none(), "the keyboard is with what was found");
+        assert!(f.app.pane().results().is_some(), "still showing it");
+        assert_eq!(cursor_name(&f.app), "a.jpg");
+        // A click on the field hands the keyboard back to it.
+        let field = spot(&mut f.app, "/jpg", 0..86);
+        click(&mut f.app, field);
+        assert!(matches!(f.app.field, Some(Field::Search)));
+    }
+
+    #[test]
+    fn drags_moves_releases_and_the_middle_button_do_nothing() {
+        let mut f = fixture();
+        let notes = spot(&mut f.app, "notes.txt", 24..86);
+        for kind in [
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::Down(MouseButton::Middle),
+        ] {
+            mouse(&mut f.app, kind, notes, KeyModifiers::NONE);
+        }
+        assert_eq!((f.app.pane().cursor, f.app.focus), (0, Focus::Files));
+        assert!(f.app.menu.is_none() && f.app.field.is_none());
+    }
+
+    #[test]
+    fn without_a_frame_drawn_a_click_lands_nowhere() {
+        let mut f = fixture();
+        click(&mut f.app, (28, 5));
+        right_click(&mut f.app, (28, 5));
+        assert_eq!(f.app.pane().cursor, 0);
+        assert!(f.app.menu.is_none());
     }
 }

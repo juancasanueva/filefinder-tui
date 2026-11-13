@@ -7,16 +7,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::pad;
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, HitMap, Spot};
 use crate::theme;
 
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+/// Draws the places; each one's row is a spot for the mouse.
+pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let width = area.width as usize;
     let current = app.current_place();
     let cursor = (app.focus == Focus::Sidebar).then_some(app.sidebar_cursor);
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut cursor_line = 0;
+    let mut cursor_line = None;
+    // The line of each place, in order.
+    let mut place_lines = Vec::new();
     let mut index = 0;
     for section in &app.sidebar {
         lines.push(Line::default());
@@ -35,8 +38,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 theme::base()
             };
             if cursor == Some(index) {
-                cursor_line = lines.len();
+                cursor_line = Some(lines.len());
             }
+            place_lines.push(lines.len());
             let text = format!("  {}  {}", place.icon.glyph(), place.label);
             lines.push(Line::from(Span::styled(
                 pad(&text, width.saturating_sub(1)),
@@ -46,9 +50,21 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Keep the keyboard's place on screen in a long sidebar.
+    // As far as the wheel scrolled it, but with the keyboard's place on
+    // screen in a long sidebar.
     let height = area.height as usize;
-    let scroll = (cursor_line + 1).saturating_sub(height);
+    let mut scroll = app.sidebar_scroll.min(lines.len().saturating_sub(height));
+    if let Some(line) = cursor_line {
+        scroll = scroll.min(line).max((line + 1).saturating_sub(height));
+    }
+    hits.add(area, Spot::Sidebar);
+    hits.sidebar_lines = lines.len();
+    for (place, line) in place_lines.into_iter().enumerate() {
+        if (scroll..scroll + height).contains(&line) {
+            let y = area.y + (line - scroll) as u16;
+            hits.add(Rect::new(area.x, y, area.width, 1), Spot::Place(place));
+        }
+    }
     frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), area);
 }
 

@@ -6,22 +6,26 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use super::{COLUMN_PITCH as PITCH, COLUMN_WIDTH};
 use super::{empty_text, fit, icon_style, pad, row_style, scroll};
-use crate::app::App;
+use crate::app::{App, HitMap, Spot};
 use crate::icons::Icon;
 use crate::model::Entry;
 use crate::theme;
 
-const COLUMN_WIDTH: u16 = 26;
-/// A column and the hairline on its right.
-const PITCH: u16 = COLUMN_WIDTH + 1;
-
 /// Draws one pane's folder and the ones above it; `focused` is whether it
-/// has the keyboard.
-pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: bool) {
+/// has the keyboard. Each row is a spot for the mouse.
+pub fn draw(
+    frame: &mut Frame,
+    app: &mut App,
+    index: usize,
+    area: Rect,
+    focused: bool,
+    hits: &mut HitMap,
+) {
     // One blank row of air on top, like the list.
     let rows = area.height.saturating_sub(1) as usize;
-    let pane = &mut app.panes[pane];
+    let pane = &mut app.panes[index];
     pane.offset = scroll(pane.offset, pane.cursor, rows);
 
     // The folders above, then the pane's own; the rightmost ones when they don't all fit.
@@ -44,13 +48,20 @@ pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: 
         if column.width == PITCH {
             frame.render_widget(hairline, column);
         }
-        match pane.ancestors.get(total - shown + slot) {
+        let depth = total - shown + slot;
+        match pane.ancestors.get(depth) {
             Some(above) => {
                 // The way down is highlighted in grey: the keyboard is further right.
                 let offset = scroll(0, above.on_path.unwrap_or(0), rows);
                 let lit = theme::selected_inactive();
                 let on_path = |index| above.on_path == Some(index);
                 draw_column(frame, inner, &above.entries, offset, on_path, lit);
+                let spot = |row| Spot::Above {
+                    pane: index,
+                    depth,
+                    index: row,
+                };
+                add_rows(hits, inner, above.entries.len(), offset, spot);
             }
             None if pane.entries.is_empty() => {
                 // The pane's own column is the last one: there is room to
@@ -67,8 +78,28 @@ pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: 
                 let lit = row_style(true, focused);
                 let selected = |index| pane.is_selected(index);
                 draw_column(frame, inner, &pane.entries, pane.offset, selected, lit);
+                let spot = |row| Spot::Item {
+                    pane: index,
+                    index: row,
+                };
+                add_rows(hits, inner, pane.entries.len(), pane.offset, spot);
             }
         }
+    }
+}
+
+/// Where `draw_column` drew each of a folder's rows, for the mouse.
+fn add_rows(
+    hits: &mut HitMap,
+    area: Rect,
+    count: usize,
+    offset: usize,
+    spot: impl Fn(usize) -> Spot,
+) {
+    let rows = area.height.saturating_sub(1) as usize;
+    for (line, row) in (offset..count).take(rows).enumerate() {
+        let y = area.y + 1 + line as u16;
+        hits.add(Rect::new(area.x, y, area.width, 1), spot(row));
     }
 }
 

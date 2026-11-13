@@ -9,11 +9,12 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::pad;
-use crate::app::{Menu, MenuRow};
+use crate::app::{HitMap, Menu, MenuRow, Spot};
 use crate::theme;
 
-/// Draws the menu next to `anchor`, the cells of the item it is about.
-pub fn draw(frame: &mut Frame, menu: &Menu, anchor: Rect, area: Rect) {
+/// Draws the menu next to `anchor`, the cells of the item it is about. The
+/// menu and each of its lines are spots for the mouse.
+pub fn draw(frame: &mut Frame, menu: &Menu, anchor: Rect, area: Rect, hits: &mut HitMap) {
     let label_width = |row: &MenuRow| match row {
         MenuRow::Item { label, .. } => label.width(),
         MenuRow::Separator => 0,
@@ -48,6 +49,10 @@ pub fn draw(frame: &mut Frame, menu: &Menu, anchor: Rect, area: Rect) {
     let showing = menu.rows.iter().enumerate().skip(first).take(rows);
     let lines: Vec<Line> = showing.map(line).collect();
     frame.render_widget(Paragraph::new(lines), inner);
+    hits.add(outer, Spot::Menu);
+    for (y, row) in (inner.y..inner.bottom()).zip(first..menu.rows.len()) {
+        hits.add(Rect::new(inner.x, y, inner.width, 1), Spot::MenuRow(row));
+    }
 }
 
 /// Where a menu of a size goes: right under the item it is about; above it

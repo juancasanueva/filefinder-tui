@@ -8,8 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use super::{pad, pad_left};
-use crate::app::App;
+use super::{fit, pad, pad_left};
+use crate::app::{App, HitMap, Spot};
 use crate::theme;
 
 const SHORTCUTS: &[(&str, &str)] = &[
@@ -75,10 +75,15 @@ const SIDES: usize = 8;
 
 const TITLE: &str = "Keyboard shortcuts";
 
+/// Under the shortcuts, whatever is scrolled: what the mouse does.
+const MOUSE: &str =
+    "Mouse: click, double-click, right-click; Shift+click a range, Alt+click one by one";
+
 /// One line of a column: the keys, or nothing where the line above goes on.
 type Row = (&'static str, String);
 
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+/// Draws the overlay, which is a spot for the mouse wheel.
+pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
     let (area_width, area_height) = (area.width as usize, area.height as usize);
     // With room to spare: a margin around the panel and air above and below
     // the lines, which leaves this many rows for them.
@@ -96,11 +101,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     // A window still too short gives up the margin and the air, then scrolls.
+    // The line about the mouse takes the place of the air under the
+    // shortcuts, or a row of its own without it.
     let tallest = columns.iter().map(Vec::len).max().unwrap_or(0);
     let (air, rows) = if tallest <= roomy_rows {
         (1, roomy_rows)
     } else {
-        (0, area_height.saturating_sub(4))
+        (0, area_height.saturating_sub(5))
     };
     let showing = tallest.min(rows);
     let last = tallest - showing;
@@ -108,7 +115,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.help_rows = showing;
     let first = app.help_scroll;
 
-    let height = (showing + 4 + 2 * air).min(area_height);
+    let height = (showing + 5 + air).min(area_height);
     let overlay = Rect {
         x: area.x + ((area_width - width) / 2) as u16,
         y: area.y + ((area_height - height) / 2) as u16,
@@ -118,7 +125,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(theme::rule())
-        .padding(Padding::new(3, 3, air as u16, air as u16))
+        .padding(Padding::new(3, 3, air as u16, 0))
         .style(theme::base().bg(theme::DARK_BACKGROUND));
 
     let inner_width = width.saturating_sub(SIDES);
@@ -157,8 +164,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         lines.push(Line::from(spans));
     }
+    lines.push(Line::from(Span::styled(
+        fit(MOUSE, inner_width),
+        theme::dim(),
+    )));
     frame.render_widget(Clear, overlay);
     frame.render_widget(Paragraph::new(lines).block(block), overlay);
+    hits.add(overlay, Spot::Help);
 }
 
 /// The lines of a column `width` cells wide: what the keys do goes on under
@@ -349,6 +361,26 @@ mod tests {
         assert_eq!(show(&mut f.app, 120, 24), top);
         press(&mut f.app, &[KeyCode::Char('?')]);
         assert!(!f.app.help_visible);
+    }
+
+    #[test]
+    fn the_overlay_says_what_the_mouse_does_under_the_shortcuts() {
+        let mouse =
+            "Mouse: click, double-click, right-click; Shift+click a range, Alt+click one by one";
+        for (width, height) in [(120, 40), (120, 24), (200, 24)] {
+            let mut f = fixture();
+            let screens = read_through(&mut f.app, width, height);
+            for shown in &screens {
+                let line = shown.lines().position(|line| line.contains(mouse));
+                let last = shown
+                    .lines()
+                    .position(|line| line.contains("Close the window"));
+                assert!(line.is_some(), "{width}x{height}:\n{shown}");
+                if let Some(last) = last {
+                    assert!(line > Some(last), "under the shortcuts");
+                }
+            }
+        }
     }
 
     #[test]

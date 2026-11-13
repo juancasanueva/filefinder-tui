@@ -6,20 +6,26 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{fit, pad};
-use crate::app::Dialog;
+use crate::app::{Dialog, HitMap, Spot};
 use crate::input::Input;
 use crate::ops;
 use crate::theme;
 
 const WIDTH: u16 = 72;
 
-pub fn draw(frame: &mut Frame, dialog: &Dialog, area: Rect) {
+/// What a name's dialog says under the field: its two choices.
+const APPLY: &str = "⏎ Apply";
+const CANCEL: &str = "Esc Cancel";
+const HINT_GAP: &str = "    ";
+
+/// Draws the dialog; it and each of its buttons are spots for the mouse.
+pub fn draw(frame: &mut Frame, dialog: &Dialog, area: Rect, hits: &mut HitMap) {
     match dialog {
-        Dialog::Rename { input, .. } => name(frame, area, "Rename", input),
-        Dialog::NewFolder { input, .. } => name(frame, area, "New Folder", input),
+        Dialog::Rename { input, .. } => name(frame, area, "Rename", input, hits),
+        Dialog::NewFolder { input, .. } => name(frame, area, "New Folder", input, hits),
         Dialog::Delete { paths, armed } => {
             let what = match paths.as_slice() {
                 [one] => {
@@ -28,7 +34,8 @@ pub fn draw(frame: &mut Frame, dialog: &Dialog, area: Rect) {
                 }
                 several => ops::count(several.len()),
             };
-            confirm(frame, area, "Delete for good?", &what, "Delete", *armed);
+            let asked = "Delete for good?";
+            confirm(frame, area, asked, &what, "Delete", *armed, hits);
         }
         Dialog::EmptyTrash { paths, armed } => {
             let what = ops::count(paths.len());
@@ -39,6 +46,7 @@ pub fn draw(frame: &mut Frame, dialog: &Dialog, area: Rect) {
                 &what,
                 "Empty Trash",
                 *armed,
+                hits,
             );
         }
     }
@@ -46,7 +54,7 @@ pub fn draw(frame: &mut Frame, dialog: &Dialog, area: Rect) {
 
 /// Clears a panel in the middle of the window and returns where its `rows`
 /// lines of content go.
-fn panel(frame: &mut Frame, area: Rect, rows: u16) -> Rect {
+fn panel(frame: &mut Frame, area: Rect, rows: u16, hits: &mut HitMap) -> Rect {
     let width = WIDTH.min(area.width.saturating_sub(4));
     // A short window gives up the air above and below the content first.
     let air = u16::from(area.height >= rows + 6);
@@ -65,15 +73,28 @@ fn panel(frame: &mut Frame, area: Rect, rows: u16) -> Rect {
     let inner = block.inner(outer);
     frame.render_widget(Clear, outer);
     frame.render_widget(block, outer);
+    hits.add(outer, Spot::Dialog);
     inner
 }
 
+/// A button `width` cells wide at `x` on a row, as much of it as shows.
+fn button(hits: &mut HitMap, row: Rect, x: u16, width: usize, yes: bool) {
+    let cells = Rect::new(x, row.y, width as u16, 1).intersection(row);
+    hits.add(cells, Spot::Choice(yes));
+}
+
 /// A title over a field holding the name being typed.
-fn name(frame: &mut Frame, area: Rect, title: &str, input: &Input) {
-    let inner = panel(frame, area, 5);
+fn name(frame: &mut Frame, area: Rect, title: &str, input: &Input, hits: &mut HitMap) {
+    let inner = panel(frame, area, 5, hits);
     let [title_row, _, field, _, hint] = Layout::vertical([Constraint::Length(1); 5]).areas(inner);
     frame.render_widget(Span::styled(title, theme::title()), title_row);
-    frame.render_widget(Span::styled("⏎ Apply    Esc Cancel", theme::dim()), hint);
+    let choices = format!("{APPLY}{HINT_GAP}{CANCEL}");
+    frame.render_widget(Span::styled(choices, theme::dim()), hint);
+    button(hits, hint, hint.x, APPLY.width(), true);
+    let cancel = hint
+        .x
+        .saturating_add((APPLY.width() + HINT_GAP.len()) as u16);
+    button(hits, hint, cancel, CANCEL.width(), false);
     if field.is_empty() {
         return;
     }
@@ -85,17 +106,29 @@ fn name(frame: &mut Frame, area: Rect, title: &str, input: &Input) {
 
 /// The question before deleting `what` for good, with its two choices:
 /// `yes`, which is lit once it is `armed`, and Cancel.
-fn confirm(frame: &mut Frame, area: Rect, asked: &str, what: &str, yes: &str, armed: bool) {
-    let inner = panel(frame, area, 6);
+fn confirm(
+    frame: &mut Frame,
+    area: Rect,
+    asked: &str,
+    what: &str,
+    yes: &str,
+    armed: bool,
+    hits: &mut HitMap,
+) {
+    let inner = panel(frame, area, 6, hits);
     let rows = [1, 1, 2, 1, 1].map(Constraint::Length);
     let [title, _, text, _, choices] = Layout::vertical(rows).areas(inner);
     let asks = format!("{what} will be deleted permanently. This can't be undone.");
     frame.render_widget(Span::styled(asked, theme::title()), title);
     frame.render_widget(Paragraph::new(asks).wrap(Wrap { trim: true }), text);
+    let (yes, cancel) = (format!("  {yes}  "), "  Cancel  ");
+    button(hits, choices, choices.x, yes.width(), true);
+    let after = choices.x.saturating_add(yes.width() as u16 + 2);
+    button(hits, choices, after, cancel.width(), false);
     let line = Line::from(vec![
-        Span::styled(format!("  {yes}  "), theme::choice(armed)),
+        Span::styled(yes, theme::choice(armed)),
         Span::raw("  "),
-        Span::styled("  Cancel  ", theme::choice(!armed)),
+        Span::styled(cancel, theme::choice(!armed)),
     ]);
     frame.render_widget(line, choices);
 }

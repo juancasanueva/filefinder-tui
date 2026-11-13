@@ -7,7 +7,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use super::{fit, grid, pad, picture};
-use crate::app::{App, Focus, Pane};
+use crate::app::{App, Focus, HitMap, Pane, Spot};
 use crate::format;
 use crate::model::Entry;
 use crate::theme;
@@ -16,7 +16,8 @@ use crate::thumbs::{Facts, Thumbs};
 /// The fewest rows the pane needs before a third of them go to the preview.
 const ROWS_FOR_A_PREVIEW: u16 = 12;
 
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+/// Draws the pane; its Open button is a spot for the mouse.
+pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
     let inner = Rect {
         x: area.x + 2,
         width: area.width.saturating_sub(4),
@@ -67,6 +68,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         pad(label, (button.width as usize).saturating_sub(3))
     );
     frame.render_widget(Paragraph::new(text).style(theme::button()), button);
+    hits.add(button, Spot::OpenButton);
 
     if preview_rows > 0 {
         draw_preview(frame, app.thumbs.as_mut(), entry, facts, preview);
