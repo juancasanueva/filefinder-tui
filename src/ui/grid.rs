@@ -88,14 +88,15 @@ fn clip(rect: Rect, area: Rect) -> Option<Rect> {
     (!inside.is_empty()).then_some(inside)
 }
 
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+/// Draws one pane's items as tiles; `focused` is whether it has the keyboard.
+pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: bool) {
     let size = app.tile;
     let columns = columns(area.width, size);
     let rows = visible_rows(area.height, size);
-    app.grid_columns = columns;
-    app.page_rows = rows;
     let date_style = app.date_style;
-    let pane = &mut app.panes[app.active];
+    let pane = &mut app.panes[pane];
+    pane.grid_columns = columns;
+    pane.page_rows = rows;
     if pane.entries.is_empty() {
         list::empty(frame, area, pane);
         return;
@@ -109,7 +110,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
         let Some(tile) = tile_rect(area, size, pane.offset, index) else {
             break;
         };
-        let selected = index == pane.cursor;
+        let selected = pane.is_selected(index);
 
         let thumb = thumb_of(tile, size);
         if let Some(visible) = thumb_rect(area, size, pane.offset, index) {
@@ -222,7 +223,7 @@ fn details(entry: &Entry, now: SystemTime, date_style: DateStyle, width: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::testing::{ctrl, fixture, grid_fixture, pictures, press, settle};
+    use crate::app::testing::{ctrl, fixture, grid_fixture, pictures, press, settle, split};
     use crate::icons::Icon;
     use crate::thumbs::testing::painted;
     use crate::ui::testing::{buffer, find, screen};
@@ -366,10 +367,10 @@ mod tests {
     fn bigger_and_smaller_tiles_change_how_many_fit_across() {
         let mut f = grid_fixture();
         screen(&mut f.app, 130, 30);
-        assert_eq!(f.app.grid_columns, 3);
+        assert_eq!(f.app.pane().grid_columns, 3);
         f.app.handle_key(ctrl(KeyCode::Char('=')));
         let big = buffer(&mut f.app, 130, 30);
-        assert_eq!(f.app.grid_columns, 2);
+        assert_eq!(f.app.pane().grid_columns, 2);
         // A 26-cell tile: the frame's corners are that far apart, around a 9-row thumbnail.
         let (x, y) = find(&big, "┌", 24..96).unwrap();
         assert_eq!(big[(x + 25, y)].symbol(), "┐");
@@ -378,7 +379,7 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('-')));
         f.app.handle_key(ctrl(KeyCode::Char('-')));
         let small = buffer(&mut f.app, 130, 30);
-        assert_eq!(f.app.grid_columns, 4);
+        assert_eq!(f.app.pane().grid_columns, 4);
         let (x, y) = find(&small, "┌", 24..96).unwrap();
         assert_eq!(small[(x + 13, y)].symbol(), "┐");
         assert_eq!(small[(x, y + 5)].symbol(), "└");
@@ -528,5 +529,76 @@ mod tests {
         press(&mut f.app, &[KeyCode::Enter]);
         let all = screen(&mut f.app, 100, 20).join("\n");
         assert!(all.contains("No items"), "{all}");
+    }
+
+    // Two panes in a window 182 cells wide: 124 of them for the files, 62 on
+    // the left, a hairline, 61 on the right, each under a row for its path.
+    const LEFT: Rect = Rect::new(24, 3, 62, 21);
+    const RIGHT: Rect = Rect::new(87, 3, 61, 21);
+
+    #[test]
+    fn two_grids_each_have_their_own_tiles_across_and_their_own_selected_tile() {
+        let mut f = grid_fixture();
+        split(&mut f.app);
+        buffer(&mut f.app, 182, 24);
+        let across = |app: &App| (app.panes[0].grid_columns, app.panes[1].grid_columns);
+        assert_eq!(across(&f.app), (3, 2));
+        assert_eq!((f.app.panes[0].page_rows, f.app.panes[1].page_rows), (2, 2));
+
+        // Down is a row of two on the right and a row of three on the left.
+        press(&mut f.app, &[KeyCode::Down]);
+        assert_eq!(f.app.pane().cursor, 2);
+        press(&mut f.app, &[KeyCode::BackTab, KeyCode::Down]);
+        assert_eq!(f.app.pane().cursor, 3);
+        let drawn = buffer(&mut f.app, 182, 24);
+        let here = tile_rect(LEFT, TileSize::Normal, 0, 3).unwrap();
+        let there = tile_rect(RIGHT, TileSize::Normal, 0, 2).unwrap();
+        assert_eq!((here.y, there.y), (13, 13), "the second row of each");
+        assert_eq!(drawn[(here.x, here.y)].symbol(), "┌");
+        assert_eq!(drawn[(here.x, here.y)].fg, theme::ACCENT);
+        assert_eq!(drawn[(there.x, there.y)].symbol(), "┌");
+        assert_eq!(drawn[(there.x, there.y)].fg, theme::BRIGHT_FOREGROUND);
+        // One frame each, and a hairline between the two grids.
+        let corners = (0..182u16)
+            .flat_map(|x| (0..24u16).map(move |y| (x, y)))
+            .filter(|at| drawn[*at].symbol() == "┌");
+        assert_eq!(corners.count(), 2);
+        assert_eq!(drawn[(86, 2)].symbol(), "│");
+        assert_eq!(drawn[(86, 23)].symbol(), "│");
+        // The path is on the row above the tiles.
+        assert_eq!(find(&drawn, "~", 24..86), Some((26, 2)));
+        assert_eq!(find(&drawn, "~", 87..148), Some((89, 2)));
+    }
+
+    #[test]
+    fn each_pane_draws_the_thumbnails_of_its_own_folder() {
+        let (mut f, thumbnailer) = pictures();
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        split(&mut f.app);
+        press(&mut f.app, &[KeyCode::Right, KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        buffer(&mut f.app, 182, 24);
+        settle(&mut f.app);
+        let drawn = buffer(&mut f.app, 182, 24);
+
+        // notes.txt, the third tile on the left; a.jpg, the second on the right.
+        let notes = thumb_rect(LEFT, TileSize::Normal, 0, 2).unwrap();
+        let picture = thumb_rect(RIGHT, TileSize::Normal, 0, 1).unwrap();
+        assert!(notes.right() <= 86 && picture.x >= 87);
+        for thumb in [notes, picture] {
+            assert_eq!((thumb.width, thumb.height), (16, 6));
+            for (x, y) in [
+                (thumb.x, thumb.y),
+                (thumb.right() - 1, thumb.y),
+                (thumb.x, thumb.bottom() - 1),
+                (thumb.right() - 1, thumb.bottom() - 1),
+            ] {
+                assert!(painted(&drawn[(x, y)]), "{x}, {y}");
+            }
+            assert!(!painted(&drawn[(thumb.x - 1, thumb.y)]));
+        }
+        let mut asked = thumbnailer.asked();
+        asked.sort();
+        assert_eq!(asked, ["a.jpg", "notes.txt"]);
     }
 }

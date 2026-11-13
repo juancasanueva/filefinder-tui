@@ -1,5 +1,6 @@
 //! Application state and what each key does to it.
 
+use std::collections::{BTreeSet, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -150,6 +151,17 @@ struct Visit {
     recents: bool,
 }
 
+/// Where a pane was before it was listed again behind its back: what to
+/// put back afterwards.
+struct Position {
+    cursor: usize,
+    offset: usize,
+    /// The item the cursor was on.
+    under_cursor: Option<PathBuf>,
+    /// The items that were selected, when there were several.
+    selected: Vec<PathBuf>,
+}
+
 /// A folder above the pane's own, as the columns view lists it.
 pub struct Ancestor {
     pub entries: Vec<Entry>,
@@ -162,11 +174,20 @@ pub struct Pane {
     pub listing: Listing,
     pub entries: Vec<Entry>,
     pub cursor: usize,
+    /// The items selected, while there are several of them: with one, it is
+    /// the item under the cursor and this is empty.
+    marks: BTreeSet<usize>,
+    /// Where the range that Shift and the arrows select started.
+    anchor: Option<usize>,
     /// First visible row (of tiles, in the grid); the view keeps the cursor on screen with it.
     pub offset: usize,
     /// The folders from home (or `/`) down to this one's parent. Only the columns
     /// view needs them, so they are listed when a folder is shown in that view.
     pub ancestors: Vec<Ancestor>,
+    /// Rows the pane's view showed last time, for Page Up and Page Down.
+    pub page_rows: usize,
+    /// Tiles across the pane's grid last time, for Up and Down.
+    pub grid_columns: usize,
     back: Vec<Visit>,
     forward: Vec<Visit>,
 }
@@ -178,15 +199,89 @@ impl Pane {
             listing: Listing::Folder,
             entries,
             cursor: 0,
+            marks: BTreeSet::new(),
+            anchor: None,
             offset: 0,
             ancestors: Vec::new(),
+            page_rows: 10,
+            grid_columns: 1,
             back: Vec::new(),
             forward: Vec::new(),
         }
     }
 
+    /// The item under the cursor: the one Enter opens and the details show.
     pub fn selected(&self) -> Option<&Entry> {
         self.entries.get(self.cursor)
+    }
+
+    /// Whether an item is selected: the one under the cursor, or each of
+    /// the several that a range or Ctrl+A took.
+    pub fn is_selected(&self, index: usize) -> bool {
+        if self.marks.is_empty() {
+            index == self.cursor
+        } else {
+            self.marks.contains(&index)
+        }
+    }
+
+    /// What is selected, in the order it is listed.
+    pub fn selection(&self) -> impl Iterator<Item = &Entry> {
+        let selected = |(index, _): &(usize, &Entry)| self.is_selected(*index);
+        let listed = self.entries.iter().enumerate();
+        listed.filter(selected).map(|(_, entry)| entry)
+    }
+
+    /// Selects everything from where a range started to the cursor.
+    fn select_from(&mut self, anchor: usize) {
+        self.anchor = Some(anchor);
+        let (first, last) = (anchor.min(self.cursor), anchor.max(self.cursor));
+        self.marks = (first..=last).filter(|_| first < last).collect();
+    }
+
+    /// Selects every item, wherever the cursor is.
+    fn select_all(&mut self) {
+        self.anchor = None;
+        let all = 0..self.entries.len();
+        self.marks = all.filter(|_| self.entries.len() > 1).collect();
+    }
+
+    /// Leaves only the item under the cursor selected.
+    fn collapse(&mut self) {
+        self.marks.clear();
+        self.anchor = None;
+    }
+
+    /// Where the pane is, to put back once it has been listed again.
+    fn position(&self) -> Position {
+        let path = |entry: &Entry| entry.path.clone();
+        let several = !self.marks.is_empty();
+        Position {
+            cursor: self.cursor,
+            offset: self.offset,
+            under_cursor: self.selected().map(path),
+            selected: self.selection().filter(|_| several).map(path).collect(),
+        }
+    }
+
+    /// Puts the pane back where it was after listing it again: the cursor on
+    /// its item, or on the row that item had, the view scrolled as it was,
+    /// and what was selected selected, as far as it is still listed.
+    fn put_back(&mut self, was: Position) {
+        let last = self.entries.len().saturating_sub(1);
+        self.cursor = was.cursor.min(last);
+        self.want(was.under_cursor.into_iter().collect());
+        self.offset = was.offset;
+        let selected: HashSet<&PathBuf> = was.selected.iter().collect();
+        let listed = self.entries.iter().enumerate();
+        let marks: BTreeSet<usize> = listed
+            .filter(|(_, entry)| selected.contains(&entry.path))
+            .map(|(index, _)| index)
+            .collect();
+        // A selection the cursor's item fell out of is no longer one.
+        if marks.len() > 1 && marks.contains(&self.cursor) {
+            self.marks = marks;
+        }
     }
 
     /// Whether the pane lists a folder's own items. Only there can things
@@ -244,6 +339,7 @@ impl Pane {
         self.entries = entries;
         self.offset = 0;
         self.cursor = 0;
+        self.collapse();
         if let Some(name) = select {
             self.select(name);
         }
@@ -253,6 +349,7 @@ impl Pane {
     fn select(&mut self, name: &str) {
         if let Some(index) = self.entries.iter().position(|entry| entry.name == name) {
             self.cursor = index;
+            self.collapse();
         }
     }
 
@@ -262,6 +359,7 @@ impl Pane {
         let listed = |path: &PathBuf| self.entries.iter().position(|entry| entry.path == *path);
         if let Some(index) = wanted.iter().find_map(listed) {
             self.cursor = index;
+            self.collapse();
         }
         if let Listing::Search(search) = &mut self.listing {
             search.wanted = wanted;
@@ -283,6 +381,8 @@ impl Pane {
                 // Only one wanted more than this one moves the cursor again.
                 search.wanted.truncate(rank);
                 self.cursor = self.entries.len();
+                self.marks.clear();
+                self.anchor = None;
             }
             self.entries.push(entry);
         }
@@ -348,10 +448,6 @@ pub struct App {
     pub message: Option<Message>,
     pub should_quit: bool,
     pub date_style: DateStyle,
-    /// Rows the file view showed last time, for Page Up and Page Down.
-    pub page_rows: usize,
-    /// Tiles across the grid last time, for Up and Down.
-    pub grid_columns: usize,
     pub thumbs: Option<Thumbs>,
     /// What was read about the selected item for the details pane.
     pub facts: Option<Facts>,
@@ -399,8 +495,6 @@ impl App {
             message: None,
             should_quit: false,
             date_style: config.date_style,
-            page_rows: 10,
-            grid_columns: 1,
             thumbs: config.thumbs,
             facts: None,
             clipboard: None,
@@ -548,6 +642,11 @@ impl App {
             KeyCode::Char('q' | 'Q') if plain => self.quit(),
             KeyCode::Char('/') if plain => self.search(),
             KeyCode::Char('l') if ctrl => self.ask_path(),
+            // Ctrl+Alt+N, whichever way the terminal spells the letter.
+            KeyCode::Char('n' | 'N') if alt && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.split()
+            }
+            KeyCode::Char('w') if ctrl => self.close_split(),
             KeyCode::Esc => self.escape(),
             KeyCode::Tab => self.move_focus(1),
             KeyCode::BackTab => self.move_focus(-1),
@@ -875,14 +974,14 @@ impl App {
         }
     }
 
-    /// What the file commands act on. One method for all of them, because the
-    /// selection is going to hold several items.
+    /// What the file commands act on: everything selected in the active
+    /// pane. One method for all of them.
     fn selection(&self) -> Vec<PathBuf> {
         if self.focus == Focus::Sidebar {
             return Vec::new();
         }
-        let selected = self.selected().map(|entry| entry.path.clone());
-        selected.into_iter().collect()
+        let selected = self.pane().selection();
+        selected.map(|entry| entry.path.clone()).collect()
     }
 
     /// Says to wait when file work is under way: changes to files are
@@ -1149,12 +1248,66 @@ impl App {
 
     /// Lists what the pane shows again and puts the cursor on the first of
     /// these that is in it: one of `paths`, what was selected before, or
-    /// `neighbour`.
+    /// `neighbour`. The other pane's folder is listed again too, since what
+    /// changed may show there, and that pane stays where it was.
     fn relist(&mut self, paths: &[PathBuf], neighbour: Option<PathBuf>) {
         let selected = self.selected().map(|entry| entry.path.clone());
         if self.reload() {
             let wanted = paths.iter().cloned().chain(selected).chain(neighbour);
             self.pane_mut().want(wanted.collect());
+        }
+        for index in 0..self.panes.len() {
+            // The files used lately and what a search found are not asked
+            // for again on another pane's account.
+            if index != self.active && self.panes[index].is_folder() {
+                let was = self.panes[index].position();
+                if self.in_pane(index, Self::reload) {
+                    self.panes[index].put_back(was);
+                }
+            }
+        }
+    }
+
+    /// Does to a pane what is written for the active one.
+    fn in_pane<T>(&mut self, index: usize, act: impl FnOnce(&mut Self) -> T) -> T {
+        let active = std::mem::replace(&mut self.active, index);
+        let done = act(self);
+        self.active = active;
+        done
+    }
+
+    /// Lists what every pane shows again: the sort order and the hidden
+    /// files are the same in all of them.
+    fn reload_all(&mut self) {
+        for index in 0..self.panes.len() {
+            self.in_pane(index, Self::reload);
+        }
+    }
+
+    /// Ctrl+Alt+N: a second pane on the right, in the folder of the first,
+    /// with the keyboard. Two are as many as there are.
+    fn split(&mut self) {
+        if self.panes.len() > 1 {
+            return;
+        }
+        let folder = self.pane().cwd.clone();
+        self.panes.push(Pane::new(folder.clone(), Vec::new()));
+        let shown = self.in_pane(1, |app| app.show_folder(&folder, None));
+        if shown {
+            self.active = 1;
+            self.focus = Focus::Files;
+        } else {
+            // Why was said; a pane with nothing to show is no use.
+            self.panes.pop();
+        }
+    }
+
+    /// Ctrl+W: closes the right pane. The left one has the keyboard from then on.
+    fn close_split(&mut self) {
+        if self.panes.len() > 1 {
+            self.panes.truncate(1);
+            self.active = 0;
+            self.focus = Focus::Files;
         }
     }
 
@@ -1169,12 +1322,15 @@ impl App {
     }
 
     /// Escape: stops the file work under way; with none, leaves the search
-    /// that is showing, or dismisses what went wrong.
+    /// that is showing, or dismisses what went wrong. With none of that to
+    /// do, it leaves only the item under the cursor selected.
     fn escape(&mut self) {
         if self.work.is_none() && self.pane().search().is_some() {
             self.leave_search();
-        } else {
+        } else if self.work.is_some() || self.message.is_some() {
             self.stop_or_dismiss();
+        } else {
+            self.pane_mut().collapse();
         }
     }
 
@@ -1195,28 +1351,48 @@ impl App {
 
     fn files_key(&mut self, key: KeyEvent) {
         let grid = self.view == ViewMode::Grid;
-        let columns = if grid { self.grid_columns.max(1) } else { 1 };
-        let page = (self.page_rows.max(1) * columns) as isize;
+        let pane = self.pane();
+        let columns = if grid { pane.grid_columns.max(1) } else { 1 };
+        let page = (pane.page_rows.max(1) * columns) as isize;
+        let held = key.modifiers;
+        let ctrl = held.contains(KeyModifiers::CONTROL) && !held.contains(KeyModifiers::ALT);
         match key.code {
-            // In the grid the arrows only move: Left and Right never change folder.
-            KeyCode::Up if grid => self.pane_mut().move_row(false, columns),
-            KeyCode::Down if grid => self.pane_mut().move_row(true, columns),
-            KeyCode::Left if grid => self.pane_mut().move_cursor(-1),
-            KeyCode::Right if grid => self.pane_mut().move_cursor(1),
-            KeyCode::Up => self.pane_mut().move_cursor(-1),
-            KeyCode::Down => self.pane_mut().move_cursor(1),
-            KeyCode::PageUp => self.pane_mut().move_cursor(-page),
-            KeyCode::PageDown => self.pane_mut().move_cursor(page),
-            KeyCode::Home => self.pane_mut().move_cursor(isize::MIN / 2),
-            KeyCode::End => self.pane_mut().move_cursor(isize::MAX / 2),
-            KeyCode::Left => self.go_up(),
-            KeyCode::Right => {
+            KeyCode::Char('a') if ctrl => {
+                self.pane_mut().select_all();
+                return;
+            }
+            KeyCode::Left if !grid => return self.go_up(),
+            KeyCode::Right if !grid => {
                 if self.selected().is_some_and(|entry| entry.is_dir) {
                     self.open_selected();
                 }
+                return;
             }
-            KeyCode::Enter => self.open_selected(),
+            KeyCode::Enter => return self.open_selected(),
             _ => {}
+        }
+        // The rest move the cursor. With Shift held everything between it
+        // and where the range started is selected; without, only its item.
+        let pane = self.pane_mut();
+        let anchor = pane.anchor.unwrap_or(pane.cursor);
+        match key.code {
+            // In the grid the arrows only move: Left and Right never change folder.
+            KeyCode::Up if grid => pane.move_row(false, columns),
+            KeyCode::Down if grid => pane.move_row(true, columns),
+            KeyCode::Left => pane.move_cursor(-1),
+            KeyCode::Right => pane.move_cursor(1),
+            KeyCode::Up => pane.move_cursor(-1),
+            KeyCode::Down => pane.move_cursor(1),
+            KeyCode::PageUp => pane.move_cursor(-page),
+            KeyCode::PageDown => pane.move_cursor(page),
+            KeyCode::Home => pane.move_cursor(isize::MIN / 2),
+            KeyCode::End => pane.move_cursor(isize::MAX / 2),
+            _ => return,
+        }
+        if held.contains(KeyModifiers::SHIFT) {
+            pane.select_from(anchor);
+        } else {
+            pane.collapse();
         }
     }
 
@@ -1246,16 +1422,21 @@ impl App {
         }
     }
 
+    /// Tab and Shift+Tab: the sidebar, each pane in turn, then the details.
+    /// The sidebar and the details go on showing the pane that was active.
     fn move_focus(&mut self, delta: isize) {
-        let mut stops = vec![Focus::Sidebar, Focus::Files];
+        let mut stops = vec![(Focus::Sidebar, None)];
+        stops.extend((0..self.panes.len()).map(|pane| (Focus::Files, Some(pane))));
         if self.details_visible {
-            stops.push(Focus::Details);
+            stops.push((Focus::Details, None));
         }
-        let index = stops
-            .iter()
-            .position(|stop| *stop == self.focus)
-            .unwrap_or(1) as isize;
-        self.focus = stops[(index + delta).rem_euclid(stops.len() as isize) as usize];
+        let here = |(focus, pane): &(Focus, Option<usize>)| {
+            *focus == self.focus && pane.is_none_or(|pane| pane == self.active)
+        };
+        let index = stops.iter().position(here).unwrap_or(1) as isize;
+        let (focus, pane) = stops[(index + delta).rem_euclid(stops.len() as isize) as usize];
+        self.focus = focus;
+        self.active = pane.unwrap_or(self.active);
         if self.focus == Focus::Sidebar {
             // A drive plugged in since the last look shows up now.
             self.rebuild_sidebar();
@@ -1427,7 +1608,9 @@ impl App {
 
     fn set_view(&mut self, view: ViewMode) {
         self.view = view;
-        self.refresh_ancestors();
+        for index in 0..self.panes.len() {
+            self.in_pane(index, Self::refresh_ancestors);
+        }
         self.remember();
     }
 
@@ -1450,7 +1633,7 @@ impl App {
 
     fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
-        self.reload();
+        self.reload_all();
     }
 
     fn toggle_details(&mut self) {
@@ -1462,7 +1645,7 @@ impl App {
 
     fn set_sort(&mut self, sort: SortMode) {
         self.sort = sort;
-        self.reload();
+        self.reload_all();
         self.note(sort.tip());
     }
 
@@ -1829,8 +2012,28 @@ pub mod testing {
         f
     }
 
+    /// The fixture with `a.txt` to `e.txt` next to what it had: eight items
+    /// in a list, `Documents`, `Pictures`, the five and `notes.txt`.
+    pub fn several() -> Fixture {
+        let mut f = fixture();
+        for name in ["a", "b", "c", "d", "e"] {
+            fs::write(f.home.join(format!("{name}.txt")), name).unwrap();
+        }
+        f.app.handle_key(key(KeyCode::F(5)));
+        f
+    }
+
+    /// Ctrl+Alt+N: a second pane, which takes the keyboard.
+    pub fn split(app: &mut App) {
+        app.handle_key(ctrl_alt(KeyCode::Char('n')));
+    }
+
     pub fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    pub fn ctrl_alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::ALT)
     }
 
     pub fn alt(code: KeyCode) -> KeyEvent {
@@ -2123,7 +2326,7 @@ mod tests {
     #[test]
     fn in_the_grid_left_and_right_move_one_item_and_up_and_down_one_row() {
         let mut f = grid_fixture();
-        assert_eq!(f.app.grid_columns, 3);
+        assert_eq!(f.app.pane().grid_columns, 3);
         press(&mut f.app, &[KeyCode::Right]);
         assert_eq!(selected_name(&f.app), Some("Pictures"));
         press(&mut f.app, &[KeyCode::Down]);
@@ -2174,7 +2377,7 @@ mod tests {
     #[test]
     fn in_the_grid_home_end_and_pages_still_work_and_enter_opens() {
         let mut f = grid_fixture();
-        assert_eq!(f.app.page_rows, 2);
+        assert_eq!(f.app.pane().page_rows, 2);
         press(&mut f.app, &[KeyCode::PageDown]);
         assert_eq!(selected_name(&f.app), Some("e.txt"), "two rows of three");
         press(&mut f.app, &[KeyCode::PageUp]);
@@ -3907,5 +4110,653 @@ mod tests {
         assert!(f.app.field.is_none());
         press(&mut f.app, &[KeyCode::Char('q')]);
         assert!(f.app.should_quit);
+    }
+
+    // Two panes side by side, and selections of several items. The eight
+    // items of `several()` are Documents, Pictures, a.txt to e.txt, notes.txt.
+
+    /// The names of what is selected in the active pane.
+    fn chosen(app: &App) -> Vec<&str> {
+        let selection = app.pane().selection();
+        selection.map(|entry| entry.name.as_str()).collect()
+    }
+
+    fn pane_names(app: &App, pane: usize) -> Vec<&str> {
+        let entries = app.panes[pane].entries.iter();
+        entries.map(|entry| entry.name.as_str()).collect()
+    }
+
+    /// The name of the item a pane's cursor is on.
+    fn under_cursor(app: &App, pane: usize) -> Option<&str> {
+        app.panes[pane].selected().map(|entry| entry.name.as_str())
+    }
+
+    /// Where the keyboard is: the region, and the pane that is the active one.
+    fn keyboard(app: &App) -> (Focus, usize) {
+        (app.focus, app.active)
+    }
+
+    #[test]
+    fn ctrl_alt_n_splits_the_window_in_two_and_ctrl_w_closes_the_right_pane() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Down]);
+        f.app.handle_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(f.app.panes.len(), 1, "one pane: there is none to close");
+        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+
+        // The new pane is on the right, in the same folder, with the keyboard.
+        press(&mut f.app, &[KeyCode::Tab]);
+        split(&mut f.app);
+        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        assert_eq!(f.app.pane().cwd, pictures);
+        assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
+        assert_eq!(selected_name(&f.app), Some("Trip"));
+        assert_eq!(f.app.panes[0].cwd, pictures);
+        assert_eq!(under_cursor(&f.app, 0), Some("a.jpg"));
+
+        // Two is as many as there are, in either spelling of the chord.
+        press(&mut f.app, &[KeyCode::Enter]);
+        f.app.handle_key(ctrl_alt(KeyCode::Char('N')));
+        split(&mut f.app);
+        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        assert_eq!(f.app.pane().cwd, pictures.join("Trip"));
+
+        // From the left pane too it is the right one that closes.
+        press(&mut f.app, &[KeyCode::BackTab]);
+        f.app.handle_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(f.app.pane().cwd, pictures);
+        assert_eq!(selected_name(&f.app), Some("a.jpg"));
+
+        // Closed from the right pane or the sidebar, the left one takes the keyboard.
+        f.app.handle_key(ctrl_alt(KeyCode::Char('N')));
+        assert_eq!((f.app.panes.len(), f.app.active), (2, 1));
+        f.app.handle_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        split(&mut f.app);
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert_eq!(f.app.focus, Focus::Sidebar);
+        f.app.handle_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+    }
+
+    #[test]
+    fn each_pane_has_its_own_folder_history_cursor_and_listing() {
+        let mut f = searchable();
+        let pictures = f.home.join("Pictures");
+        let recent = f.home.join("notes.txt");
+        f.system.recents.borrow_mut().push(recent);
+        press(&mut f.app, &[KeyCode::Down]);
+        split(&mut f.app);
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, pictures.join("Trip"));
+        assert_eq!(f.app.panes[0].cwd, f.home);
+        assert_eq!(under_cursor(&f.app, 0), Some("Pictures"));
+
+        // Back in the right pane; the left one has nowhere to go back to.
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(f.app.pane().cwd, pictures);
+        assert_eq!(selected_name(&f.app), Some("Trip"));
+        press(&mut f.app, &[KeyCode::BackTab]);
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(f.app.pane().cwd, f.home);
+        press(&mut f.app, &[KeyCode::End]);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+        assert_eq!(under_cursor(&f.app, 1), Some("Trip"));
+
+        // A search on the left, the files used lately on the right.
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        search_for(&mut f.app, "trip");
+        assert_eq!(names(&f.app), TRIPS);
+        assert_eq!(pane_names(&f.app, 1), ["Trip", "a.jpg"]);
+        // Out of the field, then on to the right pane and round to the sidebar.
+        press(&mut f.app, &[KeyCode::Tab; 4]);
+        assert_eq!(keyboard(&f.app), (Focus::Sidebar, 1));
+        open_place(&mut f.app, "Recents");
+        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        assert!(f.app.pane().recents());
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        assert!(f.app.panes[0].results().is_some());
+        assert_eq!(pane_names(&f.app, 0), TRIPS);
+
+        // Up from there is the right pane's business alone.
+        press(&mut f.app, &[KeyCode::Backspace]);
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert!(f.app.pane().is_folder());
+        assert_eq!(pane_names(&f.app, 0), TRIPS);
+    }
+
+    #[test]
+    fn tab_goes_from_the_sidebar_through_both_panes_to_the_details() {
+        let mut f = fixture();
+        split(&mut f.app);
+        let walk = |app: &mut App, code: KeyCode| {
+            let stops = (0..4).map(|_| {
+                press(app, &[code]);
+                keyboard(app)
+            });
+            stops.collect::<Vec<_>>()
+        };
+        assert_eq!(
+            walk(&mut f.app, KeyCode::Tab),
+            [
+                (Focus::Details, 1),
+                (Focus::Sidebar, 1),
+                (Focus::Files, 0),
+                (Focus::Files, 1)
+            ]
+        );
+        assert_eq!(
+            walk(&mut f.app, KeyCode::BackTab),
+            [
+                (Focus::Files, 0),
+                (Focus::Sidebar, 0),
+                (Focus::Details, 0),
+                (Focus::Files, 1)
+            ]
+        );
+        // Without the details there are three stops.
+        f.app.handle_key(ctrl(KeyCode::Char('i')));
+        assert_eq!(
+            walk(&mut f.app, KeyCode::Tab)[..3],
+            [(Focus::Sidebar, 1), (Focus::Files, 0), (Focus::Files, 1)]
+        );
+    }
+
+    #[test]
+    fn what_acts_on_the_pane_acts_on_the_one_with_the_keyboard() {
+        let mut f = fixture();
+        let (documents, pictures) = (f.home.join("Documents"), f.home.join("Pictures"));
+        press(&mut f.app, &[KeyCode::Enter]);
+        split(&mut f.app);
+        press(
+            &mut f.app,
+            &[KeyCode::Backspace, KeyCode::Down, KeyCode::Enter],
+        );
+        assert_eq!(f.app.pane().cwd, pictures);
+        assert_eq!(f.app.panes[0].cwd, documents);
+
+        // The sidebar's place and the path field are the right pane's.
+        assert_eq!(f.app.current_place(), place_of(&f.app, "Pictures"));
+        open_path_field(&mut f.app);
+        assert_eq!(path_field(&f.app).0, "~/Pictures");
+        press(&mut f.app, &[KeyCode::Esc]);
+        // A new folder is made in its folder.
+        f.app.handle_key(ctrl_shift('n'));
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(on_disk(&pictures), ["New Folder", "Trip", "a.jpg"]);
+        assert!(on_disk(&documents).is_empty());
+
+        // And the left one's once the keyboard is there.
+        press(&mut f.app, &[KeyCode::BackTab]);
+        assert_eq!(f.app.current_place(), place_of(&f.app, "Documents"));
+        open_path_field(&mut f.app);
+        assert_eq!(path_field(&f.app).0, "~/Documents");
+        press(&mut f.app, &[KeyCode::Esc]);
+        // F5 reads the one pane again.
+        fs::write(documents.join("new.txt"), "").unwrap();
+        fs::write(pictures.join("new.txt"), "").unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
+        assert_eq!(names(&f.app), ["new.txt"]);
+        assert_eq!(pane_names(&f.app, 1), ["New Folder", "Trip", "a.jpg"]);
+    }
+
+    #[test]
+    fn what_is_copied_or_cut_in_one_pane_is_pasted_into_the_other_ones_folder() {
+        let mut f = fixture();
+        let (documents, pictures) = (f.home.join("Documents"), f.home.join("Pictures"));
+        select(&mut f.app, "notes.txt");
+        split(&mut f.app);
+        press(&mut f.app, &[KeyCode::Enter, KeyCode::BackTab]);
+        assert_eq!(f.app.panes[1].cwd, documents);
+
+        // Copied on the left, pasted on the right.
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        press(&mut f.app, &[KeyCode::Tab]);
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        finish_work(&mut f.app);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+        assert_eq!(f.app.active, 1);
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+        assert_eq!(pane_names(&f.app, 0), FOLDER);
+        assert_eq!(said(&f.app), ("Copied 1 item.", false));
+
+        // Cut on the right, pasted on the left: both panes see it move.
+        f.app.handle_key(ctrl(KeyCode::Char('x')));
+        press(&mut f.app, &[KeyCode::BackTab]);
+        select(&mut f.app, "Pictures");
+        press(&mut f.app, &[KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&pictures), ["Trip", "a.jpg", "notes.txt"]);
+        assert!(on_disk(&documents).is_empty());
+        assert_eq!(read(pictures.join("notes.txt")), "hello");
+        assert_eq!(f.app.active, 0);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+        assert!(pane_names(&f.app, 1).is_empty(), "the right pane saw it go");
+        assert_eq!(said(&f.app), ("Moved 1 item.", false));
+    }
+
+    #[test]
+    fn after_a_change_both_panes_list_their_folder_again_and_keep_their_place() {
+        let mut f = several();
+        select(&mut f.app, "c.txt");
+        split(&mut f.app);
+        f.app.panes[0].offset = 2;
+
+        // A folder made on the right shows on the left, which stays on its item.
+        f.app.handle_key(ctrl_shift('n'));
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "Album");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(selected_name(&f.app), Some("Album"));
+        assert_eq!(
+            pane_names(&f.app, 0)[..3],
+            ["Album", "Documents", "Pictures"]
+        );
+        assert_eq!(under_cursor(&f.app, 0), Some("c.txt"));
+        assert_eq!(f.app.panes[0].offset, 2, "scrolled where it was");
+
+        // The item the left pane is on goes, from the right: the one that
+        // takes its row is the left pane's now.
+        select(&mut f.app, "c.txt");
+        press(&mut f.app, &[KeyCode::Delete]);
+        let left = [
+            "Album",
+            "Documents",
+            "Pictures",
+            "a.txt",
+            "b.txt",
+            "d.txt",
+            "e.txt",
+            "notes.txt",
+        ];
+        assert_eq!(pane_names(&f.app, 0), left);
+        assert_eq!(under_cursor(&f.app, 0), Some("d.txt"));
+        assert_eq!(names(&f.app), left);
+        assert_eq!(selected_name(&f.app), Some("d.txt"));
+
+        // What a folder holds is counted again where the folder is listed.
+        select(&mut f.app, "a.txt");
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        select(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        finish_work(&mut f.app);
+        let listed = &f.app.panes[0].entries[1];
+        assert_eq!(listed.name, "Documents");
+        assert_eq!(listed.item_count(), Some(1));
+        assert_eq!(under_cursor(&f.app, 0), Some("d.txt"));
+
+        // Undone from the left, the copy leaves the right pane's list.
+        press(&mut f.app, &[KeyCode::BackTab]);
+        f.app.handle_key(ctrl(KeyCode::Char('z')));
+        assert!(pane_names(&f.app, 1).is_empty());
+        assert_eq!(f.app.panes[0].entries[1].item_count(), Some(0));
+    }
+
+    #[test]
+    fn the_view_the_sort_order_and_hidden_files_are_the_same_in_both_panes() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        fs::write(pictures.join(".secret"), "").unwrap();
+        fs::write(pictures.join("big.bin"), vec![0u8; 100]).unwrap();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        split(&mut f.app);
+        press(&mut f.app, &[KeyCode::Backspace]);
+        assert_eq!(pane_names(&f.app, 0), ["Trip", "a.jpg", "big.bin"]);
+        assert_eq!(names(&f.app), FOLDER);
+
+        // Asked for with the keyboard on the right, they change on the left too.
+        f.app.handle_key(ctrl(KeyCode::Char('h')));
+        assert_eq!(
+            pane_names(&f.app, 0),
+            ["Trip", ".secret", "a.jpg", "big.bin"]
+        );
+        assert_eq!(names(&f.app)[2..], [".hidden", "notes.txt"]);
+        f.app.handle_key(ctrl(KeyCode::Char('h')));
+        assert_eq!(pane_names(&f.app, 0), ["Trip", "a.jpg", "big.bin"]);
+        assert_eq!(names(&f.app), FOLDER);
+
+        press(&mut f.app, &[KeyCode::Char('S')]);
+        assert_eq!(f.app.sort, SortMode::Size);
+        assert_eq!(pane_names(&f.app, 0), ["Trip", "big.bin", "a.jpg"]);
+        assert_eq!(under_cursor(&f.app, 0), Some("Trip"));
+
+        // The columns list the folders above in each pane.
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        assert_eq!(f.app.panes[0].ancestors.len(), 1);
+        assert_eq!(f.app.panes[1].ancestors.len(), 0);
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        assert_eq!(f.app.panes[0].ancestors.len(), 0);
+    }
+
+    #[test]
+    fn ctrl_shift_n_and_ctrl_n_do_what_they_did_and_split_nothing() {
+        let mut f = fixture();
+        f.app.handle_key(ctrl(KeyCode::Char('n')));
+        assert!(f.app.dialog.is_none());
+        let held = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        for chord in [ctrl_shift('n'), KeyEvent::new(KeyCode::Char('n'), held)] {
+            f.app.handle_key(chord);
+            assert!(matches!(f.app.dialog, Some(Dialog::NewFolder { .. })));
+            press(&mut f.app, &[KeyCode::Esc]);
+        }
+        // The new chords' letters alone, or with Alt alone, are only letters.
+        type_text(&mut f.app, "nwa");
+        f.app.handle_key(alt(KeyCode::Char('n')));
+        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(chosen(&f.app), ["Documents"]);
+        assert_eq!((f.app.working(), &f.app.message), (None, &None));
+        assert_eq!(on_disk(&f.home), FOLDER);
+    }
+
+    #[test]
+    fn shift_arrows_select_a_range_from_where_it_started() {
+        let mut f = several();
+        select(&mut f.app, "a.txt");
+        f.app.handle_key(shift(KeyCode::Down));
+        f.app.handle_key(shift(KeyCode::Down));
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt", "c.txt"]);
+        assert_eq!(selected_name(&f.app), Some("c.txt"));
+
+        // Back toward where it started it shrinks; past it, it grows the other way.
+        f.app.handle_key(shift(KeyCode::Up));
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
+        f.app.handle_key(shift(KeyCode::Up));
+        assert_eq!(chosen(&f.app), ["a.txt"]);
+        f.app.handle_key(shift(KeyCode::Up));
+        assert_eq!(chosen(&f.app), ["Pictures", "a.txt"]);
+        assert_eq!(selected_name(&f.app), Some("Pictures"));
+
+        f.app.handle_key(shift(KeyCode::End));
+        assert_eq!(
+            chosen(&f.app),
+            ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "notes.txt"]
+        );
+        f.app.handle_key(shift(KeyCode::Home));
+        assert_eq!(chosen(&f.app), ["Documents", "Pictures", "a.txt"]);
+        // A page is the three rows a window this short shows.
+        crate::ui::testing::screen(&mut f.app, 120, 6);
+        f.app.handle_key(shift(KeyCode::PageDown));
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
+        f.app.handle_key(shift(KeyCode::PageUp));
+        assert_eq!(chosen(&f.app), ["Documents", "Pictures", "a.txt"]);
+        assert_eq!(f.app.pane().cwd, f.home);
+    }
+
+    #[test]
+    fn in_the_grid_shift_left_and_right_extend_by_a_tile_and_up_and_down_by_a_row() {
+        let mut f = grid_fixture();
+        press(&mut f.app, &[KeyCode::Right]);
+        f.app.handle_key(shift(KeyCode::Right));
+        assert_eq!(chosen(&f.app), ["Pictures", "a.txt"]);
+        f.app.handle_key(shift(KeyCode::Down));
+        assert_eq!(
+            chosen(&f.app),
+            ["Pictures", "a.txt", "b.txt", "c.txt", "d.txt"]
+        );
+        f.app.handle_key(shift(KeyCode::Left));
+        assert_eq!(chosen(&f.app), ["Pictures", "a.txt", "b.txt", "c.txt"]);
+        f.app.handle_key(shift(KeyCode::Up));
+        assert_eq!(chosen(&f.app), ["Pictures"]);
+        f.app.handle_key(shift(KeyCode::Left));
+        assert_eq!(chosen(&f.app), ["Documents", "Pictures"]);
+        assert_eq!(selected_name(&f.app), Some("Documents"));
+        assert_eq!(f.app.pane().cwd, f.home, "no folder was entered or left");
+    }
+
+    #[test]
+    fn ctrl_a_selects_everything_in_the_pane_and_leaves_the_cursor() {
+        let mut f = several();
+        select(&mut f.app, "b.txt");
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(chosen(&f.app).len(), 8);
+        assert_eq!(chosen(&f.app), pane_names(&f.app, 0));
+        assert_eq!(selected_name(&f.app), Some("b.txt"));
+
+        // Only the files' own key: the sidebar has nothing to select.
+        press(&mut f.app, &[KeyCode::Down, KeyCode::BackTab]);
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(chosen(&f.app), ["c.txt"]);
+        // In an empty folder there is nothing to take.
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Home, KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        assert!(chosen(&f.app).is_empty());
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(f.app.message, None);
+    }
+
+    #[test]
+    fn a_plain_move_or_escape_leaves_only_the_item_under_the_cursor_selected() {
+        let mut f = several();
+        select(&mut f.app, "a.txt");
+        f.app.handle_key(shift(KeyCode::Down));
+        f.app.handle_key(shift(KeyCode::Down));
+        press(&mut f.app, &[KeyCode::Down]);
+        assert_eq!(chosen(&f.app), ["d.txt"]);
+        f.app.handle_key(shift(KeyCode::Up));
+        assert_eq!(chosen(&f.app), ["c.txt", "d.txt"]);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(chosen(&f.app), ["c.txt"]);
+        assert_eq!(selected_name(&f.app), Some("c.txt"));
+
+        // Escape dismisses what the band says before it touches the selection.
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(said(&f.app), ("8 items ready to paste.", false));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.app.message, None);
+        assert_eq!(chosen(&f.app).len(), 8);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(chosen(&f.app), ["c.txt"]);
+
+        // Another folder starts with one item selected, and so does the way back.
+        select(&mut f.app, "Documents");
+        f.app.handle_key(shift(KeyCode::Down));
+        assert_eq!(chosen(&f.app), ["Documents", "Pictures"]);
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert_eq!(chosen(&f.app), ["Trip"]);
+        press(&mut f.app, &[KeyCode::Backspace]);
+        assert_eq!(chosen(&f.app), ["Pictures"]);
+    }
+
+    #[test]
+    fn copy_cut_and_paste_take_the_whole_selection() {
+        let mut f = several();
+        let (documents, pictures) = (f.home.join("Documents"), f.home.join("Pictures"));
+        select(&mut f.app, "a.txt");
+        f.app.handle_key(shift(KeyCode::Down));
+        f.app.handle_key(shift(KeyCode::Down));
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(said(&f.app), ("3 items ready to paste.", false));
+        select(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        assert_eq!(f.app.working(), Some("Copying 3 items…"));
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&documents), ["a.txt", "b.txt", "c.txt"]);
+        assert_eq!(read(documents.join("c.txt")), "c");
+        assert_eq!(on_disk(&f.home).len(), 8, "the originals stay");
+        assert_eq!(said(&f.app), ("Copied 3 items.", false));
+
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        f.app.handle_key(ctrl(KeyCode::Char('x')));
+        assert_eq!(said(&f.app), ("3 items ready to move.", false));
+        press(&mut f.app, &[KeyCode::Backspace]);
+        select(&mut f.app, "Pictures");
+        press(&mut f.app, &[KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        finish_work(&mut f.app);
+        assert_eq!(
+            on_disk(&pictures),
+            ["Trip", "a.jpg", "a.txt", "b.txt", "c.txt"]
+        );
+        assert!(on_disk(&documents).is_empty());
+        assert_eq!(said(&f.app), ("Moved 3 items.", false));
+    }
+
+    #[test]
+    fn delete_and_shift_delete_take_the_whole_selection() {
+        let mut f = several();
+        select(&mut f.app, "b.txt");
+        f.app.handle_key(shift(KeyCode::Down));
+        f.app.handle_key(shift(KeyCode::Down));
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert_eq!(
+            on_disk(&f.home),
+            ["Documents", "Pictures", "a.txt", "e.txt", "notes.txt"]
+        );
+        assert_eq!(on_disk(&f.trash), ["b.txt", "c.txt", "d.txt"]);
+        assert_eq!(said(&f.app), ("Moved 3 items to the trash.", false));
+        assert_eq!(chosen(&f.app), ["e.txt"]);
+        // One undo brings the three of them back.
+        f.app.handle_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(on_disk(&f.home).len(), 8);
+        assert!(on_disk(&f.trash).is_empty());
+
+        // Deleting for good asks about all of them, once.
+        select(&mut f.app, "d.txt");
+        f.app.handle_key(shift(KeyCode::Down));
+        f.app.handle_key(shift(KeyCode::Delete));
+        let Some(Dialog::Delete { paths, armed }) = &f.app.dialog else {
+            panic!("it didn't ask");
+        };
+        assert_eq!(*paths, [f.home.join("d.txt"), f.home.join("e.txt")]);
+        assert!(!*armed);
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Enter]);
+        assert_eq!(
+            on_disk(&f.home),
+            [
+                "Documents",
+                "Pictures",
+                "a.txt",
+                "b.txt",
+                "c.txt",
+                "notes.txt"
+            ]
+        );
+        assert!(on_disk(&f.trash).is_empty(), "gone for good");
+        assert_eq!(said(&f.app), ("Deleted 2 items.", false));
+        assert_eq!(chosen(&f.app), ["notes.txt"]);
+    }
+
+    #[test]
+    fn duplicate_and_copy_path_take_the_selection_and_the_rest_the_item_under_the_cursor() {
+        let mut f = several();
+        let (a, b) = (f.home.join("a.txt"), f.home.join("b.txt"));
+        select(&mut f.app, "a.txt");
+        f.app.handle_key(shift(KeyCode::Down));
+
+        // One name can't go to two items.
+        press(&mut f.app, &[KeyCode::F(2)]);
+        assert!(f.app.dialog.is_none());
+        // A path on each line.
+        f.app.handle_key(ctrl_shift('c'));
+        let lines = format!("{}\n{}", a.display(), b.display());
+        assert_eq!(*f.system.copied.borrow(), [lines]);
+        // Space, Enter and the Open button are for the one under the cursor.
+        press(&mut f.app, &[KeyCode::Char(' '), KeyCode::Enter]);
+        press(
+            &mut f.app,
+            &[KeyCode::Tab, KeyCode::Enter, KeyCode::BackTab],
+        );
+        assert_eq!(*f.system.previewed.borrow(), std::slice::from_ref(&b));
+        assert_eq!(*f.system.opened.borrow(), [b.clone(), b.clone()]);
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
+
+        f.app.handle_key(ctrl_shift('d'));
+        assert_eq!(f.app.working(), Some("Duplicating 2 items…"));
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("a (copy).txt")), "a");
+        assert_eq!(read(f.home.join("b (copy).txt")), "b");
+        assert_eq!(on_disk(&f.home).len(), 10);
+        assert_eq!(said(&f.app), ("Duplicated 2 items.", false));
+
+        // With one item selected F2 asks for its new name, as before.
+        select(&mut f.app, "c.txt");
+        press(&mut f.app, &[KeyCode::F(2)]);
+        let Some(Dialog::Rename { path, .. }) = &f.app.dialog else {
+            panic!("it didn't ask");
+        };
+        assert_eq!(*path, f.home.join("c.txt"));
+    }
+
+    #[test]
+    fn each_pane_keeps_its_own_selection_while_the_keyboard_is_elsewhere() {
+        let mut f = several();
+        select(&mut f.app, "a.txt");
+        f.app.handle_key(shift(KeyCode::Down));
+        split(&mut f.app);
+        assert_eq!(chosen(&f.app), ["Documents"]);
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        press(&mut f.app, &[KeyCode::BackTab]);
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(chosen(&f.app).len(), 8);
+        // Round by the details and the sidebar.
+        press(&mut f.app, &[KeyCode::Tab; 3]);
+        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
+
+        // Pasted into the other pane's folder, it is still what is selected here.
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Home, KeyCode::Enter]);
+        press(&mut f.app, &[KeyCode::BackTab]);
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        press(&mut f.app, &[KeyCode::Tab]);
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&f.home.join("Documents")), ["a.txt", "b.txt"]);
+        press(&mut f.app, &[KeyCode::BackTab]);
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
+        assert_eq!(selected_name(&f.app), Some("b.txt"));
+    }
+
+    #[test]
+    fn with_one_pane_and_one_item_selected_the_keys_do_what_they_did() {
+        let mut f = several();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Down]);
+        assert_eq!(chosen(&f.app), ["a.txt"]);
+        press(&mut f.app, &[KeyCode::Up]);
+        assert_eq!(chosen(&f.app), ["Pictures"]);
+        press(&mut f.app, &[KeyCode::End]);
+        assert_eq!(chosen(&f.app), ["notes.txt"]);
+        press(&mut f.app, &[KeyCode::Home]);
+        assert_eq!(chosen(&f.app), ["Documents"]);
+
+        // Delete takes the one item, and Escape only dismisses what was said.
+        select(&mut f.app, "a.txt");
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert_eq!(on_disk(&f.trash), ["a.txt"]);
+        assert_eq!(on_disk(&f.home).len(), 7);
+        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.app.message, None);
+        assert_eq!(chosen(&f.app), ["b.txt"]);
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(said(&f.app), ("1 item ready to paste.", false));
+
+        // Tab goes round the three regions and the one pane stays the active one.
+        let mut stops = Vec::new();
+        for _ in 0..3 {
+            press(&mut f.app, &[KeyCode::Tab]);
+            stops.push(keyboard(&f.app));
+        }
+        assert_eq!(
+            stops,
+            [(Focus::Details, 0), (Focus::Sidebar, 0), (Focus::Files, 0)]
+        );
+        press(&mut f.app, &[KeyCode::F(2)]);
+        assert!(matches!(f.app.dialog, Some(Dialog::Rename { .. })));
     }
 }

@@ -10,7 +10,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::pad;
-use crate::app::{App, Field, ViewMode};
+use crate::app::{App, Field, Pane, ViewMode};
 use crate::input::Input;
 use crate::theme;
 
@@ -60,25 +60,7 @@ fn draw_crumbs(frame: &mut Frame, app: &App, area: Rect) {
         0
     };
     let room = area.width.saturating_sub(4 + kept) as usize;
-    let crumbs = if pane.recents() {
-        // Not a folder: it has no way down from home to show.
-        vec!["Recents".to_string()]
-    } else {
-        breadcrumbs(&pane.cwd, &app.home, room)
-    };
-    let mut spans = vec![Span::raw("  ")];
-    let last = crumbs.len().saturating_sub(1);
-    for (index, crumb) in crumbs.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" / ", theme::faint()));
-        }
-        let style = if index == last {
-            theme::title()
-        } else {
-            theme::dim()
-        };
-        spans.push(Span::styled(crumb.clone(), style));
-    }
+    let spans = path_spans(app, pane, room, true);
     let used = spans.iter().map(|span| span.content.width()).sum::<usize>() as u16;
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
@@ -92,6 +74,39 @@ fn draw_crumbs(frame: &mut Frame, app: &App, area: Rect) {
         let typing = matches!(app.field, Some(Field::Search));
         field(frame, area, "/", &search.input, typing);
     }
+}
+
+/// One pane's path on a row of its own above its files, for when two panes
+/// share the window: bright in the active pane, dim in the other.
+pub fn draw_pane_path(frame: &mut Frame, app: &App, pane: usize, area: Rect) {
+    let room = area.width.saturating_sub(4) as usize;
+    let spans = path_spans(app, &app.panes[pane], room, pane == app.active);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Where a pane is, as crumbs that fit in `room` after two cells of air.
+/// The last one is bright where `lit`; elsewhere all of them are dim.
+fn path_spans(app: &App, pane: &Pane, room: usize, lit: bool) -> Vec<Span<'static>> {
+    let crumbs = if pane.recents() {
+        // Not a folder: it has no way down from home to show.
+        vec!["Recents".to_string()]
+    } else {
+        breadcrumbs(&pane.cwd, &app.home, room)
+    };
+    let mut spans = vec![Span::raw("  ")];
+    let last = crumbs.len().saturating_sub(1);
+    for (index, crumb) in crumbs.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" / ", theme::faint()));
+        }
+        let style = if lit && index == last {
+            theme::title()
+        } else {
+            theme::dim()
+        };
+        spans.push(Span::styled(crumb, style));
+    }
+    spans
 }
 
 /// A field in the bar: what is being typed after its `lead`, with the

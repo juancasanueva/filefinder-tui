@@ -86,13 +86,28 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(u16::from(app.message.is_some())),
     ])
     .areas(area);
-    let focused = app.focus == Focus::Files;
-    // Lists show one blank row of air on top; the grid counts its own rows.
-    app.page_rows = view.height.saturating_sub(1).max(1) as usize;
-    match app.view {
-        ViewMode::Grid => grid::draw(frame, app, view, focused),
-        ViewMode::List => list::draw(frame, app, view, focused),
-        ViewMode::Columns => columns::draw(frame, app, view, focused),
+    if app.panes.len() > 1 {
+        // Two panes side by side with a hairline between them, each under
+        // its own path: the top bar only has room for the active one's.
+        let left = view.width.saturating_sub(1).div_ceil(2);
+        let [left, rule, right] = Layout::horizontal([
+            Constraint::Length(left),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(view);
+        let hairline = Block::new()
+            .borders(Borders::LEFT)
+            .border_style(theme::rule());
+        frame.render_widget(hairline, rule);
+        for (pane, area) in [left, right].into_iter().enumerate() {
+            let [path, files] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+            topbar::draw_pane_path(frame, app, pane, path);
+            draw_pane(frame, app, pane, files);
+        }
+    } else {
+        draw_pane(frame, app, app.active, view);
     }
 
     if let Some(label) = app.working() {
@@ -110,6 +125,18 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         let text = fit(&format!("  {}", note.text), message.width as usize);
         frame.render_widget(Paragraph::new(Line::from(text)).style(style), message);
+    }
+}
+
+/// One pane's items in the view that is on.
+fn draw_pane(frame: &mut Frame, app: &mut App, pane: usize, area: Rect) {
+    let focused = app.focus == Focus::Files && app.active == pane;
+    // Lists show one blank row of air on top; the grid counts its own rows.
+    app.panes[pane].page_rows = area.height.saturating_sub(1).max(1) as usize;
+    match app.view {
+        ViewMode::Grid => grid::draw(frame, app, pane, area, focused),
+        ViewMode::List => list::draw(frame, app, pane, area, focused),
+        ViewMode::Columns => columns::draw(frame, app, pane, area, focused),
     }
 }
 
@@ -287,7 +314,7 @@ mod tests {
     use super::testing::screen;
     use super::testing::{buffer, find};
     use super::*;
-    use crate::app::testing::{ctrl, finish_work, fixture, press};
+    use crate::app::testing::{ctrl, finish_work, fixture, press, shift, split};
     use ratatui::crossterm::event::KeyCode;
 
     #[test]
@@ -554,5 +581,147 @@ mod tests {
         let columns = buffer(&mut f.app, 130, 24);
         assert_eq!(find(&columns, "notes.txt", 24..96), Some((28, 5)));
         assert_eq!(find(&columns, "a.jpg", 24..96), Some((55, 4)));
+    }
+
+    #[test]
+    fn two_panes_share_the_file_area_each_under_its_own_path() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down]);
+        f.app.tick();
+        let single = screen(&mut f.app, 120, 24);
+        split(&mut f.app);
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Down]);
+        f.app.tick();
+        let right = buffer(&mut f.app, 120, 24);
+        let colors = |drawn: &ratatui::buffer::Buffer, x, y| (drawn[(x, y)].fg, drawn[(x, y)].bg);
+        let lit = (theme::ACCENT, theme::SELECTION);
+        let unlit = (theme::BRIGHT_FOREGROUND, theme::LIGHTER_BACKGROUND);
+
+        // The 62 cells between the sidebar and the details: 31, a hairline, 30.
+        for y in 2..24 {
+            assert_eq!(right[(55, y)].symbol(), "│", "row {y}");
+            assert_eq!(right[(55, y)].fg, theme::RULE);
+        }
+        // Each pane's path on its first row: bright where the keyboard is.
+        assert_eq!(find(&right, "~", 24..55), Some((26, 2)));
+        assert_eq!(right[(26, 2)].fg, theme::DIM);
+        assert_eq!(find(&right, "~ / Pictures", 56..86), Some((58, 2)));
+        assert_eq!(right[(58, 2)].fg, theme::DIM);
+        assert_eq!(right[(62, 2)].fg, theme::BRIGHT_FOREGROUND);
+        // Under it the files, each pane's own, with its own cursor.
+        assert_eq!(find(&right, "Documents", 24..55), Some((28, 4)));
+        assert_eq!(find(&right, "Pictures", 24..55), Some((28, 5)));
+        assert_eq!(find(&right, "notes.txt", 24..55), Some((28, 6)));
+        assert_eq!(find(&right, "Trip", 56..86), Some((60, 4)));
+        assert_eq!(find(&right, "a.jpg", 56..86), Some((60, 5)));
+        assert_eq!(colors(&right, 28, 5), unlit);
+        assert_eq!(colors(&right, 60, 5), lit);
+        assert_eq!(right[(28, 4)].bg, theme::BACKGROUND);
+        // The top bar, the sidebar and the details are the right pane's.
+        assert_eq!(find(&right, "~ / Pictures", 0..60), Some((2, 0)));
+        let sidebar = |drawn: &ratatui::buffer::Buffer, y: u16| -> String {
+            (0..23).map(|x| drawn[(x, y)].symbol()).collect()
+        };
+        let place = (2..24).find(|y| sidebar(&right, *y).contains("Pictures"));
+        let place = place.expect("the place");
+        assert_eq!(right[(2, place)].bg, theme::SELECTION);
+        assert_eq!(find(&right, "a.jpg", 86..120), Some((89, 10)));
+
+        // With the keyboard in the left pane they are the left pane's.
+        press(&mut f.app, &[KeyCode::BackTab]);
+        f.app.tick();
+        let left = buffer(&mut f.app, 120, 24);
+        assert_eq!(left[(26, 2)].fg, theme::BRIGHT_FOREGROUND);
+        assert_eq!(left[(62, 2)].fg, theme::DIM);
+        assert_eq!(colors(&left, 28, 5), lit);
+        assert_eq!(colors(&left, 60, 5), unlit);
+        assert!(sidebar(&left, place).contains("Pictures"));
+        assert_eq!(left[(2, place)].bg, theme::BACKGROUND);
+        let bar: String = (0..60).map(|x| left[(x, 0)].symbol()).collect();
+        assert_eq!(bar.trim(), "~");
+        assert_eq!(find(&left, "Pictures", 86..120), Some((89, 10)));
+        assert_eq!(find(&left, "Folder · 2 items", 86..120), Some((89, 11)));
+
+        // With the keyboard in the details neither pane's cursor is lit.
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Tab]);
+        let away = buffer(&mut f.app, 120, 24);
+        assert_eq!(colors(&away, 28, 5), unlit);
+        assert_eq!(colors(&away, 60, 5), unlit);
+
+        // Closed, the window is what it was before.
+        f.app.handle_key(ctrl(KeyCode::Char('w')));
+        f.app.tick();
+        assert_eq!(screen(&mut f.app, 120, 24), single);
+    }
+
+    #[test]
+    fn every_selected_item_is_drawn_selected_in_each_view() {
+        let mut f = fixture();
+        f.app.handle_key(shift(KeyCode::Down));
+        let colors = |drawn: &ratatui::buffer::Buffer, x, y| (drawn[(x, y)].fg, drawn[(x, y)].bg);
+        let lit = (theme::ACCENT, theme::SELECTION);
+        let unlit = (theme::BRIGHT_FOREGROUND, theme::LIGHTER_BACKGROUND);
+        let plain = (theme::FOREGROUND, theme::BACKGROUND);
+
+        // Documents and Pictures, not notes.txt: rows in the list and the columns.
+        for view in ['2', '3'] {
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            let drawn = buffer(&mut f.app, 120, 24);
+            assert_eq!(colors(&drawn, 28, 3), lit, "view {view}");
+            assert_eq!(colors(&drawn, 28, 4), lit, "view {view}");
+            assert_eq!(colors(&drawn, 28, 5), plain, "view {view}");
+        }
+        // Tiles in the grid: a frame around each, and the name in its color.
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        let grid = buffer(&mut f.app, 120, 24);
+        for (corner, name) in [(26, 31), (46, 51)] {
+            assert_eq!(grid[(corner, 2)].symbol(), "┌");
+            assert_eq!(grid[(corner, 2)].fg, theme::ACCENT);
+            assert_eq!(grid[(name, 10)].fg, theme::ACCENT);
+        }
+        assert_eq!(grid[(66, 2)].symbol(), " ");
+        assert_eq!(grid[(71, 10)].fg, theme::FOREGROUND);
+
+        // With the keyboard elsewhere all of them go grey.
+        press(&mut f.app, &[KeyCode::Tab]);
+        let grid = buffer(&mut f.app, 120, 24);
+        for (corner, name) in [(26, 31), (46, 51)] {
+            assert_eq!(grid[(corner, 2)].symbol(), "┌");
+            assert_eq!(grid[(corner, 2)].fg, theme::BRIGHT_FOREGROUND);
+            assert_eq!(grid[(name, 10)].fg, theme::BRIGHT_FOREGROUND);
+        }
+        for view in ['2', '3'] {
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            let drawn = buffer(&mut f.app, 120, 24);
+            assert_eq!(colors(&drawn, 28, 3), unlit, "view {view}");
+            assert_eq!(colors(&drawn, 28, 4), unlit, "view {view}");
+            assert_eq!(colors(&drawn, 28, 5), plain, "view {view}");
+        }
+    }
+
+    #[test]
+    fn the_help_overlay_lists_the_split_and_selection_shortcuts() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        let all = screen(&mut f.app, 120, 40).join("\n");
+        for (keys, does) in [
+            (
+                "Ctrl+Alt+N / Ctrl+W",
+                "Split into two panes / close the right one",
+            ),
+            (
+                "Tab / Shift+Tab",
+                "Move between the sidebar, the panes and the details",
+            ),
+            ("Shift+arrows", "Select a range"),
+            ("Ctrl+A", "Select everything"),
+        ] {
+            let line = format!("{keys:<26}{does}");
+            assert!(all.contains(&line), "{line} is missing from\n{all}");
+        }
+        assert!(
+            all.contains("Close the window"),
+            "the last one fits:\n{all}"
+        );
     }
 }

@@ -7,7 +7,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use super::{fit, grid, pad, picture};
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, Pane};
 use crate::format;
 use crate::model::Entry;
 use crate::theme;
@@ -23,16 +23,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         y: area.y + 1,
         height: area.height.saturating_sub(2),
     };
-    let Some(entry) = app.panes[app.active].selected() else {
+    let pane = &app.panes[app.active];
+    let Some(entry) = pane.selected() else {
         frame.render_widget(
             Paragraph::new("Nothing selected").style(theme::dim()),
             inner,
         );
         return;
     };
+    // Several items have no one preview and no one set of details.
+    let several = pane.selection().nth(1).is_some();
     // What was read about the item, unless it was about another one.
     let facts = app.facts.as_ref().filter(|facts| facts.describes(entry));
-    let preview_rows = if inner.height >= ROWS_FOR_A_PREVIEW {
+    let preview_rows = if inner.height >= ROWS_FOR_A_PREVIEW && !several {
         inner.height / 3
     } else {
         0
@@ -47,6 +50,32 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     .areas(inner);
     let width = info.width as usize;
 
+    let lines = if several {
+        selection_lines(pane, width)
+    } else {
+        item_lines(app, entry, facts, width)
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), info);
+
+    let label = if app.focus == Focus::Details {
+        "› Open"
+    } else {
+        "Open"
+    };
+    let text = format!(
+        " {}⏎ ",
+        pad(label, (button.width as usize).saturating_sub(3))
+    );
+    frame.render_widget(Paragraph::new(text).style(theme::button()), button);
+
+    if preview_rows > 0 {
+        draw_preview(frame, app.thumbs.as_mut(), entry, facts, preview);
+    }
+}
+
+/// What the pane says about one item: its name, what it is, and when it
+/// was last changed.
+fn item_lines(app: &App, entry: &Entry, facts: Option<&Facts>, width: usize) -> Vec<Line<'static>> {
     let summary = match entry.item_count() {
         Some(count) => format!("Folder · {}", format::items(count)),
         None if entry.is_dir => "Folder".to_string(),
@@ -73,22 +102,30 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         let room = width.saturating_sub("Where ".width());
         lines.push(field("Where", &fit(&app.shown_path(folder), room), width));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), info);
+    lines
+}
 
-    let label = if app.focus == Focus::Details {
-        "› Open"
-    } else {
-        "Open"
-    };
-    let text = format!(
-        " {}⏎ ",
-        pad(label, (button.width as usize).saturating_sub(3))
-    );
-    frame.render_widget(Paragraph::new(text).style(theme::button()), button);
-
-    if preview_rows > 0 {
-        draw_preview(frame, app.thumbs.as_mut(), entry, facts, preview);
+/// What the pane says about several selected items: how many they are, and
+/// how big the files among them are together.
+fn selection_lines(pane: &Pane, width: usize) -> Vec<Line<'static>> {
+    let (mut items, mut files, mut bytes) = (0, 0, 0);
+    for entry in pane.selection() {
+        items += 1;
+        if !entry.is_dir {
+            files += 1;
+            bytes += entry.size;
+        }
     }
+    let mut lines = vec![Line::from(Span::styled(
+        format::items(items),
+        theme::title(),
+    ))];
+    // Folders alone have no size to add up.
+    if files > 0 {
+        let size = fit(&format::size(bytes), width);
+        lines.push(Line::from(Span::styled(size, theme::dim())));
+    }
+    lines
 }
 
 /// The top of the pane: a text file's opening lines, a file's picture, or the
@@ -127,7 +164,7 @@ fn field(label: &str, value: &str, width: usize) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::testing::{fixture, pictures, press, settle};
+    use crate::app::testing::{ctrl, fixture, pictures, press, settle, shift};
     use crate::icons::Icon;
     use crate::theme;
     use crate::thumbs::testing::painted;
@@ -290,5 +327,51 @@ mod tests {
         let cut = find(&found, "~/Documents/Projects 2…", 86..120);
         assert_eq!(cut, Some((95, 14)));
         assert_eq!(find(&found, "Where", 86..120), Some((89, 14)));
+    }
+
+    #[test]
+    fn several_selected_items_show_how_many_and_how_big_in_place_of_one_items_details() {
+        let (mut f, thumbnailer) = pictures();
+        fs::write(f.home.join("Pictures").join("b.jpg"), "four").unwrap();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        f.app.tick();
+        buffer(&mut f.app, 120, 24);
+        settle(&mut f.app);
+        let shown = buffer(&mut f.app, 120, 24);
+
+        // Trip, a.jpg and b.jpg: three items, the two files seven bytes together.
+        assert_eq!(find(&shown, "3 items", 86..120), Some((89, 3)));
+        assert_eq!(shown[(89, 3)].fg, theme::BRIGHT_FOREGROUND);
+        assert_eq!(find(&shown, "7 B", 86..120), Some((89, 4)));
+        assert_eq!(shown[(89, 4)].fg, theme::DIM);
+        for gone in ["Trip", "Folder", "Modified", "JPEG image"] {
+            assert_eq!(find(&shown, gone, 86..120), None, "{gone}");
+        }
+        // No preview, of the folder under the cursor or of anything else.
+        for y in 5..22 {
+            for x in 87..120 {
+                assert_eq!(shown[(x, y)].bg, theme::BACKGROUND, "{x}, {y}");
+            }
+        }
+        assert!(thumbnailer.asked().is_empty());
+        // Open is still there, for the item under the cursor.
+        assert_eq!(find(&shown, "Open", 86..120), Some((90, 22)));
+
+        // Folders alone have no size to add up.
+        press(&mut f.app, &[KeyCode::Backspace, KeyCode::Home]);
+        f.app.handle_key(shift(KeyCode::Down));
+        f.app.tick();
+        let folders = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&folders, "2 items", 86..120), Some((89, 3)));
+        let under: String = (87..120).map(|x| folders[(x, 4)].symbol()).collect();
+        assert_eq!(under.trim(), "");
+
+        // Back to one item, its details are back, preview and all.
+        press(&mut f.app, &[KeyCode::End]);
+        f.app.tick();
+        let one = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&one, "notes.txt", 86..120), Some((89, 10)));
+        assert_eq!(find(&one, "Modified", 86..120), Some((89, 13)));
     }
 }

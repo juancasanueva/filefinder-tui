@@ -18,9 +18,10 @@ use crate::theme;
 const SIZE_WIDTH: usize = 11;
 const DATE_WIDTH: usize = 10;
 
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+/// Draws one pane's items as rows; `focused` is whether it has the keyboard.
+pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: bool) {
     let date_style = app.date_style;
-    let pane = &mut app.panes[app.active];
+    let pane = &mut app.panes[pane];
     if pane.entries.is_empty() {
         empty(frame, area, pane);
         return;
@@ -41,7 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
 
     let mut lines = vec![Line::default()];
     for (index, entry) in pane.entries.iter().enumerate().skip(pane.offset).take(rows) {
-        let selected = index == pane.cursor;
+        let selected = pane.is_selected(index);
         let row = row_style(selected, focused);
         let icon = icon_style(row, entry.is_dir, selected && focused);
         let meta = if selected { row } else { row.fg(theme::DIM) };

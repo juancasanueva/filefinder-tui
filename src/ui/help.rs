@@ -14,7 +14,13 @@ use crate::theme;
 
 const SHORTCUTS: &[(&str, &str)] = &[
     ("← ↑ → ↓", "Move the selection"),
+    ("Shift+arrows", "Select a range"),
+    ("Ctrl+A", "Select everything"),
     ("→ / ←", "In list and columns: into a folder / back out"),
+    (
+        "Ctrl+Alt+N / Ctrl+W",
+        "Split into two panes / close the right one",
+    ),
     (
         "Tab / Shift+Tab",
         "Move between the sidebar, the panes and the details",

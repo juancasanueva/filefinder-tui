@@ -16,10 +16,12 @@ const COLUMN_WIDTH: u16 = 26;
 /// A column and the hairline on its right.
 const PITCH: u16 = COLUMN_WIDTH + 1;
 
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+/// Draws one pane's folder and the ones above it; `focused` is whether it
+/// has the keyboard.
+pub fn draw(frame: &mut Frame, app: &mut App, pane: usize, area: Rect, focused: bool) {
     // One blank row of air on top, like the list.
     let rows = area.height.saturating_sub(1) as usize;
-    let pane = &mut app.panes[app.active];
+    let pane = &mut app.panes[pane];
     pane.offset = scroll(pane.offset, pane.cursor, rows);
 
     // The folders above, then the pane's own; the rightmost ones when they don't all fit.
@@ -47,7 +49,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
                 // The way down is highlighted in grey: the keyboard is further right.
                 let offset = scroll(0, above.on_path.unwrap_or(0), rows);
                 let lit = theme::selected_inactive();
-                draw_column(frame, inner, &above.entries, offset, above.on_path, lit);
+                let on_path = |index| above.on_path == Some(index);
+                draw_column(frame, inner, &above.entries, offset, on_path, lit);
             }
             None if pane.entries.is_empty() => {
                 // The pane's own column is the last one: there is room to
@@ -62,27 +65,27 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
             }
             None => {
                 let lit = row_style(true, focused);
-                let cursor = Some(pane.cursor);
-                draw_column(frame, inner, &pane.entries, pane.offset, cursor, lit);
+                let selected = |index| pane.is_selected(index);
+                draw_column(frame, inner, &pane.entries, pane.offset, selected, lit);
             }
         }
     }
 }
 
-/// One folder's rows from `offset` down, the marked one in the `lit` style.
+/// One folder's rows from `offset` down, the marked ones in the `lit` style.
 fn draw_column(
     frame: &mut Frame,
     area: Rect,
     entries: &[Entry],
     offset: usize,
-    marked: Option<usize>,
+    marked: impl Fn(usize) -> bool,
     lit: Style,
 ) {
     let rows = area.height.saturating_sub(1) as usize;
     let name_width = (area.width as usize).saturating_sub(7);
     let mut lines = vec![Line::default()];
     for (index, entry) in entries.iter().enumerate().skip(offset).take(rows) {
-        let is_marked = marked == Some(index);
+        let is_marked = marked(index);
         let row = if is_marked { lit } else { theme::base() };
         let icon = icon_style(row, entry.is_dir, is_marked && lit == theme::selected());
         // Folders end with a chevron: there is a column to their right.
