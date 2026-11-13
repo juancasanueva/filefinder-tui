@@ -104,6 +104,12 @@ pub fn field() -> Style {
     Style::new().fg(BRIGHT_FOREGROUND).bg(LIGHTER_BACKGROUND)
 }
 
+/// A field in the top bar: the accent while it has the keyboard.
+pub fn bar_field(typing: bool) -> Style {
+    let fg = if typing { ACCENT } else { FOREGROUND };
+    Style::new().fg(fg).bg(LIGHTER_BACKGROUND)
+}
+
 /// A choice in a dialog: the lit one is what Enter takes.
 pub fn choice(lit: bool) -> Style {
     if lit { button() } else { notice() }

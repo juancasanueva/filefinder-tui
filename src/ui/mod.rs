@@ -18,7 +18,7 @@ use ratatui_image::Image;
 use ratatui_image::protocol::Protocol;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Focus, ViewMode};
+use crate::app::{App, Focus, Pane, ViewMode};
 use crate::model::Entry;
 use crate::theme;
 use crate::thumbs::Thumbs;
@@ -148,6 +148,16 @@ pub fn picture(
         return false;
     }
     true
+}
+
+/// What a view says in place of the items of a pane that has none.
+pub fn empty_text(pane: &Pane) -> String {
+    match pane.results() {
+        // Still looking: it may find some yet.
+        Some(search) if search.is_running() => String::new(),
+        Some(search) => format!("Nothing matches “{}”", search.input.text()),
+        None => "No items".to_string(),
+    }
 }
 
 /// Where a view has to start for the cursor's row to be among the `rows` it shows.
@@ -463,5 +473,86 @@ mod tests {
         assert_eq!(after[(details, 0)].bg, theme::BACKGROUND);
         assert_eq!(find(&after, "Modified", 0..120), None);
         assert_eq!(find(&after, ".hidden", 24..120), Some((28, 5)));
+    }
+
+    #[test]
+    fn the_help_overlay_lists_the_path_and_search_shortcuts() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        let all = screen(&mut f.app, 120, 40).join("\n");
+        for (keys, does) in [
+            ("Ctrl+L", "Type a path (Tab completes)"),
+            ("/", "Search this folder and below"),
+        ] {
+            let line = format!("{keys:<26}{does}");
+            assert!(all.contains(&line), "{line} is missing from\n{all}");
+        }
+        assert!(
+            all.contains("Close the window"),
+            "the last one fits:\n{all}"
+        );
+    }
+
+    #[test]
+    fn a_search_that_found_nothing_says_so_in_every_view() {
+        use crate::app::testing::{finish_search, type_text};
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "zebra");
+        finish_search(&mut f.app);
+        press(&mut f.app, &[KeyCode::Tab]);
+        for view in ['2', '1', '3'] {
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            let drawn = buffer(&mut f.app, 120, 24);
+            let said = find(&drawn, "Nothing matches “zebra”", 24..86);
+            assert!(said.is_some(), "view {view}");
+            assert_eq!(find(&drawn, "No items", 0..120), None, "view {view}");
+        }
+        // An empty folder still says what it said.
+        press(&mut f.app, &[KeyCode::Esc, KeyCode::Enter]);
+        let drawn = buffer(&mut f.app, 120, 24);
+        assert!(find(&drawn, "No items", 24..86).is_some());
+    }
+
+    #[test]
+    fn what_a_search_found_shows_in_each_view_and_in_a_single_column() {
+        use crate::app::testing::{finish_search, type_text};
+        let mut f = fixture();
+        let trip = f.home.join("Pictures").join("Trip");
+        std::fs::write(trip.join("day.jpg"), "").unwrap();
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        press(
+            &mut f.app,
+            &[KeyCode::Down, KeyCode::Right, KeyCode::Char('/')],
+        );
+        type_text(&mut f.app, "jpg");
+        finish_search(&mut f.app);
+        press(&mut f.app, &[KeyCode::Tab]);
+
+        // The home column steps out: what was found is the only one.
+        let columns = buffer(&mut f.app, 130, 24);
+        assert_eq!(find(&columns, "a.jpg", 24..96), Some((28, 3)));
+        assert_eq!(find(&columns, "day.jpg", 24..96), Some((28, 4)));
+        assert_eq!(find(&columns, "notes.txt", 24..96), None);
+        assert_eq!(columns[(24, 3)].bg, theme::SELECTION, "the cursor");
+
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        let list = buffer(&mut f.app, 130, 24);
+        assert_eq!(find(&list, "a.jpg", 24..96), Some((28, 3)));
+        assert_eq!(find(&list, "day.jpg", 24..96), Some((28, 4)));
+        assert!(find(&list, "3 B", 24..96).is_some(), "with its size");
+
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        let grid = buffer(&mut f.app, 130, 24);
+        let (a, day) = (find(&grid, "a.jpg", 24..96), find(&grid, "day.jpg", 24..96));
+        let ((ax, ay), (dx, dy)) = (a.expect("the first"), day.expect("the second"));
+        assert!(ay == dy && ax < dx, "side by side, in the order found");
+
+        // Left, the folder is back with the ones above it.
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        press(&mut f.app, &[KeyCode::Esc]);
+        let columns = buffer(&mut f.app, 130, 24);
+        assert_eq!(find(&columns, "notes.txt", 24..96), Some((28, 5)));
+        assert_eq!(find(&columns, "a.jpg", 24..96), Some((55, 4)));
     }
 }

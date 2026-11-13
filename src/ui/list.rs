@@ -8,8 +8,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::{icon_style, pad, pad_left, row_style, scroll};
-use crate::app::App;
+use super::{empty_text, fit, icon_style, pad, pad_left, row_style, scroll};
+use crate::app::{App, Pane};
 use crate::format;
 use crate::icons::Icon;
 use crate::model::Entry;
@@ -22,7 +22,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let date_style = app.date_style;
     let pane = &mut app.panes[app.active];
     if pane.entries.is_empty() {
-        empty(frame, area);
+        empty(frame, area, pane);
         return;
     }
 
@@ -81,14 +81,15 @@ pub fn size_text(entry: &Entry) -> String {
     }
 }
 
-pub fn empty(frame: &mut Frame, area: Rect) {
+/// What a pane with no items says, a third of the way down the view.
+pub fn empty(frame: &mut Frame, area: Rect, pane: &Pane) {
     let middle = Rect {
         y: area.y + area.height / 3,
         height: 1.min(area.height),
         ..area
     };
     frame.render_widget(
-        Paragraph::new("No items")
+        Paragraph::new(fit(&empty_text(pane), area.width as usize))
             .style(Style::new().fg(theme::DIM))
             .alignment(Alignment::Center),
         middle,

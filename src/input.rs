@@ -2,6 +2,7 @@
 //! never bytes, so accents and other scripts edit like plain letters.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Input {
@@ -71,6 +72,29 @@ impl Input {
 
     pub fn end(&mut self) {
         self.cursor = self.chars.len();
+    }
+
+    /// The part of the text that fits in `width` cells with the cursor in
+    /// sight, and the cell the cursor is on.
+    pub fn window(&self, width: usize) -> (String, u16) {
+        let cells = |c: &char| c.width().unwrap_or(0);
+        let mut before: usize = self.chars[..self.cursor].iter().map(cells).sum();
+        // Start late enough for the cursor's own cell to be inside.
+        let mut start = 0;
+        while before >= width && start < self.cursor {
+            before -= cells(&self.chars[start]);
+            start += 1;
+        }
+        let mut text = String::new();
+        let mut used = 0;
+        for c in &self.chars[start..] {
+            used += cells(c);
+            if used > width {
+                break;
+            }
+            text.push(*c);
+        }
+        (text, before as u16)
     }
 
     /// Applies a key that edits the text. False for any other key, which is
@@ -183,5 +207,22 @@ mod tests {
             assert!(!input.handle_key(other), "{other:?}");
         }
         assert_eq!(input.text(), "qQ!");
+    }
+
+    #[test]
+    fn a_text_longer_than_its_room_shows_the_part_around_the_cursor() {
+        let mut input = Input::new("abcdefghij");
+        assert_eq!(input.window(20), ("abcdefghij".to_string(), 10));
+        // The cursor after the last letter needs a cell of its own.
+        assert_eq!(input.window(6), ("fghij".to_string(), 5));
+        input.set_cursor(7);
+        assert_eq!(input.window(6), ("cdefgh".to_string(), 5));
+        input.set_cursor(3);
+        assert_eq!(input.window(6), ("abcdef".to_string(), 3));
+        // Wide letters take two cells each.
+        let mut wide = Input::new("日本語のファイル");
+        assert_eq!(wide.window(7), ("ァイル".to_string(), 6));
+        wide.home();
+        assert_eq!(wide.window(7), ("日本語".to_string(), 0));
     }
 }

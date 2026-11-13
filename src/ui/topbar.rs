@@ -1,15 +1,21 @@
-//! The top bar: where you are, and the view toggles.
+//! The top bar: where you are, the path or the search being typed, and the
+//! view toggles.
 
 use std::path::Path;
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, ViewMode};
+use super::pad;
+use crate::app::{App, Field, ViewMode};
+use crate::input::Input;
 use crate::theme;
+
+/// The widest the search field gets, and the room the breadcrumbs leave it.
+const SEARCH_WIDTH: u16 = 30;
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let [row, rule] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
@@ -22,12 +28,43 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let [path, right] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(toggles_width + 1)]).areas(row);
 
+    if let Some(Field::Path(input)) = &app.field {
+        // In place of the breadcrumbs, as far as the toggles.
+        let area = Rect {
+            x: path.x + 2,
+            width: path.width.saturating_sub(3),
+            ..path
+        };
+        field(frame, area, "", input, true);
+    } else {
+        draw_crumbs(frame, app, path);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(toggles)).alignment(Alignment::Left),
+        right,
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(rule.width as usize)).style(theme::rule()),
+        rule,
+    );
+}
+
+/// Where the pane is, and after it the search field when one is open.
+fn draw_crumbs(frame: &mut Frame, app: &App, area: Rect) {
     let pane = app.pane();
-    let crumbs = if pane.recents {
+    let search = pane.search();
+    // A search keeps room for its field: its folder's crumbs give way first.
+    let kept = if search.is_some() {
+        SEARCH_WIDTH + 2
+    } else {
+        0
+    };
+    let room = area.width.saturating_sub(4 + kept) as usize;
+    let crumbs = if pane.recents() {
         // Not a folder: it has no way down from home to show.
         vec!["Recents".to_string()]
     } else {
-        breadcrumbs(&pane.cwd, &app.home, path.width.saturating_sub(4) as usize)
+        breadcrumbs(&pane.cwd, &app.home, room)
     };
     let mut spans = vec![Span::raw("  ")];
     let last = crumbs.len().saturating_sub(1);
@@ -42,15 +79,34 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         };
         spans.push(Span::styled(crumb.clone(), style));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), path);
-    frame.render_widget(
-        Paragraph::new(Line::from(toggles)).alignment(Alignment::Left),
-        right,
-    );
-    frame.render_widget(
-        Paragraph::new("─".repeat(rule.width as usize)).style(theme::rule()),
-        rule,
-    );
+    let used = spans.iter().map(|span| span.content.width()).sum::<usize>() as u16;
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    if let Some(search) = search {
+        let x = area.x + used + 2;
+        let area = Rect {
+            x,
+            width: SEARCH_WIDTH.min(area.right().saturating_sub(x + 1)),
+            ..area
+        };
+        let typing = matches!(app.field, Some(Field::Search));
+        field(frame, area, "/", &search.input, typing);
+    }
+}
+
+/// A field in the bar: what is being typed after its `lead`, with the
+/// terminal's cursor in it while it has the keyboard.
+fn field(frame: &mut Frame, area: Rect, lead: &str, input: &Input, typing: bool) {
+    let before = lead.width() as u16;
+    if area.width <= before {
+        return;
+    }
+    let (text, column) = input.window((area.width - before) as usize);
+    let shown = pad(&format!("{lead}{text}"), area.width as usize);
+    frame.render_widget(Paragraph::new(shown).style(theme::bar_field(typing)), area);
+    if typing {
+        frame.set_cursor_position(Position::new(area.x + before + column, area.y));
+    }
 }
 
 /// View, sort, hidden files and details; the ones switched on are lit.
@@ -142,5 +198,97 @@ mod tests {
         let lines = screen(&mut f.app, 120, 24);
         assert!(lines[0].starts_with("  Recents  "), "{}", lines[0]);
         assert!(!lines[0].contains('~'), "{}", lines[0]);
+    }
+
+    #[test]
+    fn ctrl_l_turns_the_breadcrumbs_into_a_field_holding_the_path() {
+        use crate::app::testing::{ctrl, fixture, press, type_text};
+        use crate::theme;
+        use crate::ui::testing::{buffer, cursor, find};
+        use ratatui::crossterm::event::KeyCode;
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('l')));
+        let drawn = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&drawn, "~/Pictures ", 0..120), Some((2, 0)));
+        assert_eq!(find(&drawn, "~ / Pictures", 0..120), None);
+        // Accent on a lighter ground, as far as the toggles: it reads as a field.
+        for x in [2, 11, 12, 60, 105] {
+            assert_eq!(drawn[(x, 0)].fg, theme::ACCENT, "{x}");
+            assert_eq!(drawn[(x, 0)].bg, theme::LIGHTER_BACKGROUND, "{x}");
+        }
+        assert_eq!(drawn[(1, 0)].bg, theme::BACKGROUND);
+        let (toggles, _) = find(&drawn, "≡", 0..120).expect("the toggles stay");
+        assert_eq!(drawn[(toggles - 1, 0)].bg, theme::BACKGROUND);
+        assert_eq!(cursor(&mut f.app, 120, 24), (12, 0), "after the path");
+
+        // What is typed shows where the cursor is, and the cursor moves along.
+        type_text(&mut f.app, "/Tr");
+        let drawn = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&drawn, "~/Pictures/Tr ", 0..120), Some((2, 0)));
+        assert_eq!(cursor(&mut f.app, 120, 24), (15, 0));
+
+        // Closed, the breadcrumbs are back.
+        press(&mut f.app, &[KeyCode::Esc]);
+        let drawn = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&drawn, "~ / Pictures", 0..120), Some((2, 0)));
+        assert_eq!(drawn[(2, 0)].bg, theme::BACKGROUND);
+    }
+
+    #[test]
+    fn a_path_longer_than_the_bar_scrolls_to_keep_the_cursor_in_sight() {
+        use crate::app::testing::{ctrl, fixture, type_text};
+        use crate::ui::testing::{cursor, screen};
+        use ratatui::crossterm::event::KeyCode;
+        let mut f = fixture();
+        f.app.handle_key(ctrl(KeyCode::Char('l')));
+        type_text(&mut f.app, &"/abcdefghi".repeat(6));
+        // 27 cells of bar, 13 of them the toggles: a field of 11, the last
+        // of them for the cursor.
+        let lines = screen(&mut f.app, 27, 10);
+        assert!(lines[0].starts_with("  /abcdefghi  "), "{}", lines[0]);
+        assert_eq!(cursor(&mut f.app, 27, 10), (12, 0));
+    }
+
+    #[test]
+    fn slash_puts_a_field_after_the_breadcrumbs_of_the_folder_being_searched() {
+        use crate::app::testing::{finish_search, fixture, press, type_text};
+        use crate::theme;
+        use crate::ui::testing::{buffer, cursor, find};
+        use ratatui::crossterm::event::KeyCode;
+        let mut f = fixture();
+        press(
+            &mut f.app,
+            &[KeyCode::Down, KeyCode::Enter, KeyCode::Char('/')],
+        );
+        // Open and empty: the folder's breadcrumbs, then the field.
+        let drawn = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&drawn, "~ / Pictures  / ", 0..120), Some((2, 0)));
+        assert_eq!(cursor(&mut f.app, 120, 24), (17, 0));
+
+        type_text(&mut f.app, "jp");
+        finish_search(&mut f.app);
+        let drawn = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&drawn, "~ / Pictures  /jp ", 0..120), Some((2, 0)));
+        assert_eq!(drawn[(13, 0)].fg, theme::BRIGHT_FOREGROUND, "Pictures");
+        assert_eq!(drawn[(15, 0)].bg, theme::BACKGROUND, "the gap");
+        for x in [16, 17, 30] {
+            assert_eq!(drawn[(x, 0)].fg, theme::ACCENT, "{x}");
+            assert_eq!(drawn[(x, 0)].bg, theme::LIGHTER_BACKGROUND, "{x}");
+        }
+        assert_eq!(cursor(&mut f.app, 120, 24), (19, 0), "after what was typed");
+
+        // With the keyboard on what was found the field stays, unlit.
+        press(&mut f.app, &[KeyCode::Tab]);
+        let drawn = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&drawn, "~ / Pictures  /jp ", 0..120), Some((2, 0)));
+        assert_eq!(drawn[(16, 0)].fg, theme::FOREGROUND);
+        assert_eq!(drawn[(16, 0)].bg, theme::LIGHTER_BACKGROUND);
+
+        // Left, it is gone.
+        press(&mut f.app, &[KeyCode::Esc]);
+        let drawn = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&drawn, "/jp", 0..120), None);
+        assert_eq!(drawn[(16, 0)].bg, theme::BACKGROUND);
     }
 }

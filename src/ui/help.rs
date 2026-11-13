@@ -20,6 +20,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Backspace", "Go to the parent folder"),
     ("Alt+← / Alt+→", "Back / forward"),
     ("Alt+Home", "Go home"),
+    ("Ctrl+L", "Type a path (Tab completes)"),
+    ("/", "Search this folder and below"),
     ("Ctrl+C / X / V", "Copy, cut, paste"),
     ("Ctrl+Shift+C", "Copy the path as text"),
     ("F2 / Ctrl+Shift+D", "Rename / duplicate"),

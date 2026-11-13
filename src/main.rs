@@ -7,6 +7,7 @@ mod input;
 mod model;
 mod ops;
 mod places;
+mod search;
 mod state;
 mod system;
 mod theme;

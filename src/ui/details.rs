@@ -67,6 +67,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some((across, down)) = facts.and_then(|facts| facts.dimensions) {
         lines.push(field("Dimensions", &format!("{across} × {down}"), width));
     }
+    // What a search found comes from many folders: this one's is said.
+    let found = app.panes[app.active].results().is_some();
+    if let Some(folder) = entry.path.parent().filter(|_| found) {
+        let room = width.saturating_sub("Where ".width());
+        lines.push(field("Where", &fit(&app.shown_path(folder), room), width));
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), info);
 
     let label = if app.focus == Focus::Details {
@@ -241,5 +247,48 @@ mod tests {
         press(&mut f.app, &[KeyCode::Char('?')]);
         let again = buffer(&mut f.app, 120, 24);
         assert!(painted(&again[(105, 5)]));
+    }
+
+    #[test]
+    fn what_a_search_found_says_where_it_is() {
+        use crate::app::testing::{finish_search, type_text};
+        let mut f = fixture();
+        let trip = f.home.join("Pictures").join("Trip");
+        fs::write(trip.join("day.jpg"), "").unwrap();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "day");
+        finish_search(&mut f.app);
+        let found = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&found, "day.jpg", 86..120), Some((89, 10)));
+        assert_eq!(find(&found, "Modified", 86..120), Some((89, 13)));
+        // Under it, the folder against the right edge, home as a tilde.
+        assert_eq!(find(&found, "Where", 86..120), Some((89, 14)));
+        assert_eq!(found[(89, 14)].fg, theme::DIM);
+        assert_eq!(find(&found, "~/Pictures/Trip", 86..120), Some((103, 14)));
+        assert_eq!(found[(103, 14)].fg, theme::FOREGROUND);
+
+        // In a folder of its own there is nothing to say.
+        press(&mut f.app, &[KeyCode::Esc, KeyCode::End]);
+        f.app.tick();
+        let folder = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&folder, "notes.txt", 86..120), Some((89, 10)));
+        assert_eq!(find(&folder, "Where", 86..120), None);
+    }
+
+    #[test]
+    fn a_folder_too_deep_for_the_row_is_cut_short() {
+        use crate::app::testing::{finish_search, type_text};
+        let mut f = fixture();
+        let deep = f.home.join("Documents/Projects 2026/Quarterly reports");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("day.txt"), "").unwrap();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "day");
+        finish_search(&mut f.app);
+        let found = buffer(&mut f.app, 120, 24);
+        // 29 cells: the label, a gap, and 23 for the folder.
+        let cut = find(&found, "~/Documents/Projects 2…", 86..120);
+        assert_eq!(cut, Some((95, 14)));
+        assert_eq!(find(&found, "Where", 86..120), Some((89, 14)));
     }
 }

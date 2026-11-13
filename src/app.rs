@@ -1,7 +1,7 @@
 //! Application state and what each key does to it.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -14,6 +14,7 @@ use crate::input::Input;
 use crate::model::{self, Entry, SortMode};
 use crate::ops::{self, Change, History, Kind, Report};
 use crate::places::{self, Place, PlaceKind, Section};
+use crate::search::Walk;
 use crate::state::{self, Saved};
 use crate::system::System;
 use crate::thumbs::{Facts, Thumbs};
@@ -73,6 +74,45 @@ pub enum Dialog {
     Delete { paths: Vec<PathBuf>, armed: bool },
 }
 
+/// A field in the top bar. While one has the keyboard every key goes to it.
+pub enum Field {
+    /// Ctrl+L: a path to go to.
+    Path(Input),
+    /// `/`: what the active pane searches for. The pane holds the text.
+    Search,
+}
+
+/// What a pane lists.
+pub enum Listing {
+    /// The items of the folder at `cwd`.
+    Folder,
+    /// The files used lately, in place of a folder's. `cwd` is the home
+    /// folder meanwhile: that is where "up" leads from there.
+    Recents,
+    /// What a search at and below `cwd` found, or what was there before
+    /// while nothing is typed.
+    Search(Search),
+}
+
+/// A search in a pane: `/` and what was typed after it.
+pub struct Search {
+    pub input: Input,
+    /// What the pane showed before: where Escape and Back return to.
+    origin: Visit,
+    /// The walk looking for matches, until it has no more to give.
+    walk: Option<Walk>,
+    /// Where the cursor belongs once the walk finds one of them; the
+    /// earlier in the list, the better.
+    wanted: Vec<PathBuf>,
+}
+
+impl Search {
+    /// Whether matches may still arrive.
+    pub fn is_running(&self) -> bool {
+        self.walk.is_some()
+    }
+}
+
 /// What Ctrl+C or Ctrl+X took, waiting for Ctrl+V.
 struct Clipboard {
     paths: Vec<PathBuf>,
@@ -119,9 +159,7 @@ pub struct Ancestor {
 
 pub struct Pane {
     pub cwd: PathBuf,
-    /// The pane shows the files used lately in place of a folder's. `cwd` is
-    /// the home folder meanwhile: that is where "up" leads from there.
-    pub recents: bool,
+    pub listing: Listing,
     pub entries: Vec<Entry>,
     pub cursor: usize,
     /// First visible row (of tiles, in the grid); the view keeps the cursor on screen with it.
@@ -137,7 +175,7 @@ impl Pane {
     fn new(cwd: PathBuf, entries: Vec<Entry>) -> Self {
         Self {
             cwd,
-            recents: false,
+            listing: Listing::Folder,
             entries,
             cursor: 0,
             offset: 0,
@@ -151,22 +189,103 @@ impl Pane {
         self.entries.get(self.cursor)
     }
 
-    fn visit(&self) -> Visit {
-        Visit {
-            path: self.cwd.clone(),
-            selected: self.selected().map(|entry| entry.name.clone()),
-            recents: self.recents,
+    /// Whether the pane lists a folder's own items. Only there can things
+    /// be pasted or made, and only that can be pinned.
+    pub fn is_folder(&self) -> bool {
+        matches!(self.listing, Listing::Folder)
+    }
+
+    pub fn recents(&self) -> bool {
+        matches!(self.listing, Listing::Recents)
+    }
+
+    /// The search that is open in the pane.
+    pub fn search(&self) -> Option<&Search> {
+        match &self.listing {
+            Listing::Search(search) => Some(search),
+            _ => None,
         }
     }
 
+    /// The search whose matches the pane lists: one with something typed.
+    pub fn results(&self) -> Option<&Search> {
+        self.search()
+            .filter(|search| !search.input.chars().is_empty())
+    }
+
+    /// Ends the search that is open and hands it over. What the pane lists
+    /// is for the caller to put right.
+    fn take_search(&mut self) -> Option<Search> {
+        self.search()?;
+        match std::mem::replace(&mut self.listing, Listing::Folder) {
+            Listing::Search(search) => Some(search),
+            _ => None,
+        }
+    }
+
+    /// Where Back returns to from what comes next.
+    fn visit(&self) -> Visit {
+        match &self.listing {
+            // What a search found is no place to come back to: the folder
+            // it looked in is, as it was.
+            Listing::Search(search) => search.origin.clone(),
+            listing => Visit {
+                path: self.cwd.clone(),
+                selected: self.selected().map(|entry| entry.name.clone()),
+                recents: matches!(listing, Listing::Recents),
+            },
+        }
+    }
+
+    /// Lists a folder's items. A search that was open ends here, and its walk with it.
     fn show(&mut self, cwd: PathBuf, entries: Vec<Entry>, select: Option<&str>) {
         self.cwd = cwd;
-        self.recents = false;
+        self.listing = Listing::Folder;
         self.entries = entries;
         self.offset = 0;
-        self.cursor = select
-            .and_then(|name| self.entries.iter().position(|entry| entry.name == name))
-            .unwrap_or(0);
+        self.cursor = 0;
+        if let Some(name) = select {
+            self.select(name);
+        }
+    }
+
+    /// Puts the cursor on the item with this name, when it is listed.
+    fn select(&mut self, name: &str) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.name == name) {
+            self.cursor = index;
+        }
+    }
+
+    /// Puts the cursor on the first of these that is listed. A search goes
+    /// on looking for the ones before it among what its walk still finds.
+    fn want(&mut self, wanted: Vec<PathBuf>) {
+        let listed = |path: &PathBuf| self.entries.iter().position(|entry| entry.path == *path);
+        if let Some(index) = wanted.iter().find_map(listed) {
+            self.cursor = index;
+        }
+        if let Listing::Search(search) = &mut self.listing {
+            search.wanted = wanted;
+        }
+    }
+
+    /// Takes in what the search found since the last turn.
+    fn collect_found(&mut self) {
+        let Listing::Search(search) = &mut self.listing else {
+            return;
+        };
+        let Some(walk) = &mut search.walk else { return };
+        let (found, finished) = walk.collect();
+        if finished {
+            search.walk = None;
+        }
+        for entry in found {
+            if let Some(rank) = search.wanted.iter().position(|path| *path == entry.path) {
+                // Only one wanted more than this one moves the cursor again.
+                search.wanted.truncate(rank);
+                self.cursor = self.entries.len();
+            }
+            self.entries.push(entry);
+        }
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -220,6 +339,8 @@ pub struct App {
     pub sidebar_cursor: usize,
     pub help_visible: bool,
     pub dialog: Option<Dialog>,
+    /// The field in the top bar that has the keyboard.
+    pub field: Option<Field>,
     pub message: Option<Message>,
     pub should_quit: bool,
     pub date_style: DateStyle,
@@ -268,6 +389,7 @@ impl App {
             sidebar_cursor: 0,
             help_visible: false,
             dialog: None,
+            field: None,
             message: None,
             should_quit: false,
             date_style: config.date_style,
@@ -331,7 +453,7 @@ impl App {
     pub fn current_place(&self) -> Option<usize> {
         let pane = self.pane();
         let recents = |place: &Place| place.kind == PlaceKind::Recents;
-        if pane.recents {
+        if pane.recents() {
             return self.places().position(recents);
         }
         self.places()
@@ -355,11 +477,14 @@ impl App {
     }
 
     /// What every turn of the event loop does besides keys: takes in the file
-    /// work that finished and the thumbnails made since the last one, and
-    /// reads what the details pane says about a newly selected item, so that
-    /// drawing never has to.
+    /// work that finished, what a search found and the thumbnails made since
+    /// the last one, and reads what the details pane says about a newly
+    /// selected item, so that drawing never has to.
     pub fn tick(&mut self) {
         self.collect_work();
+        for pane in &mut self.panes {
+            pane.collect_found();
+        }
         if let Some(thumbs) = &mut self.thumbs {
             thumbs.collect();
         }
@@ -375,6 +500,9 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // A key is the user taking over: the cursor is no longer moved to
+        // what a search under way was asked to find again.
+        self.pane_mut().want(Vec::new());
         if self.help_visible {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.help_visible = false;
@@ -383,6 +511,13 @@ impl App {
         }
         if let Some(dialog) = self.dialog.take() {
             self.dialog_key(dialog, key);
+            return;
+        }
+        if let Some(field) = self.field.take() {
+            match field {
+                Field::Path(input) => self.path_key(input, key),
+                Field::Search => self.search_key(key),
+            }
             return;
         }
         if self.file_key(key) {
@@ -394,7 +529,9 @@ impl App {
         match key.code {
             KeyCode::Char('?') => self.help_visible = true,
             KeyCode::Char('q' | 'Q') if plain => self.quit(),
-            KeyCode::Esc => self.stop_or_dismiss(),
+            KeyCode::Char('/') if plain => self.search(),
+            KeyCode::Char('l') if ctrl => self.ask_path(),
+            KeyCode::Esc => self.escape(),
             KeyCode::Tab => self.move_focus(1),
             KeyCode::BackTab => self.move_focus(-1),
             KeyCode::Left if alt => self.go_back(),
@@ -489,6 +626,206 @@ impl App {
         self.dialog = Some(dialog);
     }
 
+    /// Ctrl+L: turns the breadcrumbs into a field holding the pane's path.
+    fn ask_path(&mut self) {
+        let path = self.shown_path(&self.pane().cwd);
+        self.field = Some(Field::Path(Input::new(&path)));
+    }
+
+    /// A path the way the top bar and the details pane spell it: `~` for
+    /// the home folder.
+    pub fn shown_path(&self, path: &Path) -> String {
+        match path.strip_prefix(&self.home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        }
+    }
+
+    /// A key pressed while the path field is open: it goes nowhere else.
+    fn path_key(&mut self, mut input: Input, key: KeyEvent) {
+        match key.code {
+            // Closed, with nothing done but what it said taken back.
+            KeyCode::Esc => {
+                self.message = None;
+                return;
+            }
+            KeyCode::Enter => {
+                self.go_to_typed(input);
+                return;
+            }
+            KeyCode::Tab => self.complete(&mut input),
+            _ => {
+                input.handle_key(key);
+            }
+        }
+        self.field = Some(Field::Path(input));
+    }
+
+    /// Where a typed path leads: `~` is the home folder, and what doesn't
+    /// start at `/` starts at the pane's folder. `.` and `..` are followed
+    /// as written, without asking the disk.
+    fn resolve(&self, typed: &str) -> PathBuf {
+        let below_home = typed
+            .strip_prefix('~')
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+        let spelled = match below_home {
+            Some(rest) => self.home.join(rest.trim_start_matches('/')),
+            None => self.pane().cwd.join(typed),
+        };
+        let mut path = PathBuf::new();
+        for part in spelled.components() {
+            match part {
+                Component::ParentDir => {
+                    path.pop();
+                }
+                Component::CurDir => {}
+                part => path.push(part),
+            }
+        }
+        path
+    }
+
+    /// Enter in the path field: goes to the folder typed, or to a file's
+    /// folder with the file selected. The field stays open when it can't.
+    fn go_to_typed(&mut self, input: Input) {
+        let typed = input.text();
+        let typed = typed.trim();
+        let target = self.resolve(typed);
+        let arrived = match Entry::from_path(target.clone()) {
+            Ok(entry) if entry.is_dir => self.go_to(&target, None),
+            Ok(entry) => {
+                let folder = target.parent().unwrap_or(&target);
+                self.go_to(folder, Some(&entry.name))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.fail(format!("{typed} doesn't exist."));
+                false
+            }
+            Err(error) => {
+                self.fail(read_error(&target, &error));
+                false
+            }
+        };
+        if !arrived {
+            self.field = Some(Field::Path(input));
+        }
+    }
+
+    /// Tab in the path field: fills in the folder name being typed as far
+    /// as the folders that start like it agree. The folder is listed once.
+    fn complete(&self, input: &mut Input) {
+        let text = input.text();
+        let (before, typed) = text.split_at(text.rfind('/').map_or(0, |slash| slash + 1));
+        if text == "~" {
+            *input = Input::new("~/");
+            return;
+        }
+        let hidden = self.show_hidden || typed.starts_with('.');
+        let Ok(entries) = model::list_dir(&self.resolve(before), hidden, SortMode::Name) else {
+            return;
+        };
+        let start = typed.to_lowercase();
+        let folders: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.is_dir && entry.name.to_lowercase().starts_with(&start))
+            .map(|entry| entry.name.as_str())
+            .collect();
+        let filled = match folders.as_slice() {
+            [] => return,
+            [only] => format!("{only}/"),
+            [first, others @ ..] => common_start(first, others),
+        };
+        *input = Input::new(&format!("{before}{filled}"));
+    }
+
+    /// `/`: opens the search field, or hands the keyboard back to the one
+    /// that is open.
+    fn search(&mut self) {
+        if self.pane().search().is_none() {
+            let origin = self.pane().visit();
+            self.pane_mut().listing = Listing::Search(Search {
+                input: Input::default(),
+                origin,
+                walk: None,
+                wanted: Vec::new(),
+            });
+        }
+        // Up, Down and Enter act on the files from the field.
+        self.focus = Focus::Files;
+        self.field = Some(Field::Search);
+    }
+
+    /// A key pressed while the search field has the keyboard: what isn't
+    /// typed into it moves in what was found, opens it or leaves.
+    fn search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.leave_search();
+                return;
+            }
+            // The keyboard moves on to what was found. With nothing typed
+            // there is no search to keep.
+            KeyCode::Tab | KeyCode::BackTab => {
+                if self.pane().results().is_none() {
+                    self.leave_search();
+                }
+                return;
+            }
+            KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                self.files_key(key)
+            }
+            _ => {
+                let mut retyped = false;
+                if let Listing::Search(search) = &mut self.pane_mut().listing {
+                    let before = search.input.text();
+                    search.input.handle_key(key);
+                    retyped = search.input.text() != before;
+                }
+                if retyped {
+                    self.run_search();
+                }
+            }
+        }
+        // Enter on a folder went there and left the search.
+        if self.pane().search().is_some() {
+            self.field = Some(Field::Search);
+        }
+    }
+
+    /// Lists what the search field asks for: what was there before while
+    /// it is empty, and otherwise the matches of a walk started afresh.
+    fn run_search(&mut self) {
+        let Some(mut search) = self.pane_mut().take_search() else {
+            return;
+        };
+        let text = search.input.text();
+        search.wanted.clear();
+        // The walk under way looked for something else: dropped, it stops.
+        search.walk = None;
+        if text.is_empty() {
+            self.revisit(&search.origin);
+            self.pane_mut().listing = Listing::Search(search);
+        } else {
+            let folder = search.origin.path.clone();
+            search.walk = Some(Walk::start(folder.clone(), &text, self.show_hidden));
+            let pane = self.pane_mut();
+            pane.show(folder, Vec::new(), None);
+            pane.listing = Listing::Search(search);
+            self.refresh_ancestors();
+            self.message = None;
+        }
+    }
+
+    /// Ends the search and shows what was there before it, the cursor
+    /// where it was.
+    fn leave_search(&mut self) {
+        self.field = None;
+        if let Some(search) = self.pane_mut().take_search() {
+            self.revisit(&search.origin);
+        }
+    }
+
     /// Enter in a dialog: does what it asked about.
     fn answer(&mut self, dialog: Dialog) {
         match dialog {
@@ -557,7 +894,7 @@ impl App {
         if self.busy() {
             return;
         }
-        if self.pane().recents {
+        if !self.pane().is_folder() {
             self.note("Files can't be pasted here.");
             return;
         }
@@ -612,7 +949,7 @@ impl App {
     /// Whether the pane shows the trash, or a folder that is in it.
     fn in_trash(&self) -> bool {
         let pane = self.pane();
-        !pane.recents && pane.cwd.starts_with(&self.trash_dir)
+        !pane.recents() && pane.cwd.starts_with(&self.trash_dir)
     }
 
     /// Moves the selection to the trash.
@@ -668,7 +1005,7 @@ impl App {
         if self.busy() {
             return;
         }
-        if self.pane().recents {
+        if !self.pane().is_folder() {
             self.note("Folders can't be made here.");
             return;
         }
@@ -683,7 +1020,7 @@ impl App {
     fn copy_path(&mut self) {
         let mut paths = self.selection();
         if paths.is_empty() {
-            if self.pane().recents {
+            if !self.pane().is_folder() {
                 // Not a folder: it has no path of its own.
                 return;
             }
@@ -777,7 +1114,7 @@ impl App {
 
     /// Takes in what a command over several items did: logs it for undo,
     /// lists the folder again and says how it went.
-    fn settle(&mut self, report: Report, neighbour: Option<String>) {
+    fn settle(&mut self, report: Report, neighbour: Option<PathBuf>) {
         let message = outcome(&report);
         let landed = report.change.landed();
         self.history.record(report.change);
@@ -793,35 +1130,38 @@ impl App {
         self.note(&said);
     }
 
-    /// Lists the folder again and puts the cursor on the first of these that
-    /// is in it: one of `paths`, what was selected before, or `neighbour`.
-    fn relist(&mut self, paths: &[PathBuf], neighbour: Option<String>) {
-        let here = self.pane().visit();
-        if !self.revisit(&here) {
-            return;
-        }
-        let pane = self.pane_mut();
-        let named = |name: String| pane.entries.iter().position(|entry| entry.name == name);
-        let found = paths
-            .iter()
-            .find_map(|path| pane.entries.iter().position(|entry| entry.path == *path))
-            .or_else(|| here.selected.into_iter().chain(neighbour).find_map(named));
-        if let Some(index) = found {
-            pane.cursor = index;
+    /// Lists what the pane shows again and puts the cursor on the first of
+    /// these that is in it: one of `paths`, what was selected before, or
+    /// `neighbour`.
+    fn relist(&mut self, paths: &[PathBuf], neighbour: Option<PathBuf>) {
+        let selected = self.selected().map(|entry| entry.path.clone());
+        if self.reload() {
+            let wanted = paths.iter().cloned().chain(selected).chain(neighbour);
+            self.pane_mut().want(wanted.collect());
         }
     }
 
-    /// The name the cursor should fall on once these are gone: the next item
+    /// The item the cursor should fall on once these are gone: the next one
     /// that stays, or else the nearest one before.
-    fn neighbour(&self, leaving: &[PathBuf]) -> Option<String> {
+    fn neighbour(&self, leaving: &[PathBuf]) -> Option<PathBuf> {
         let pane = self.pane();
         let stays = |entry: &&Entry| !leaving.contains(&entry.path);
         let after = pane.entries.iter().skip(pane.cursor).find(stays);
         let before = pane.entries.iter().take(pane.cursor).rev().find(stays);
-        after.or(before).map(|entry| entry.name.clone())
+        after.or(before).map(|entry| entry.path.clone())
     }
 
-    /// Escape: stops the file work under way, or dismisses what went wrong.
+    /// Escape: stops the file work under way; with none, leaves the search
+    /// that is showing, or dismisses what went wrong.
+    fn escape(&mut self) {
+        if self.work.is_none() && self.pane().search().is_some() {
+            self.leave_search();
+        } else {
+            self.stop_or_dismiss();
+        }
+    }
+
+    /// Stops the file work under way, or dismisses what went wrong.
     fn stop_or_dismiss(&mut self) {
         if let Some(work) = &self.work {
             work.cancel.store(true, Ordering::Relaxed);
@@ -908,7 +1248,7 @@ impl App {
 
     /// Ctrl+P: pins the pane's folder to the sidebar, or unpins it.
     fn toggle_pin(&mut self) {
-        if self.pane().recents {
+        if !self.pane().is_folder() {
             self.note("Only folders can be pinned.");
             return;
         }
@@ -977,34 +1317,54 @@ impl App {
 
     /// Goes to a folder, remembering where we were for Back.
     pub fn navigate(&mut self, path: &Path) {
+        self.go_to(path, None);
+    }
+
+    /// Goes to a folder with the cursor on the item named, remembering
+    /// where we were for Back. False when the folder couldn't be shown.
+    fn go_to(&mut self, path: &Path, select: Option<&str>) -> bool {
         let from = self.pane().visit();
-        let elsewhere = from.recents || path != from.path;
-        if elsewhere && self.show_folder(path, None) {
-            let pane = self.pane_mut();
-            pane.back.push(from);
-            pane.forward.clear();
+        if from.recents || path != from.path {
+            let shown = self.show_folder(path, select);
+            if shown {
+                let pane = self.pane_mut();
+                pane.back.push(from);
+                pane.forward.clear();
+            }
+            return shown;
         }
+        // Already there: at most a search to leave and the cursor to move.
+        if self.pane().search().is_some() {
+            self.leave_search();
+        }
+        if let Some(name) = select {
+            self.pane_mut().select(name);
+        }
+        true
     }
 
     /// Shows the files used lately in place of a folder, remembering where
     /// we were for Back.
     fn open_recents(&mut self) {
         let from = self.pane().visit();
-        if !from.recents {
-            self.show_recents(None);
-            let pane = self.pane_mut();
-            pane.back.push(from);
-            pane.forward.clear();
+        if from.recents {
+            // Already there, unless a search is in the way.
+            self.leave_search();
+            return;
         }
+        self.show_recents(None);
+        let pane = self.pane_mut();
+        pane.back.push(from);
+        pane.forward.clear();
     }
 
     fn go_up(&mut self) {
-        if self.pane().recents {
+        let from = self.pane().visit();
+        if from.recents {
             // Recents hang off the home folder.
             self.go_home();
             return;
         }
-        let from = self.pane().visit();
         let Some(parent) = from.path.parent().map(Path::to_path_buf) else {
             return;
         };
@@ -1095,10 +1455,15 @@ impl App {
         self.reload();
     }
 
-    /// Lists what the pane shows again, keeping the selection on the same item.
-    fn reload(&mut self) {
+    /// Lists what the pane shows again, keeping the selection on the same
+    /// item. False when it couldn't be listed.
+    fn reload(&mut self) -> bool {
+        if self.pane().search().is_some() {
+            self.run_search();
+            return true;
+        }
         let here = self.pane().visit();
-        self.revisit(&here);
+        self.revisit(&here)
     }
 
     /// Shows what a visit was of: a folder, or the files used lately.
@@ -1149,14 +1514,15 @@ impl App {
         let home = self.home.clone();
         let pane = self.pane_mut();
         pane.show(home, entries, select);
-        pane.recents = true;
+        pane.listing = Listing::Recents;
         self.refresh_ancestors();
         self.message = None;
     }
 
-    /// Lists the folders above the active pane's again, when the view shows them.
+    /// Lists the folders above the active pane's again, when the view shows
+    /// them. What a search found is a column on its own.
     fn refresh_ancestors(&mut self) {
-        let ancestors = if self.view == ViewMode::Columns {
+        let ancestors = if self.view == ViewMode::Columns && self.pane().results().is_none() {
             self.list_ancestors(&self.pane().cwd)
         } else {
             Vec::new()
@@ -1243,6 +1609,15 @@ fn told(verb: &str, change: &Change) -> String {
         Kind::Rename => format!("{verb} renaming {name}."),
         Kind::NewFolder => format!("{verb} making {name}."),
     }
+}
+
+/// What several names start with alike, whatever their case, the way the
+/// first one spells it.
+fn common_start(first: &str, others: &[&str]) -> String {
+    let alike = |(a, b): &(char, char)| a.to_lowercase().eq(b.to_lowercase());
+    let shared = |other: &&str| first.chars().zip(other.chars()).take_while(alike).count();
+    let length = others.iter().map(shared).min().unwrap_or(0);
+    first.chars().take(length).collect()
 }
 
 /// An item's name as the lists show it.
@@ -1343,6 +1718,23 @@ pub mod testing {
                 return;
             }
             assert!(Instant::now() < deadline, "the file work never finished");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Lets the search under way look everywhere and takes in what it found.
+    pub fn finish_search(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            app.tick();
+            if app
+                .pane()
+                .search()
+                .is_none_or(|search| !search.is_running())
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the search never finished");
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -2697,7 +3089,7 @@ mod tests {
         assert_eq!(f.system.asked.get(), 0, "not before it is opened");
 
         open_place(&mut f.app, "Recents");
-        assert!(f.app.pane().recents);
+        assert!(f.app.pane().recents());
         assert_eq!(names(&f.app), ["a.jpg", "notes.txt"], "Spotlight's order");
         assert_eq!(f.app.focus, Focus::Files);
         assert_eq!(f.app.current_place(), place_of(&f.app, "Recents"));
@@ -2713,11 +3105,11 @@ mod tests {
 
         // Back returns to where we were, and forward to Recents.
         f.app.handle_key(alt(KeyCode::Left));
-        assert!(!f.app.pane().recents);
+        assert!(!f.app.pane().recents());
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
         assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
         f.app.handle_key(alt(KeyCode::Right));
-        assert!(f.app.pane().recents);
+        assert!(f.app.pane().recents());
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
     }
 
@@ -2733,14 +3125,14 @@ mod tests {
         for leave in leaving {
             f.app.navigate(&f.home.join("Pictures"));
             open_place(&mut f.app, "Recents");
-            assert!(f.app.pane().recents);
+            assert!(f.app.pane().recents());
             f.app.handle_key(leave);
-            assert!(!f.app.pane().recents);
+            assert!(!f.app.pane().recents());
             assert_eq!(f.app.pane().cwd, f.home);
             assert_eq!(names(&f.app), ["Documents", "Pictures", "notes.txt"]);
             // Recents is one step back.
             f.app.handle_key(alt(KeyCode::Left));
-            assert!(f.app.pane().recents);
+            assert!(f.app.pane().recents());
             assert_eq!(names(&f.app), ["notes.txt"]);
         }
     }
@@ -2763,7 +3155,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::F(5)]);
         assert_eq!(f.system.asked.get(), 2);
         assert_eq!(names(&f.app), ["notes.txt"]);
-        assert!(f.app.pane().recents);
+        assert!(f.app.pane().recents());
     }
 
     #[test]
@@ -2800,7 +3192,7 @@ mod tests {
         type_text(&mut f.app, "b.jpg");
         press(&mut f.app, &[KeyCode::Enter]);
         assert_eq!(on_disk(&f.home.join("Pictures")), ["Trip", "b.jpg"]);
-        assert!(f.app.pane().recents);
+        assert!(f.app.pane().recents());
 
         // Delete moves it to the trash.
         select(&mut f.app, "notes.txt");
@@ -2808,7 +3200,7 @@ mod tests {
         assert_eq!(read(f.trash.join("notes.txt")), "hello");
         assert!(!notes.exists());
         assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
-        assert!(f.app.pane().recents);
+        assert!(f.app.pane().recents());
         assert_eq!(names(&f.app), ["plan.md"]);
 
         f.app.navigate(&f.home.join("Pictures"));
@@ -2926,5 +3318,577 @@ mod tests {
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::Sidebar);
         assert_eq!(sections(&f.app), [home, views(), ("Drives", vec!["USB"])]);
+    }
+
+    // The path field (Ctrl+L) and the search (/). Both live in the top bar
+    // and take the keyboard while they are open.
+
+    fn path_field(app: &App) -> (String, usize) {
+        match &app.field {
+            Some(Field::Path(input)) => (input.text(), input.cursor()),
+            _ => panic!("the path field isn't open"),
+        }
+    }
+
+    fn open_path_field(app: &mut App) {
+        app.handle_key(ctrl(KeyCode::Char('l')));
+    }
+
+    /// Ctrl+L, a path typed over what the field held, Enter.
+    fn go_to_typed(app: &mut App, path: &str) {
+        open_path_field(app);
+        clear_field(app);
+        type_text(app, path);
+        press(app, &[KeyCode::Enter]);
+    }
+
+    /// Types over what the path field holds, presses Tab and says what it holds then.
+    fn completed(app: &mut App, typed: &str) -> String {
+        clear_field(app);
+        type_text(app, typed);
+        press(app, &[KeyCode::Tab]);
+        let (text, cursor) = path_field(app);
+        assert_eq!(cursor, text.chars().count(), "the cursor ends up after it");
+        text
+    }
+
+    #[test]
+    fn ctrl_l_opens_a_field_holding_the_panes_path_with_the_cursor_after_it() {
+        let mut f = fixture();
+        open_path_field(&mut f.app);
+        assert_eq!(path_field(&f.app), ("~".to_string(), 1));
+        press(&mut f.app, &[KeyCode::Esc]);
+
+        f.app.navigate(&f.home.join("Pictures").join("Trip"));
+        open_path_field(&mut f.app);
+        assert_eq!(path_field(&f.app), ("~/Pictures/Trip".to_string(), 15));
+        press(&mut f.app, &[KeyCode::Esc]);
+
+        // Outside the home folder a path is spelled out.
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        f.app.navigate(&outside);
+        open_path_field(&mut f.app);
+        let spelled = outside.display().to_string();
+        let length = spelled.chars().count();
+        assert_eq!(path_field(&f.app), (spelled, length));
+    }
+
+    #[test]
+    fn enter_in_the_path_field_goes_where_the_path_leads_and_back_returns() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        let absolute = f.home.join("Documents").display().to_string();
+        // From Pictures each time: what is typed, and where it leads.
+        let leads = [
+            ("~", f.home.clone()),
+            ("~/Pictures/Trip/", pictures.join("Trip")),
+            ("Trip", pictures.join("Trip")),
+            ("../Documents/.", f.home.join("Documents")),
+            ("./Trip/../..", f.home.clone()),
+            (absolute.as_str(), f.home.join("Documents")),
+        ];
+        for (typed, folder) in leads {
+            f.app.navigate(&pictures);
+            press(&mut f.app, &[KeyCode::End]);
+            go_to_typed(&mut f.app, typed);
+            assert_eq!(f.app.pane().cwd, folder, "{typed}");
+            assert!(f.app.field.is_none(), "{typed}");
+            assert_eq!(f.app.message, None, "{typed}");
+            // It is a step in the history like any other.
+            f.app.handle_key(alt(KeyCode::Left));
+            assert_eq!(f.app.pane().cwd, pictures, "{typed}");
+            assert_eq!(selected_name(&f.app), Some("a.jpg"), "{typed}");
+        }
+    }
+
+    #[test]
+    fn a_path_to_a_file_opens_its_folder_with_the_file_selected() {
+        let mut f = fixture();
+        f.app.navigate(&f.home.join("Documents"));
+        go_to_typed(&mut f.app, "~/Pictures/a.jpg");
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert_eq!(selected_name(&f.app), Some("a.jpg"));
+        assert!(f.app.field.is_none());
+        assert!(f.system.opened.borrow().is_empty(), "selected, not opened");
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(f.app.pane().cwd, f.home.join("Documents"));
+
+        // One in the folder that is showing only moves the cursor.
+        let mut f = fixture();
+        go_to_typed(&mut f.app, "notes.txt");
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+        assert!(f.app.field.is_none());
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(
+            selected_name(&f.app),
+            Some("notes.txt"),
+            "nowhere to go back to"
+        );
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_keeps_the_field_open_and_says_so() {
+        let mut f = fixture();
+        go_to_typed(&mut f.app, "~/Nowhere/else");
+        assert_eq!(path_field(&f.app), ("~/Nowhere/else".to_string(), 14));
+        assert_eq!(said(&f.app), ("~/Nowhere/else doesn't exist.", true));
+        assert_eq!(f.app.pane().cwd, f.home);
+        let all = crate::ui::testing::screen(&mut f.app, 120, 24).join("\n");
+        assert!(all.contains("~/Nowhere/else doesn't exist."), "{all}");
+
+        // So does a folder that is there and can't be read.
+        let locked = f.home.join("Documents");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Enter]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(path_field(&f.app).0, "Documents");
+        assert_eq!(said(&f.app), ("Documents: Permission was refused.", true));
+        assert_eq!(f.app.pane().cwd, f.home);
+
+        // It can be put right where it stands.
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "~/Pictures");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert!(f.app.field.is_none());
+        assert_eq!(f.app.message, None);
+    }
+
+    #[test]
+    fn tab_completes_folder_names_as_far_as_they_are_certain() {
+        let mut f = fixture();
+        fs::create_dir(f.home.join("Pictures").join("Trips 2025")).unwrap();
+        fs::write(f.home.join("Pictures").join("Trailer.mov"), "").unwrap();
+        open_path_field(&mut f.app);
+        // One folder starts like that: its name, and a slash to go on from.
+        assert_eq!(completed(&mut f.app, "~/Doc"), "~/Documents/");
+        assert_eq!(completed(&mut f.app, "~/pIC"), "~/Pictures/", "any case");
+        assert_eq!(completed(&mut f.app, "Pic"), "Pictures/", "from the folder");
+        assert_eq!(completed(&mut f.app, "~"), "~/");
+        // Several do: as far as they are alike.
+        assert_eq!(completed(&mut f.app, "~/Pictures/t"), "~/Pictures/Trip");
+        assert_eq!(
+            completed(&mut f.app, "~/Pictures/Trips"),
+            "~/Pictures/Trips 2025/"
+        );
+        // None does: nothing. A file is not a folder.
+        assert_eq!(completed(&mut f.app, "~/Pictures/zz"), "~/Pictures/zz");
+        assert_eq!(completed(&mut f.app, "~/Pictures/Trai"), "~/Pictures/Trai");
+        assert_eq!(completed(&mut f.app, "~/no"), "~/no");
+        assert_eq!(completed(&mut f.app, "~/Nowhere/x"), "~/Nowhere/x");
+        // Tab went nowhere else.
+        assert_eq!((f.app.focus, &f.app.pane().cwd), (Focus::Files, &f.home));
+    }
+
+    #[test]
+    fn hidden_folders_complete_only_when_they_are_shown_or_the_dot_is_typed() {
+        let mut f = fixture();
+        fs::create_dir_all(f.home.join("Box").join(".git")).unwrap();
+        fs::create_dir(f.home.join("Box").join("src")).unwrap();
+        open_path_field(&mut f.app);
+        assert_eq!(completed(&mut f.app, "~/Box/"), "~/Box/src/");
+        assert_eq!(completed(&mut f.app, "~/Box/."), "~/Box/.git/");
+        press(&mut f.app, &[KeyCode::Esc]);
+        f.app.handle_key(ctrl(KeyCode::Char('h')));
+        open_path_field(&mut f.app);
+        // Two of them now, with nothing alike.
+        assert_eq!(completed(&mut f.app, "~/Box/"), "~/Box/");
+    }
+
+    #[test]
+    fn tab_reads_the_folder_as_it_is_when_pressed_and_drawing_reads_nothing() {
+        let mut f = fixture();
+        open_path_field(&mut f.app);
+        type_text(&mut f.app, "/Mus");
+        fs::create_dir(f.home.join("Music")).unwrap();
+        for _ in 0..3 {
+            f.app.tick();
+            crate::ui::testing::screen(&mut f.app, 120, 24);
+        }
+        assert_eq!(path_field(&f.app).0, "~/Mus");
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(path_field(&f.app).0, "~/Music/");
+    }
+
+    #[test]
+    fn escape_closes_the_path_field_and_changes_nothing() {
+        let mut f = fixture();
+        f.app.navigate(&f.home.join("Pictures"));
+        press(&mut f.app, &[KeyCode::End]);
+        open_path_field(&mut f.app);
+        type_text(&mut f.app, "/Trip");
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.field.is_none());
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert_eq!(selected_name(&f.app), Some("a.jpg"));
+        assert_eq!(f.app.message, None);
+        // Nothing was added to the history: back is still the home folder.
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(f.app.pane().cwd, f.home);
+    }
+
+    #[test]
+    fn while_the_path_field_is_open_every_key_goes_to_it() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down]);
+        open_path_field(&mut f.app);
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "qsS/? ");
+        assert_eq!(path_field(&f.app), ("qsS/? ".to_string(), 6));
+        for other in [
+            key(KeyCode::Up),
+            key(KeyCode::Down),
+            key(KeyCode::PageDown),
+            key(KeyCode::BackTab),
+            key(KeyCode::F(2)),
+            key(KeyCode::F(5)),
+            key(KeyCode::Delete),
+            shift(KeyCode::Delete),
+            ctrl(KeyCode::Char('h')),
+            ctrl(KeyCode::Char('c')),
+            ctrl(KeyCode::Char('v')),
+            ctrl(KeyCode::Char('p')),
+            ctrl(KeyCode::Char('3')),
+            ctrl(KeyCode::Char('l')),
+            ctrl_shift('n'),
+            alt(KeyCode::Char('b')),
+        ] {
+            f.app.handle_key(other);
+            assert_eq!(path_field(&f.app).0, "qsS/? ", "{other:?}");
+        }
+        assert!(!f.app.should_quit && !f.app.help_visible && f.app.dialog.is_none());
+        let (sort, view, hidden) = (f.app.sort, f.app.view, f.app.show_hidden);
+        assert_eq!(
+            (sort, view, hidden),
+            (SortMode::Name, ViewMode::List, false)
+        );
+        assert_eq!((f.app.focus, f.app.pane().cursor), (Focus::Files, 1));
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert!(f.app.pane().search().is_none());
+        assert_eq!((f.app.working(), &f.app.message), (None, &None));
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
+    }
+
+    /// The fixture with things named after a trip at three depths:
+    /// `Documents/trip-plan.md`, `Pictures/Trip/day-trip.jpg` and, out of
+    /// sight, `.cache/trip.log`.
+    fn searchable() -> Fixture {
+        let f = fixture();
+        fs::write(f.home.join("Documents").join("trip-plan.md"), "plan").unwrap();
+        let trip = f.home.join("Pictures").join("Trip");
+        fs::write(trip.join("day-trip.jpg"), "jpg").unwrap();
+        fs::create_dir(f.home.join(".cache")).unwrap();
+        fs::write(f.home.join(".cache").join("trip.log"), "log").unwrap();
+        f
+    }
+
+    const FOLDER: [&str; 3] = ["Documents", "Pictures", "notes.txt"];
+    const TRIPS: [&str; 3] = ["trip-plan.md", "Trip", "day-trip.jpg"];
+
+    /// Types into the search field and lets the walk look everywhere.
+    fn search_for(app: &mut App, text: &str) {
+        type_text(app, text);
+        finish_search(app);
+    }
+
+    fn search_text(app: &App) -> String {
+        let search = app.pane().search().expect("no search is open");
+        search.input.text()
+    }
+
+    fn typing_a_search(app: &App) -> bool {
+        matches!(app.field, Some(Field::Search))
+    }
+
+    #[test]
+    fn slash_lists_what_matches_at_and_below_the_folder_as_it_is_typed() {
+        let mut f = searchable();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        assert!(typing_a_search(&f.app));
+        assert_eq!(search_text(&f.app), "");
+
+        type_text(&mut f.app, "TR");
+        assert!(names(&f.app).is_empty(), "typing doesn't wait for the walk");
+        assert!(f.app.pane().search().unwrap().is_running());
+        finish_search(&mut f.app);
+        // The nearest first, a file before a folder: the order they were found in.
+        assert_eq!(names(&f.app), TRIPS);
+        assert_eq!(f.app.pane().cursor, 0);
+        assert_eq!(f.app.pane().cwd, f.home, "the folder being searched");
+        assert!(typing_a_search(&f.app));
+        assert_eq!(f.app.message, None);
+
+        // What is typed next is looked for in place of it.
+        search_for(&mut f.app, "ip-");
+        assert_eq!(search_text(&f.app), "TRip-");
+        assert_eq!(names(&f.app), ["trip-plan.md"]);
+        search_for(&mut f.app, "x");
+        assert!(names(&f.app).is_empty());
+        press(&mut f.app, &[KeyCode::Backspace; 4]);
+        finish_search(&mut f.app);
+        assert_eq!(search_text(&f.app), "TR");
+        assert_eq!(names(&f.app), TRIPS);
+    }
+
+    #[test]
+    fn a_search_skips_hidden_items_until_they_are_shown_and_is_never_sorted() {
+        let mut f = searchable();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        search_for(&mut f.app, "trip");
+        assert_eq!(names(&f.app), TRIPS);
+        press(&mut f.app, &[KeyCode::Tab]);
+
+        // Another order sorts the folders, not what was found.
+        press(&mut f.app, &[KeyCode::Char('S')]);
+        finish_search(&mut f.app);
+        assert_eq!(f.app.sort, SortMode::Size);
+        assert_eq!(names(&f.app), TRIPS);
+
+        f.app.handle_key(ctrl(KeyCode::Char('h')));
+        finish_search(&mut f.app);
+        let with_hidden = ["trip.log", "trip-plan.md", "Trip", "day-trip.jpg"];
+        assert_eq!(names(&f.app), with_hidden);
+        assert_eq!(search_text(&f.app), "trip");
+    }
+
+    #[test]
+    fn an_empty_search_field_shows_the_folder_as_it_was() {
+        let mut f = searchable();
+        select(&mut f.app, "Pictures");
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        assert_eq!(names(&f.app), FOLDER);
+        assert_eq!(selected_name(&f.app), Some("Pictures"));
+
+        search_for(&mut f.app, "trip");
+        assert_eq!(names(&f.app), TRIPS);
+        press(&mut f.app, &[KeyCode::Backspace; 4]);
+        assert_eq!(search_text(&f.app), "");
+        assert_eq!(names(&f.app), FOLDER);
+        assert_eq!(selected_name(&f.app), Some("Pictures"));
+        assert!(typing_a_search(&f.app), "the field stays open");
+        assert!(!f.app.pane().search().unwrap().is_running());
+    }
+
+    #[test]
+    fn up_down_and_enter_act_on_what_was_found_without_leaving_the_field() {
+        let mut f = searchable();
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        search_for(&mut f.app, "trip");
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Down, KeyCode::Up]);
+        assert_eq!(selected_name(&f.app), Some("Trip"));
+        assert!(typing_a_search(&f.app));
+        assert_eq!(search_text(&f.app), "trip");
+
+        // Enter on a file opens it, and the search stays.
+        press(&mut f.app, &[KeyCode::Up, KeyCode::Enter]);
+        let plan = f.home.join("Documents").join("trip-plan.md");
+        assert_eq!(*f.system.opened.borrow(), [plan]);
+        assert!(typing_a_search(&f.app));
+        assert_eq!(names(&f.app), TRIPS);
+
+        // Enter on a folder goes into it, leaving the search.
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
+        assert_eq!(names(&f.app), ["day-trip.jpg"]);
+        assert!(f.app.field.is_none() && f.app.pane().search().is_none());
+
+        // Back is the folder that was searched, as it was: not what was found.
+        f.app.handle_key(alt(KeyCode::Left));
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(names(&f.app), FOLDER);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+        assert!(f.app.pane().search().is_none());
+    }
+
+    #[test]
+    fn escape_leaves_the_search_and_shows_the_folder_with_the_cursor_where_it_was() {
+        let mut f = searchable();
+        select(&mut f.app, "notes.txt");
+        // From the field, and from what was found once the keyboard is there.
+        for at_what_was_found in [false, true] {
+            press(&mut f.app, &[KeyCode::Char('/')]);
+            search_for(&mut f.app, "trip");
+            press(&mut f.app, &[KeyCode::Down]);
+            if at_what_was_found {
+                press(&mut f.app, &[KeyCode::Tab]);
+                assert!(f.app.field.is_none() && f.app.pane().search().is_some());
+            }
+            press(&mut f.app, &[KeyCode::Esc]);
+            assert!(f.app.field.is_none() && f.app.pane().search().is_none());
+            assert_eq!(f.app.pane().cwd, f.home);
+            assert_eq!(names(&f.app), FOLDER);
+            assert_eq!(selected_name(&f.app), Some("notes.txt"));
+        }
+    }
+
+    #[test]
+    fn what_a_search_finds_works_like_any_item_but_nothing_is_pasted_or_made_there() {
+        let mut f = searchable();
+        let plan = f.home.join("Documents").join("trip-plan.md");
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        search_for(&mut f.app, "trip");
+        // Tab hands the keyboard to what was found; the search stays.
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert!(f.app.field.is_none());
+        assert_eq!(f.app.focus, Focus::Files);
+
+        press(&mut f.app, &[KeyCode::Char(' '), KeyCode::Enter]);
+        let asked_for = [plan.clone()];
+        assert_eq!(*f.system.previewed.borrow(), asked_for);
+        assert_eq!(*f.system.opened.borrow(), asked_for);
+        assert_eq!(search_text(&f.app), "trip", "the space wasn't typed");
+        f.app.handle_key(ctrl_shift('c'));
+        assert_eq!(*f.system.copied.borrow(), [plan.display().to_string()]);
+        f.app.handle_key(ctrl(KeyCode::Char('x')));
+        assert_eq!(said(&f.app), ("1 item ready to move.", false));
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(said(&f.app), ("1 item ready to paste.", false));
+
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        assert_eq!(said(&f.app), ("Files can't be pasted here.", false));
+        assert_eq!(f.app.working(), None);
+        f.app.handle_key(ctrl_shift('n'));
+        assert_eq!(said(&f.app), ("Folders can't be made here.", false));
+        assert!(f.app.dialog.is_none());
+
+        // F2 renames it where it is; the search looks again and finds it.
+        press(&mut f.app, &[KeyCode::F(2)]);
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "trip-notes.md");
+        press(&mut f.app, &[KeyCode::Enter]);
+        finish_search(&mut f.app);
+        assert_eq!(on_disk(&f.home.join("Documents")), ["trip-notes.md"]);
+        assert_eq!(names(&f.app), ["trip-notes.md", "Trip", "day-trip.jpg"]);
+        assert_eq!(selected_name(&f.app), Some("trip-notes.md"));
+        let renamed = "Renamed trip-plan.md to trip-notes.md.";
+        assert_eq!(said(&f.app), (renamed, false));
+
+        // Delete moves it to the trash, and the cursor to what was next to it.
+        select(&mut f.app, "day-trip.jpg");
+        press(&mut f.app, &[KeyCode::Delete]);
+        finish_search(&mut f.app);
+        assert_eq!(read(f.trash.join("day-trip.jpg")), "jpg");
+        assert_eq!(names(&f.app), ["trip-notes.md", "Trip"]);
+        assert_eq!(selected_name(&f.app), Some("Trip"));
+        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+
+        // `/` hands the keyboard back to the field, as it was left.
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        assert!(typing_a_search(&f.app));
+        assert_eq!(search_text(&f.app), "trip");
+        assert_eq!(names(&f.app), ["trip-notes.md", "Trip"]);
+    }
+
+    #[test]
+    fn while_the_search_field_is_open_what_is_typed_is_searched_for() {
+        let mut f = searchable();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "q s?/");
+        assert_eq!(search_text(&f.app), "q s?/");
+        for other in [
+            key(KeyCode::F(2)),
+            key(KeyCode::F(5)),
+            ctrl(KeyCode::Char('h')),
+            ctrl(KeyCode::Char('c')),
+            ctrl(KeyCode::Char('p')),
+            ctrl(KeyCode::Char('3')),
+            ctrl(KeyCode::Char('l')),
+            ctrl_shift('n'),
+            alt(KeyCode::Char('b')),
+        ] {
+            f.app.handle_key(other);
+            assert_eq!(search_text(&f.app), "q s?/", "{other:?}");
+            assert!(typing_a_search(&f.app), "{other:?}");
+        }
+        assert!(!f.app.should_quit && !f.app.help_visible && f.app.dialog.is_none());
+        let (sort, view, hidden) = (f.app.sort, f.app.view, f.app.show_hidden);
+        assert_eq!(
+            (sort, view, hidden),
+            (SortMode::Name, ViewMode::List, false)
+        );
+        assert!(f.system.previewed.borrow().is_empty());
+        assert_eq!(f.app.pane().cwd, f.home);
+
+        // With nothing typed there is no search to hand the keyboard on to.
+        press(&mut f.app, &[KeyCode::Backspace; 5]);
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert!(f.app.field.is_none() && f.app.pane().search().is_none());
+        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(names(&f.app), FOLDER);
+    }
+
+    #[test]
+    fn escape_stops_the_file_work_under_way_before_it_leaves_a_search() {
+        let mut f = searchable();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        search_for(&mut f.app, "trip");
+        press(&mut f.app, &[KeyCode::Tab]);
+        f.app.handle_key(ctrl_shift('d'));
+        assert_eq!(f.app.working(), Some("Duplicating trip-plan.md…"));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(
+            search_text(&f.app),
+            "trip",
+            "the first one was for the work"
+        );
+        finish_work(&mut f.app);
+        finish_search(&mut f.app);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.pane().search().is_none());
+        assert_eq!(names(&f.app), FOLDER);
+    }
+
+    #[test]
+    fn a_search_from_recents_looks_below_home_and_escape_returns_to_them() {
+        let mut f = searchable();
+        *f.system.recents.borrow_mut() = vec![f.home.join("notes.txt")];
+        open_place(&mut f.app, "Recents");
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        assert_eq!(
+            names(&f.app),
+            ["notes.txt"],
+            "as it was, until something is typed"
+        );
+        search_for(&mut f.app, "trip");
+        assert_eq!(names(&f.app), TRIPS);
+        assert!(!f.app.pane().recents());
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.pane().recents());
+        assert_eq!(names(&f.app), ["notes.txt"]);
+    }
+
+    #[test]
+    fn with_no_field_open_the_keys_do_what_they_did() {
+        let mut f = searchable();
+        // A search and a path field, come and gone.
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        search_for(&mut f.app, "trip");
+        press(&mut f.app, &[KeyCode::Esc]);
+        open_path_field(&mut f.app);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.pane().is_folder());
+
+        press(&mut f.app, &[KeyCode::Char('s')]);
+        assert_eq!(f.app.sort, SortMode::Kind);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.app.message, None);
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        assert!(f.app.help_visible);
+        press(&mut f.app, &[KeyCode::Esc, KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        press(&mut f.app, &[KeyCode::Backspace]);
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(selected_name(&f.app), Some("Pictures"));
+        // Tab moves between the panes again, and L alone is only a letter.
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Char('l')]);
+        assert_eq!(f.app.focus, Focus::Details);
+        assert!(f.app.field.is_none());
+        press(&mut f.app, &[KeyCode::Char('q')]);
+        assert!(f.app.should_quit);
     }
 }

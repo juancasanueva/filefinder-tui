@@ -6,7 +6,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::{icon_style, pad, row_style, scroll};
+use super::{empty_text, fit, icon_style, pad, row_style, scroll};
 use crate::app::App;
 use crate::icons::Icon;
 use crate::model::Entry;
@@ -50,8 +50,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
                 draw_column(frame, inner, &above.entries, offset, above.on_path, lit);
             }
             None if pane.entries.is_empty() => {
-                let text = vec![Line::default(), Line::from("  No items")];
-                frame.render_widget(Paragraph::new(text).style(theme::dim()), inner);
+                // The pane's own column is the last one: there is room to
+                // its right for what it has to say.
+                let room = Rect {
+                    width: area.right().saturating_sub(inner.x),
+                    ..inner
+                };
+                let said = fit(&format!("  {}", empty_text(pane)), room.width as usize);
+                let text = vec![Line::default(), Line::from(said)];
+                frame.render_widget(Paragraph::new(text).style(theme::dim()), room);
             }
             None => {
                 let lit = row_style(true, focused);

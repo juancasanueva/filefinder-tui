@@ -97,7 +97,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
     let date_style = app.date_style;
     let pane = &mut app.panes[app.active];
     if pane.entries.is_empty() {
-        list::empty(frame, area);
+        list::empty(frame, area, pane);
         return;
     }
     pane.offset = scroll(pane.offset, pane.cursor / columns, rows);
