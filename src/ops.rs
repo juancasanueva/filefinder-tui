@@ -337,7 +337,7 @@ impl Step {
 
     fn undo(&mut self, trash_dir: &Path) -> Result<(), Error> {
         match self {
-            Step::Moved { from, to } | Step::Trashed { from, to } => put(to, from),
+            Step::Moved { from, to } | Step::Trashed { from, to } => put(to, from, trash_dir),
             Step::Created { at, parked } => {
                 *parked = Some(trash_item(at, trash_dir, &rename_new, &volume_trash)?);
                 Ok(())
@@ -347,14 +347,14 @@ impl Step {
 
     fn redo(&mut self, trash_dir: &Path) -> Result<(), Error> {
         match self {
-            Step::Moved { from, to } => put(from, to),
+            Step::Moved { from, to } => put(from, to, trash_dir),
             Step::Trashed { from, to } => {
                 *to = trash_item(from, trash_dir, &rename_new, &volume_trash)?;
                 Ok(())
             }
             Step::Created { at, parked } => {
                 if let Some(waiting) = parked.as_deref() {
-                    put(waiting, at)?;
+                    put(waiting, at, trash_dir)?;
                 }
                 *parked = None;
                 Ok(())
@@ -364,22 +364,39 @@ impl Step {
 }
 
 /// Moves something to an exact place, which has to be free.
-fn put(from: &Path, to: &Path) -> Result<(), Error> {
+fn put(from: &Path, to: &Path, trash_dir: &Path) -> Result<(), Error> {
+    put_with(from, to, trash_dir, &rename_new)
+}
+
+/// When it fails across volumes with part of the item already copied, that
+/// part is taken away again, so that nothing is left behind that no undo
+/// knows about. The item itself is whole where it was: it is only removed
+/// there once all of it has arrived.
+fn put_with(from: &Path, to: &Path, trash_dir: &Path, rename: Rename) -> Result<(), Error> {
     let name = shown(to);
-    match move_new(from, to, &Never, &rename_new) {
+    match move_new(from, to, &Never, rename) {
         Ok(Landed::Moved) => Ok(()),
         Ok(Landed::Copied) => Err(Error(format!(
             "Copied {name}, but couldn't remove the original."
         ))),
         Err(Unfinished { why, left }) => Err(Error(match why {
             Halt::Taken => format!("{name} already exists in {}.", folder_name(to)),
-            Halt::Failed(error) if left => {
+            // The part that arrived is this move's own: to the trash with it,
+            // or removed when no trash takes it.
+            Halt::Failed(error) if left && !clear_away(to, trash_dir, rename) => {
                 format!("Moved only part of {name}: {}", why_failed(&error))
             }
             Halt::Failed(error) => format!("Couldn't move {name}: {}", why_failed(&error)),
             Halt::Cancelled => format!("Couldn't move {name}."),
         })),
     }
+}
+
+/// Takes away the part of an item that a failed move left at `part`: into the
+/// trash, or, when no trash takes it, removed. It is a copy this move made
+/// itself a moment ago, of an item that is still whole. True once it is gone.
+fn clear_away(part: &Path, trash_dir: &Path, rename: Rename) -> bool {
+    trash_item(part, trash_dir, rename, &volume_trash).is_ok() || remove(part).is_ok()
 }
 
 /// What one item's turn left behind and how it ended.
@@ -566,21 +583,76 @@ fn copy_new(src: &Path, dest: &Path, cancel: &dyn Cancel) -> Result<(), Unfinish
 
 /// Copies what a folder holds into the copy of it that was just made.
 fn fill(src: &Path, dest: &Path, meta: &fs::Metadata, cancel: &dyn Cancel) -> Result<(), Halt> {
+    let mut names = Vec::new();
     for child in fs::read_dir(src).map_err(Halt::Failed)? {
-        let child = child.map_err(Halt::Failed)?;
-        let copied = copy_new(&child.path(), &dest.join(child.file_name()), cancel);
-        copied.map_err(|unfinished| match unfinished.why {
-            // Not in a folder that was made a moment ago for this.
-            Halt::Taken => Halt::Failed(io::ErrorKind::AlreadyExists.into()),
-            why => why,
-        })?;
+        names.push(child.map_err(Halt::Failed)?.file_name());
     }
+    copy_children(src, dest, &names, cancel)?;
     // Last, so that a read-only folder could still be filled.
     let _ = fs::set_permissions(dest, meta.permissions());
     if let (Ok(folder), Ok(modified)) = (fs::File::open(dest), meta.modified()) {
         let _ = folder.set_modified(modified);
     }
     Ok(())
+}
+
+/// Copies the named items of `src` into `dest`, a folder this copy made
+/// itself, in the order they are given.
+fn copy_children(
+    src: &Path,
+    dest: &Path,
+    names: &[OsString],
+    cancel: &dyn Cancel,
+) -> Result<(), Halt> {
+    let mut copied: Vec<&OsStr> = Vec::new();
+    for name in names {
+        match copy_new(&src.join(name), &dest.join(name), cancel) {
+            Ok(()) => copied.push(name),
+            Err(Unfinished {
+                why: Halt::Taken, ..
+            }) => {
+                // The folder was made a moment ago for this, so the name can
+                // only have gone to the system's own companion of an item
+                // that was just copied. Anything else is a failure.
+                if !is_companion_made_here(src, dest, name, &copied) {
+                    return Err(Halt::Failed(io::ErrorKind::AlreadyExists.into()));
+                }
+            }
+            Err(unfinished) => return Err(unfinished.why),
+        }
+    }
+    Ok(())
+}
+
+/// How an AppleDouble file starts: the `._name` file in which macOS keeps the
+/// extended attributes of `name` on volumes that have none, like FAT disks.
+const APPLE_DOUBLE_MAGIC: [u8; 4] = [0x00, 0x05, 0x16, 0x07];
+
+/// Whether `._name` is already in `dest` because the system put it there, as
+/// the companion of an item this copy has just made, so that the one in `src`
+/// has nothing left to add. On a FAT disk, copying `one.txt` makes macOS
+/// write `._one.txt` next to the copy by itself.
+///
+/// Only that is let through, and only when both files are such companions.
+/// Where the system adds none, a `._name` file is an ordinary file and is
+/// copied like any other; a file of the user's own that happens to have such
+/// a name is never left out, the copy fails instead.
+fn is_companion_made_here(src: &Path, dest: &Path, name: &OsStr, copied: &[&OsStr]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(item) = name.as_bytes().strip_prefix(b"._") else {
+        return false;
+    };
+    copied.contains(&OsStr::from_bytes(item))
+        && is_apple_double(&src.join(name))
+        && is_apple_double(&dest.join(name))
+}
+
+fn is_apple_double(path: &Path) -> bool {
+    use std::io::Read;
+    let mut start = [0; 4];
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+        && fs::File::open(path).is_ok_and(|mut file| file.read_exact(&mut start).is_ok())
+        && start == APPLE_DOUBLE_MAGIC
 }
 
 type Rename<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
@@ -1400,6 +1472,184 @@ mod tests {
         assert_eq!(w.names("Into/Dir"), ["kept.txt"]);
         assert_eq!(w.read("a.txt"), "new");
         assert_eq!(w.names("Dir"), ["b.txt"]);
+    }
+
+    /// How the `._name` file starts that macOS keeps next to `name` on a volume
+    /// with no extended attributes of its own, like a FAT disk.
+    const APPLE_DOUBLE: &[u8] = b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        ";
+
+    /// Stands in for a folder on a FAT volume: every item that arrives in it
+    /// gets a `._name` companion that this code never asked for, as macOS
+    /// gives it there. It rides on the cancel check, which runs before each
+    /// item is copied, so the companion of one item is there before the next.
+    struct Fat(PathBuf);
+
+    impl Cancel for Fat {
+        fn cancelled(&self) -> bool {
+            for item in fs::read_dir(&self.0).into_iter().flatten().flatten() {
+                let name = item.file_name();
+                let mut companion = OsString::from("._");
+                companion.push(&name);
+                let companion = self.0.join(companion);
+                if !name.as_encoded_bytes().starts_with(b"._") && !exists(&companion) {
+                    fs::write(companion, APPLE_DOUBLE).unwrap();
+                }
+            }
+            false
+        }
+    }
+
+    fn os(names: &[&str]) -> Vec<OsString> {
+        names.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_folder_copies_whole_where_the_system_keeps_companion_files() {
+        let w = world();
+        w.file("Album/one.txt", "first");
+        w.file("Album/two.txt", "second");
+        w.folder("Album/Disc");
+        for companion in ["._one.txt", "._two.txt", "._Disc"] {
+            fs::write(w.path("Album").join(companion), APPLE_DOUBLE).unwrap();
+        }
+        // Whichever of an item and its companion the folder lists first.
+        let orders = [
+            (
+                "Item first",
+                [
+                    "one.txt",
+                    "._one.txt",
+                    "Disc",
+                    "._Disc",
+                    "two.txt",
+                    "._two.txt",
+                ],
+            ),
+            (
+                "Companion first",
+                [
+                    "._one.txt",
+                    "one.txt",
+                    "._Disc",
+                    "Disc",
+                    "._two.txt",
+                    "two.txt",
+                ],
+            ),
+        ];
+        for (to, order) in orders {
+            let dest = w.folder(to);
+            let copied = copy_children(&w.path("Album"), &dest, &os(&order), &Fat(dest.clone()));
+            assert!(copied.is_ok(), "{to}");
+            assert_eq!(
+                w.names(to),
+                [
+                    "._Disc",
+                    "._one.txt",
+                    "._two.txt",
+                    "Disc",
+                    "one.txt",
+                    "two.txt"
+                ]
+            );
+            assert_eq!(w.read(&format!("{to}/one.txt")), "first");
+            assert_eq!(w.read(&format!("{to}/two.txt")), "second");
+        }
+
+        // The same through a whole command, in the order the folder really lists.
+        let report = duplicate(&[w.path("Album")], &Fat(w.path("Album (copy)")));
+        assert_eq!((report.done, said(&report)), (1, None));
+        assert_eq!(w.names("Album (copy)"), w.names("Album"));
+        assert_eq!(w.read("Album (copy)/one.txt"), "first");
+        assert_eq!(w.read("Album (copy)/two.txt"), "second");
+        assert_eq!(w.names("Album").len(), 6, "the original is as it was");
+    }
+
+    #[test]
+    fn a_dot_underscore_file_is_copied_like_any_other_where_the_system_adds_none() {
+        let w = world();
+        w.file("Box/x.txt", "x");
+        w.file("Box/._x.txt", "my own notes");
+        w.file("Box/._alone", "no item of that name");
+        fs::write(w.path("Box/._y"), APPLE_DOUBLE).unwrap();
+        w.file("Box/y", "y");
+        let into = w.folder("Into");
+        let report = copy_into(&[w.path("Box")], &into, &go());
+        assert_eq!((report.done, said(&report)), (1, None));
+        assert_eq!(
+            w.names("Into/Box"),
+            ["._alone", "._x.txt", "._y", "x.txt", "y"]
+        );
+        assert_eq!(w.read("Into/Box/._x.txt"), "my own notes");
+        assert_eq!(w.read("Into/Box/._alone"), "no item of that name");
+        assert_eq!(fs::read(w.path("Into/Box/._y")).unwrap(), APPLE_DOUBLE);
+    }
+
+    #[test]
+    fn a_file_of_the_users_own_is_never_given_up_for_a_companion() {
+        let w = world();
+        w.file("Box/x.txt", "x");
+        w.file("Box/._x.txt", "my own notes");
+        // Where the system keeps companions, the name `._x.txt` is the
+        // system's: the user's file of that name can't go there, and the copy
+        // says so instead of leaving it out.
+        let dest = w.folder("Listed");
+        let names = os(&["x.txt", "._x.txt"]);
+        let copied = copy_children(&w.path("Box"), &dest, &names, &Fat(dest.clone()));
+        assert!(copied.is_err());
+        assert_eq!(fs::read(dest.join("._x.txt")).unwrap(), APPLE_DOUBLE);
+
+        // As a move to another volume: either all of it arrives, or the
+        // original stays whole and the part that arrived is on record.
+        let usb = w.folder("USB");
+        let arrived = usb.join("Box");
+        let report = move_with(
+            &[w.path("Box")],
+            &usb,
+            &Fat(arrived.clone()),
+            &crossing(usb.clone()),
+        );
+        if report.error.is_none() {
+            assert_eq!(w.read("USB/Box/._x.txt"), "my own notes");
+            assert_eq!(w.read("USB/Box/x.txt"), "x");
+        } else {
+            assert_eq!(w.names("Box"), ["._x.txt", "x.txt"]);
+            assert_eq!(w.read("Box/._x.txt"), "my own notes");
+            assert_eq!(report.change.steps, [created(arrived)]);
+        }
+    }
+
+    #[test]
+    fn a_copy_that_fails_halfway_leaves_nothing_that_is_not_on_record() {
+        let w = world();
+        w.file("Dir/a.txt", "a");
+        let locked = w.file("Dir/b.txt", "b");
+        fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+        let into = w.folder("Into");
+        let report = copy_into(&[w.path("Dir")], &into, &go());
+        assert_eq!(said(&report).as_deref(), Some("Couldn't copy Dir."));
+        assert_eq!(report.change.steps, [created(into.join("Dir"))]);
+        assert!(!w.has("Into/Dir/b.txt"), "no half file");
+        let mut history = History::default();
+        history.record(report.change);
+        history.undo(&w.trash).unwrap().unwrap();
+        assert!(w.names("Into").is_empty(), "undo takes the part away");
+        assert!(w.has(".Trash/Dir"), "to the trash");
+
+        // The same failure while moving back across volumes, as undo and redo
+        // do: the part that arrived is taken away again, and the item stays
+        // whole where it was.
+        let usb = w.folder("USB");
+        fs::rename(w.path("Dir"), usb.join("Dir")).unwrap();
+        let back = w.path("Dir");
+        let put = put_with(&usb.join("Dir"), &back, &w.trash, &crossing(usb.clone()));
+        fs::set_permissions(usb.join("Dir/b.txt"), Permissions::from_mode(0o644)).unwrap();
+        assert!(put.is_err());
+        assert!(!exists(&back), "no part of it is left behind");
+        assert_eq!(w.names("USB/Dir"), ["a.txt", "b.txt"]);
+        assert_eq!(w.read("USB/Dir/b.txt"), "b");
+        // Taken away to the trash, next to the one from before.
+        assert_eq!(w.names(".Trash"), ["Dir", "Dir (copy)"]);
     }
 
     #[test]

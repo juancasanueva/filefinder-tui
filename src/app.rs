@@ -338,6 +338,10 @@ pub struct App {
     pub sidebar: Vec<Section>,
     pub sidebar_cursor: usize,
     pub help_visible: bool,
+    /// How many lines the shortcuts are scrolled down; drawing keeps it in range.
+    pub help_scroll: usize,
+    /// Lines of shortcuts shown last time, for Page Up and Page Down.
+    pub help_rows: usize,
     pub dialog: Option<Dialog>,
     /// The field in the top bar that has the keyboard.
     pub field: Option<Field>,
@@ -388,6 +392,8 @@ impl App {
             details_visible: true,
             sidebar_cursor: 0,
             help_visible: false,
+            help_scroll: 0,
+            help_rows: 1,
             dialog: None,
             field: None,
             message: None,
@@ -504,8 +510,16 @@ impl App {
         // what a search under way was asked to find again.
         self.pane_mut().want(Vec::new());
         if self.help_visible {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.help_visible = false;
+            // The shortcuts keep every key: these scroll or close them, and
+            // no other reaches the files underneath.
+            let page = self.help_rows.max(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => self.help_visible = false,
+                KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
+                KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(page),
+                _ => {}
             }
             return;
         }
@@ -527,7 +541,10 @@ impl App {
         let ctrl = !alt && key.modifiers.contains(KeyModifiers::CONTROL);
         let plain = !alt && !ctrl;
         match key.code {
-            KeyCode::Char('?') => self.help_visible = true,
+            KeyCode::Char('?') => {
+                self.help_visible = true;
+                self.help_scroll = 0;
+            }
             KeyCode::Char('q' | 'Q') if plain => self.quit(),
             KeyCode::Char('/') if plain => self.search(),
             KeyCode::Char('l') if ctrl => self.ask_path(),

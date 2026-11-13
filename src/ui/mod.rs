@@ -71,7 +71,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.help_visible {
-        help::draw(frame, area);
+        help::draw(frame, app, area);
     }
     if let Some(dialog) = &app.dialog {
         dialog::draw(frame, dialog, area);

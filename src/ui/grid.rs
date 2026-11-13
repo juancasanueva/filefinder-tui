@@ -261,6 +261,8 @@ mod tests {
     #[test]
     fn each_tile_shows_the_name_centered_over_its_size_and_date() {
         let mut f = fixture();
+        // A 24-hour time is never wider than five cells, so the line fits at any hour.
+        f.app.date_style = crate::format::DateStyle::DayFirst;
         f.app.handle_key(ctrl(KeyCode::Char('1')));
         let buffer = buffer(&mut f.app, 120, 24);
         let lines = screen(&mut f.app, 120, 24);
