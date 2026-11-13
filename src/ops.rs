@@ -207,7 +207,7 @@ pub fn rename(item: &Path, name: &str) -> Result<Option<Change>, Error> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             Err(Error(format!("{name} already exists here.")))
         }
-        Err(_) => Err(Error(format!("Couldn't rename {old}."))),
+        Err(error) => Err(Error(format!("Couldn't rename {old}{}", because(&error)))),
     }
 }
 
@@ -219,7 +219,11 @@ pub fn new_folder(folder: &Path, name: &str) -> Result<Option<Change>, Error> {
     }
     check_name(name)?;
     let at = folder.join(name);
-    match fs::create_dir(&at) {
+    let made = match clash(&at, None) {
+        Some(error) => Err(error),
+        None => fs::create_dir(&at),
+    };
+    match made {
         Ok(()) => Ok(Some(Change {
             kind: Kind::NewFolder,
             steps: vec![Step::Created { at, parked: None }],
@@ -227,7 +231,7 @@ pub fn new_folder(folder: &Path, name: &str) -> Result<Option<Change>, Error> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             Err(Error(format!("{name} already exists here.")))
         }
-        Err(_) => Err(Error(format!("Couldn't create {name}."))),
+        Err(error) => Err(Error(format!("Couldn't create {name}{}", because(&error)))),
     }
 }
 
@@ -508,12 +512,12 @@ impl Unfinished {
 fn copy_one(item: &Path, folder: &Path, first: usize, cancel: &dyn Cancel) -> Turn {
     let name = shown(item);
     let is_link = fs::symlink_metadata(item).is_ok_and(|meta| meta.is_symlink());
-    let failed = || {
+    let failed = |because: &str| {
         let what = if is_link { "the link " } else { "" };
-        Turn::failed(format!("Couldn't copy {what}{name}."))
+        Turn::failed(format!("Couldn't copy {what}{name}{because}"))
     };
     let Some(file_name) = item.file_name() else {
-        return failed();
+        return failed(".");
     };
     if inside(folder, item) {
         return Turn::failed(format!("Can't put {name} inside itself."));
@@ -530,14 +534,14 @@ fn copy_one(item: &Path, folder: &Path, first: usize, cancel: &dyn Cancel) -> Tu
                 // part of a folder that got across, which stays where it is.
                 let step = left.then(|| created(dest));
                 let end = match why {
-                    Halt::Failed(_) => failed().end,
+                    Halt::Failed(error) => failed(&because(&error)).end,
                     _ => End::Stopped,
                 };
                 return Turn { step, end };
             }
         }
     }
-    failed()
+    failed(".")
 }
 
 fn created(at: PathBuf) -> Step {
@@ -553,6 +557,9 @@ fn copy_new(src: &Path, dest: &Path, cancel: &dyn Cancel) -> Result<(), Unfinish
     }
     let failed = |error| Unfinished::untouched(Halt::Failed(error));
     let meta = fs::symlink_metadata(src).map_err(failed)?;
+    if let Some(error) = clash(dest, Some(src)) {
+        return Err(failed(error));
+    }
     let kind = meta.file_type();
     if kind.is_symlink() {
         let target = fs::read_link(src).map_err(failed)?;
@@ -615,7 +622,11 @@ fn copy_children(
                 // only have gone to the system's own companion of an item
                 // that was just copied. Anything else is a failure.
                 if !is_companion_made_here(src, dest, name, &copied) {
-                    return Err(Halt::Failed(io::ErrorKind::AlreadyExists.into()));
+                    // The user's own `._name`, where the system has put its.
+                    let clash = SideBySide::of(&dest.join(name)).map(io::Error::other);
+                    return Err(Halt::Failed(
+                        clash.unwrap_or_else(|| io::ErrorKind::AlreadyExists.into()),
+                    ));
                 }
             }
             Err(unfinished) => return Err(unfinished.why),
@@ -653,6 +664,170 @@ fn is_apple_double(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
         && fs::File::open(path).is_ok_and(|mut file| file.read_exact(&mut start).is_ok())
         && start == APPLE_DOUBLE_MAGIC
+}
+
+/// Why a name can't be taken on a disk that keeps companion files: the item
+/// that can't be next to a file of the user's named `._` and its name.
+#[derive(Debug)]
+struct SideBySide(String);
+
+impl SideBySide {
+    /// The clash a `._name` file is part of; none for any other name.
+    fn of(companion: &Path) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let item = companion.file_name()?.as_bytes().strip_prefix(b"._")?;
+        (!item.is_empty()).then(|| Self(String::from_utf8_lossy(item).into_owned()))
+    }
+}
+
+impl fmt::Display for SideBySide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let item = &self.0;
+        write!(f, "{item} and ._{item} can't be side by side on this disk")
+    }
+}
+
+impl std::error::Error for SideBySide {}
+
+/// Why nothing may be made at `to`, when making it would let the system write
+/// over a file of the user's.
+///
+/// On a disk with no extended attributes of its own, macOS keeps those of
+/// `name` in a file `._name` next to it, and writes that file whenever `name`
+/// is made or changed, over whatever has the name. So on such a disk an item
+/// and an ordinary file called `._` plus its name are never put side by side,
+/// whichever of the two would come second: that one is refused, and nothing
+/// is written. A `._name` that is such a companion already is the system's,
+/// and no clash; neither is any of this on a disk that stores attributes
+/// itself, where `._name` is a name like any other.
+///
+/// `incoming` is the item about to get the name, when there is one already.
+fn clash(to: &Path, incoming: Option<&Path>) -> Option<io::Error> {
+    let (folder, name) = (to.parent()?, to.file_name()?);
+    let (other, item) = match SideBySide::of(to) {
+        // An ordinary `._name` coming in, next to `name`.
+        Some(item) if !incoming.is_some_and(is_apple_double) => (folder.join(&item.0), item),
+        Some(_) => return None,
+        // `name` coming in, next to an ordinary `._name`.
+        None => {
+            let mut companion = OsString::from("._");
+            companion.push(name);
+            let companion = folder.join(companion);
+            if is_apple_double(&companion) {
+                return None;
+            }
+            let item = SideBySide(name.to_string_lossy().into_owned());
+            (companion, item)
+        }
+    };
+    (exists(&other) && keeps_companions(folder)).then(|| io::Error::other(item))
+}
+
+/// How a failure's sentence ends: with the reason when it is this clash,
+/// which the user can do something about, and a full stop otherwise.
+fn because(error: &io::Error) -> String {
+    if is_clash(error) {
+        format!(": {}", why_failed(error))
+    } else {
+        ".".to_string()
+    }
+}
+
+fn is_clash(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<SideBySide>())
+}
+
+/// Whether the disk a folder is on has no extended attributes of its own, so
+/// that macOS keeps those of `name` in a `._name` file next to it, as on FAT
+/// disks. A disk that doesn't say counts as one that does.
+fn keeps_companions(folder: &Path) -> bool {
+    #[cfg(test)]
+    if tests::is_pretend_fat(folder) {
+        return true;
+    }
+    let asked = has_own_attributes(folder).or_else(|| {
+        // Older systems only answer for the top folder of the disk.
+        has_own_attributes(&mount_point(folder).ok()?)
+    });
+    asked != Some(true)
+}
+
+/// Whether the disk a path is on stores extended attributes itself, when it
+/// says: the capability the system goes by when it decides to keep them in
+/// `._name` files instead.
+#[cfg(target_os = "macos")]
+fn has_own_attributes(path: &Path) -> Option<bool> {
+    use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+    use std::os::unix::ffi::OsStrExt;
+
+    /// `struct attrlist`: which attributes are asked for.
+    #[repr(C)]
+    struct Asked {
+        bitmapcount: u16,
+        reserved: u16,
+        commonattr: u32,
+        volattr: u32,
+        dirattr: u32,
+        fileattr: u32,
+        forkattr: u32,
+    }
+    /// The answer: its length, then `vol_capabilities_attr_t`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Answer {
+        length: u32,
+        capabilities: [u32; 4],
+        valid: [u32; 4],
+    }
+    unsafe extern "C" {
+        fn getattrlist(
+            path: *const c_char,
+            asked: *mut c_void,
+            answer: *mut c_void,
+            size: usize,
+            options: c_uint,
+        ) -> c_int;
+    }
+    const ATTR_BIT_MAP_COUNT: u16 = 5;
+    const ATTR_VOL_INFO: u32 = 0x8000_0000;
+    const ATTR_VOL_CAPABILITIES: u32 = 0x0002_0000;
+    const VOL_CAPABILITIES_INTERFACES: usize = 1;
+    const VOL_CAP_INT_EXTENDED_ATTR: u32 = 0x0000_4000;
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut asked = Asked {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: ATTR_VOL_INFO | ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut answer = Answer::default();
+    // SAFETY: the path is a NUL-terminated string, and both structures are
+    // laid out as the call expects and live until it returns; it writes at
+    // most `size` bytes into the answer.
+    let answered = unsafe {
+        getattrlist(
+            path.as_ptr(),
+            (&raw mut asked).cast(),
+            (&raw mut answer).cast(),
+            size_of::<Answer>(),
+            0,
+        )
+    } == 0;
+    let known =
+        answered && answer.valid[VOL_CAPABILITIES_INTERFACES] & VOL_CAP_INT_EXTENDED_ATTR != 0;
+    known.then(|| answer.capabilities[VOL_CAPABILITIES_INTERFACES] & VOL_CAP_INT_EXTENDED_ATTR != 0)
+}
+
+/// Only macOS keeps such files.
+#[cfg(not(target_os = "macos"))]
+fn has_own_attributes(_path: &Path) -> Option<bool> {
+    Some(true)
 }
 
 type Rename<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
@@ -870,6 +1045,9 @@ fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
         // `to` is the item itself under the name it is getting.
         return fs::rename(from, to);
     }
+    if let Some(error) = clash(to, Some(from)) {
+        return Err(error);
+    }
     match rename_exclusive(from, to) {
         Err(error) if error.kind() == io::ErrorKind::Unsupported => rename_held(from, to),
         done => done,
@@ -1002,6 +1180,10 @@ fn folder_name(path: &Path) -> String {
 
 /// Why something failed, as a sentence.
 fn why_failed(error: &io::Error) -> String {
+    if is_clash(error) {
+        // It starts with a file's name, which keeps its small letters.
+        return format!("{error}.");
+    }
     match error.kind() {
         io::ErrorKind::PermissionDenied => "Permission was refused.".to_string(),
         io::ErrorKind::NotFound => "It isn't there any more.".to_string(),
@@ -1478,23 +1660,72 @@ mod tests {
     /// with no extended attributes of its own, like a FAT disk.
     const APPLE_DOUBLE: &[u8] = b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        ";
 
-    /// Stands in for a folder on a FAT volume: every item that arrives in it
-    /// gets a `._name` companion that this code never asked for, as macOS
-    /// gives it there. It rides on the cancel check, which runs before each
-    /// item is copied, so the companion of one item is there before the next.
-    struct Fat(PathBuf);
+    thread_local! {
+        /// The folders this test pretends are disks that keep companion files.
+        static PRETEND_FAT: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    impl Cancel for Fat {
-        fn cancelled(&self) -> bool {
-            for item in fs::read_dir(&self.0).into_iter().flatten().flatten() {
-                let name = item.file_name();
-                let mut companion = OsString::from("._");
-                companion.push(&name);
-                let companion = self.0.join(companion);
-                if !name.as_encoded_bytes().starts_with(b"._") && !exists(&companion) {
+    /// Whether a folder is on one of the pretend FAT disks of the test under way.
+    pub(super) fn is_pretend_fat(folder: &Path) -> bool {
+        PRETEND_FAT.with(|disks| disks.borrow().iter().any(|disk| folder.starts_with(disk)))
+    }
+
+    /// Stands in for a FAT volume mounted at a folder. Every item that arrives
+    /// anywhere on it gets a `._name` companion that this code never asked
+    /// for, written over whatever has that name unless it is a companion
+    /// already: what macOS was seen to do there. It rides on the cancel check,
+    /// which runs before each item is copied, so the companion of one item is
+    /// there before the next; `catch_up` does the same after the last one.
+    struct Fat {
+        root: PathBuf,
+        seen: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl Fat {
+        /// What is on the disk already keeps the companion it has, or none.
+        fn at(root: PathBuf) -> Self {
+            PRETEND_FAT.with(|disks| disks.borrow_mut().push(root.clone()));
+            let fat = Self {
+                seen: Default::default(),
+                root,
+            };
+            fat.arrivals(&fat.root);
+            fat
+        }
+
+        /// The items in a folder and below that weren't there the last time.
+        fn arrivals(&self, folder: &Path) -> Vec<PathBuf> {
+            let mut arrived = Vec::new();
+            for item in fs::read_dir(folder).into_iter().flatten().flatten() {
+                let path = item.path();
+                let is_companion = item.file_name().as_encoded_bytes().starts_with(b"._");
+                if !is_companion && !self.seen.borrow().contains(&path) {
+                    self.seen.borrow_mut().push(path.clone());
+                    arrived.push(path.clone());
+                }
+                if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                    arrived.extend(self.arrivals(&path));
+                }
+            }
+            arrived
+        }
+
+        /// The system gets round to the items that arrived since the last time.
+        fn catch_up(&self) {
+            for item in self.arrivals(&self.root) {
+                let mut name = OsString::from("._");
+                name.push(item.file_name().unwrap());
+                let companion = item.with_file_name(name);
+                if !is_apple_double(&companion) {
                     fs::write(companion, APPLE_DOUBLE).unwrap();
                 }
             }
+        }
+    }
+
+    impl Cancel for Fat {
+        fn cancelled(&self) -> bool {
+            self.catch_up();
             false
         }
     }
@@ -1539,7 +1770,8 @@ mod tests {
         ];
         for (to, order) in orders {
             let dest = w.folder(to);
-            let copied = copy_children(&w.path("Album"), &dest, &os(&order), &Fat(dest.clone()));
+            let copied =
+                copy_children(&w.path("Album"), &dest, &os(&order), &Fat::at(dest.clone()));
             assert!(copied.is_ok(), "{to}");
             assert_eq!(
                 w.names(to),
@@ -1557,7 +1789,7 @@ mod tests {
         }
 
         // The same through a whole command, in the order the folder really lists.
-        let report = duplicate(&[w.path("Album")], &Fat(w.path("Album (copy)")));
+        let report = duplicate(&[w.path("Album")], &Fat::at(w.path("Album (copy)")));
         assert_eq!((report.done, said(&report)), (1, None));
         assert_eq!(w.names("Album (copy)"), w.names("Album"));
         assert_eq!(w.read("Album (copy)/one.txt"), "first");
@@ -1585,38 +1817,165 @@ mod tests {
         assert_eq!(fs::read(w.path("Into/Box/._y")).unwrap(), APPLE_DOUBLE);
     }
 
+    /// What the app says when a file of the user's is where the system
+    /// would write a companion.
+    fn side_by_side(does: &str, item: &str, name: &str) -> Option<String> {
+        Some(format!(
+            "{does} {item}: {name} and ._{name} can't be side by side on this disk."
+        ))
+    }
+
     #[test]
     fn a_file_of_the_users_own_is_never_given_up_for_a_companion() {
         let w = world();
         w.file("Box/x.txt", "x");
         w.file("Box/._x.txt", "my own notes");
-        // Where the system keeps companions, the name `._x.txt` is the
-        // system's: the user's file of that name can't go there, and the copy
-        // says so instead of leaving it out.
-        let dest = w.folder("Listed");
-        let names = os(&["x.txt", "._x.txt"]);
-        let copied = copy_children(&w.path("Box"), &dest, &names, &Fat(dest.clone()));
-        assert!(copied.is_err());
-        assert_eq!(fs::read(dest.join("._x.txt")).unwrap(), APPLE_DOUBLE);
-
-        // As a move to another volume: either all of it arrives, or the
-        // original stays whole and the part that arrived is on record.
-        let usb = w.folder("USB");
-        let arrived = usb.join("Box");
-        let report = move_with(
-            &[w.path("Box")],
-            &usb,
-            &Fat(arrived.clone()),
-            &crossing(usb.clone()),
-        );
-        if report.error.is_none() {
-            assert_eq!(w.read("USB/Box/._x.txt"), "my own notes");
-            assert_eq!(w.read("USB/Box/x.txt"), "x");
-        } else {
-            assert_eq!(w.names("Box"), ["._x.txt", "x.txt"]);
-            assert_eq!(w.read("Box/._x.txt"), "my own notes");
-            assert_eq!(report.change.steps, [created(arrived)]);
+        let notes = |path: PathBuf| fs::read(path).is_ok_and(|bytes| bytes == b"my own notes");
+        // Where the system keeps companions, `._x.txt` next to `x.txt` is the
+        // system's to write. Whichever of the two the folder lists first, the
+        // copy says so instead of letting the user's file be written over.
+        for (to, order) in [
+            ("Item first", ["x.txt", "._x.txt"]),
+            ("Notes first", ["._x.txt", "x.txt"]),
+        ] {
+            let dest = w.folder(to);
+            let fat = Fat::at(dest.clone());
+            let copied = copy_children(&w.path("Box"), &dest, &os(&order), &fat);
+            fat.catch_up();
+            assert!(copied.is_err(), "{to}");
+            // What did arrive is whole: the notes, or `x.txt` with its companion.
+            let arrived = w.names(to);
+            assert!(
+                (arrived == ["._x.txt"] && notes(dest.join("._x.txt")))
+                    || (arrived == ["._x.txt", "x.txt"] && is_apple_double(&dest.join("._x.txt"))),
+                "{to}: {arrived:?}"
+            );
         }
+
+        // A whole copy, in the order the folder really lists: refused out
+        // loud, the original untouched, the part that arrived on record.
+        let usb = w.folder("USB");
+        let fat = Fat::at(usb.clone());
+        let report = copy_into(&[w.path("Box")], &usb, &fat);
+        fat.catch_up();
+        assert_eq!(said(&report), side_by_side("Couldn't copy", "Box", "x.txt"));
+        assert_eq!(report.done, 0);
+        assert_eq!(report.change.steps, [created(usb.join("Box"))]);
+        assert!(notes(w.path("Box/._x.txt")));
+        assert_eq!(w.read("Box/x.txt"), "x");
+
+        // A move: the original stays whole where it was.
+        w.file("Other/Box/x.txt", "x");
+        w.file("Other/Box/._x.txt", "my own notes");
+        let report = move_with(&[w.path("Other/Box")], &usb, &fat, &crossing(usb.clone()));
+        fat.catch_up();
+        assert_eq!(
+            said(&report),
+            side_by_side("Moved only part of", "Box", "x.txt")
+        );
+        assert_eq!(report.change.steps, [created(usb.join("Box (copy)"))]);
+        assert_eq!(w.names("Other/Box"), ["._x.txt", "x.txt"]);
+        assert!(notes(w.path("Other/Box/._x.txt")));
+        assert_eq!(w.read("Other/Box/x.txt"), "x");
+    }
+
+    #[test]
+    fn nothing_is_put_where_the_system_would_write_over_a_file_of_the_users() {
+        let w = world();
+        let usb = w.folder("USB");
+        w.file("USB/Sub/._y.txt", "notes about y");
+        w.file("USB/Sub/._z.txt", "notes about z");
+        w.file("USB/Sub/._Plans", "notes about plans");
+        w.file("USB/Sub/._b.txt", "notes about b");
+        w.file("USB/Sub/q.txt", "q");
+        w.file("USB/z.txt", "z");
+        w.file("USB/Sub/a.txt", "a");
+        let y = w.file("y.txt", "y");
+        let own = w.file("._q.txt", "notes about q");
+        let sub = usb.join("Sub");
+        let fat = Fat::at(usb.clone());
+
+        // Copied in next to the user's `._y.txt`.
+        let copied = copy_into(&[y], &sub, &fat);
+        assert_eq!(
+            said(&copied),
+            side_by_side("Couldn't copy", "y.txt", "y.txt")
+        );
+        // Moved in from the same disk, which is a rename.
+        let moved = move_with(&[usb.join("z.txt")], &sub, &fat, &crossing(usb.clone()));
+        assert_eq!(
+            said(&moved),
+            side_by_side("Couldn't move", "z.txt", "z.txt")
+        );
+        // A folder made there, and an item renamed to the name.
+        let made = new_folder(&sub, "Plans").unwrap_err().to_string();
+        assert_eq!(
+            Some(made),
+            side_by_side("Couldn't create", "Plans", "Plans")
+        );
+        let renamed = rename(&sub.join("a.txt"), "b.txt").unwrap_err().to_string();
+        assert_eq!(
+            Some(renamed),
+            side_by_side("Couldn't rename", "a.txt", "b.txt")
+        );
+        // The other way round: the user's `._q.txt` brought in next to `q.txt`.
+        let brought = copy_into(&[own], &sub, &fat);
+        assert_eq!(
+            said(&brought),
+            side_by_side("Couldn't copy", "._q.txt", "q.txt")
+        );
+
+        fat.catch_up();
+        for report in [copied, moved, brought] {
+            assert_eq!(report.change.steps, [], "nothing was made");
+        }
+        assert_eq!(
+            w.names("USB/Sub"),
+            ["._Plans", "._b.txt", "._y.txt", "._z.txt", "a.txt", "q.txt"]
+        );
+        for (file, text) in [
+            ("._y.txt", "y"),
+            ("._z.txt", "z"),
+            ("._Plans", "plans"),
+            ("._b.txt", "b"),
+        ] {
+            assert_eq!(
+                w.read(&format!("USB/Sub/{file}")),
+                format!("notes about {text}")
+            );
+        }
+        assert_eq!(w.read("USB/z.txt"), "z", "what was to move is where it was");
+        assert_eq!(w.read("._q.txt"), "notes about q");
+        assert_eq!(w.read("y.txt"), "y");
+    }
+
+    #[test]
+    fn on_a_disk_with_attributes_of_its_own_such_names_sit_side_by_side() {
+        let w = world();
+        w.file("Sub/._y.txt", "notes about y");
+        w.file("Sub/._Plans", "notes about plans");
+        w.file("Sub/q.txt", "q");
+        let items = [w.file("y.txt", "y"), w.file("._q.txt", "notes about q")];
+        let report = copy_into(&items, &w.path("Sub"), &go());
+        assert_eq!((report.done, said(&report)), (2, None));
+        new_folder(&w.path("Sub"), "Plans").unwrap().unwrap();
+        rename(&w.path("Sub/y.txt"), "Plans.txt").unwrap().unwrap();
+        assert_eq!(
+            w.names("Sub"),
+            [
+                "._Plans",
+                "._q.txt",
+                "._y.txt",
+                "Plans",
+                "Plans.txt",
+                "q.txt"
+            ]
+        );
+        assert_eq!(w.read("Sub/._y.txt"), "notes about y");
+        assert_eq!(w.read("Sub/._Plans"), "notes about plans");
+        assert_eq!(w.read("Sub/._q.txt"), "notes about q");
+        // The temp folder is on such a disk, and the question has an answer.
+        assert!(!keeps_companions(&w.root));
     }
 
     #[test]
