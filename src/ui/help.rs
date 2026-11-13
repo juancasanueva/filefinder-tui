@@ -20,6 +20,20 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Backspace", "Go to the parent folder"),
     ("Alt+← / Alt+→", "Back / forward"),
     ("Alt+Home", "Go home"),
+    ("Ctrl+C / X / V", "Copy, cut, paste"),
+    ("Ctrl+Shift+C", "Copy the path as text"),
+    ("F2 / Ctrl+Shift+D", "Rename / duplicate"),
+    ("Ctrl+Shift+N", "New folder"),
+    ("Delete (fn+⌫) / ⌘⌫", "Move to the trash"),
+    ("Shift+Delete", "Delete permanently (asks first)"),
+    (
+        "Ctrl+Z / Ctrl+Shift+Z",
+        "Undo / redo the last change to files (or Ctrl+Y)",
+    ),
+    (
+        "Escape",
+        "Stop the file work under way, or dismiss what went wrong",
+    ),
     ("Ctrl+1 / 2 / 3", "Switch the view: grid, list, columns"),
     (
         "Ctrl+= / Ctrl+- / Ctrl+0",
@@ -36,7 +50,8 @@ const SHORTCUTS: &[(&str, &str)] = &[
 const KEY_WIDTH: usize = 26;
 
 pub fn draw(frame: &mut Frame, area: Rect) {
-    let width = 86.min(area.width.saturating_sub(4));
+    // Wide enough for the longest line: 26 cells of keys and 56 of what they do.
+    let width = 90.min(area.width.saturating_sub(4));
     let height = (SHORTCUTS.len() as u16 + 6).min(area.height.saturating_sub(2));
     let overlay = Rect {
         x: area.x + (area.width - width) / 2,

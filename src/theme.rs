@@ -88,3 +88,23 @@ pub fn error() -> Style {
 pub fn notice() -> Style {
     Style::new().fg(FOREGROUND).bg(LIGHTER_BACKGROUND)
 }
+
+/// The band that says what file work is under way.
+pub fn working() -> Style {
+    Style::new().fg(ACCENT).bg(LIGHTER_BACKGROUND)
+}
+
+/// A dialog's panel, like the shortcuts': the darkest background.
+pub fn panel() -> Style {
+    Style::new().fg(FOREGROUND).bg(DARK_BACKGROUND)
+}
+
+/// The text being typed in a dialog.
+pub fn field() -> Style {
+    Style::new().fg(BRIGHT_FOREGROUND).bg(LIGHTER_BACKGROUND)
+}
+
+/// A choice in a dialog: the lit one is what Enter takes.
+pub fn choice(lit: bool) -> Style {
+    if lit { button() } else { notice() }
+}

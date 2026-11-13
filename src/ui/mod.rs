@@ -2,6 +2,7 @@
 
 mod columns;
 mod details;
+mod dialog;
 mod grid;
 mod help;
 mod list;
@@ -29,7 +30,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::new().style(theme::base()), area);
     if let Some(thumbs) = &mut app.thumbs {
-        thumbs.cover(app.help_visible);
+        thumbs.cover(app.help_visible || app.dialog.is_some());
     }
 
     let [top, body] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(area);
@@ -72,12 +73,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.help_visible {
         help::draw(frame, area);
     }
+    if let Some(dialog) = &app.dialog {
+        dialog::draw(frame, dialog, area);
+    }
 }
 
 fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
-    let band = u16::from(app.message.is_some());
-    let [view, message] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(band)]).areas(area);
+    // Under the view: what file work is under way, then what was last said.
+    let [view, working, message] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(u16::from(app.working().is_some())),
+        Constraint::Length(u16::from(app.message.is_some())),
+    ])
+    .areas(area);
     let focused = app.focus == Focus::Files;
     // Lists show one blank row of air on top; the grid counts its own rows.
     app.page_rows = view.height.saturating_sub(1).max(1) as usize;
@@ -87,6 +95,13 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
         ViewMode::Columns => columns::draw(frame, app, view, focused),
     }
 
+    if let Some(label) = app.working() {
+        let text = fit(&format!("  {label}"), working.width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(text)).style(theme::working()),
+            working,
+        );
+    }
     if let Some(note) = &app.message {
         let style = if note.is_error {
             theme::error()
@@ -216,6 +231,14 @@ pub mod testing {
         terminal.backend().buffer().clone()
     }
 
+    /// Draws the app at a size and returns where the terminal's cursor was left.
+    pub fn cursor(app: &mut App, width: u16, height: u16) -> (u16, u16) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let position = terminal.get_cursor_position().unwrap();
+        (position.x, position.y)
+    }
+
     /// Draws the app at a size and returns the screen as lines of text.
     pub fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let buffer = buffer(app, width, height);
@@ -254,7 +277,7 @@ mod tests {
     use super::testing::screen;
     use super::testing::{buffer, find};
     use super::*;
-    use crate::app::testing::{ctrl, fixture, press};
+    use crate::app::testing::{ctrl, finish_work, fixture, press};
     use ratatui::crossterm::event::KeyCode;
 
     #[test]
@@ -319,10 +342,67 @@ mod tests {
             ("Ctrl+I", "Show or hide the details pane"),
             ("Ctrl+H", "Show hidden files"),
             ("Space", "Preview the selected file"),
+            ("Ctrl+C / X / V", "Copy, cut, paste"),
+            ("Ctrl+Shift+C", "Copy the path as text"),
+            ("F2 / Ctrl+Shift+D", "Rename / duplicate"),
+            ("Ctrl+Shift+N", "New folder"),
+            ("Delete (fn+⌫) / ⌘⌫", "Move to the trash"),
+            ("Shift+Delete", "Delete permanently (asks first)"),
+            (
+                "Ctrl+Z / Ctrl+Shift+Z",
+                "Undo / redo the last change to files (or Ctrl+Y)",
+            ),
+            (
+                "Escape",
+                "Stop the file work under way, or dismiss what went wrong",
+            ),
         ] {
             let line = format!("{keys:<26}{does}");
             assert!(all.contains(&line), "{line} is missing from\n{all}");
         }
+    }
+
+    #[test]
+    fn the_band_says_what_file_work_is_under_way_and_then_how_it_went() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::End]);
+        f.app.handle_key(ctrl(KeyCode::Char('c')));
+        press(&mut f.app, &[KeyCode::Home, KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('v')));
+        // Refused meanwhile: said in a row of its own, next to what is going on.
+        press(&mut f.app, &[KeyCode::F(2)]);
+        let during = buffer(&mut f.app, 120, 24);
+        let (x, working) = find(&during, "Copying 1 item…", 24..86).expect("the work");
+        assert_eq!(during[(x, working)].fg, theme::ACCENT);
+        let wait = "Try again once the work under way is done.";
+        let (_, notice) = find(&during, wait, 24..86).expect("the notice");
+        assert_eq!((working, notice), (22, 23), "the two bottom rows");
+
+        finish_work(&mut f.app);
+        let after = buffer(&mut f.app, 120, 24);
+        assert_eq!(find(&after, "Copying", 0..120), None);
+        assert_eq!(
+            find(&after, "Copied 1 item.", 24..86).map(|(_, y)| y),
+            Some(23)
+        );
+    }
+
+    #[test]
+    fn a_picture_that_arrives_under_a_dialog_waits_for_it_to_go() {
+        use crate::app::testing::{pictures, settle};
+        use crate::thumbs::testing::painted;
+        let (mut f, _thumbnailer) = pictures();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::End]);
+        buffer(&mut f.app, 120, 24);
+        press(&mut f.app, &[KeyCode::F(2)]);
+        settle(&mut f.app);
+        // The dialog ends at column 95; the preview goes on to 110.
+        let covered = buffer(&mut f.app, 120, 24);
+        assert!(find(&covered, "Rename", 0..120).is_some());
+        assert!(!painted(&covered[(105, 5)]));
+        press(&mut f.app, &[KeyCode::Esc]);
+        let clear = buffer(&mut f.app, 120, 24);
+        assert!(painted(&clear[(105, 5)]));
     }
 
     #[test]

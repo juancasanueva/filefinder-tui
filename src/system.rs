@@ -1,7 +1,7 @@
 //! The port to everything outside the folder tree: launching apps and previews.
 
 use std::cell::RefCell;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -12,6 +12,9 @@ pub trait System {
     /// Shows a file in a preview window of its own, without waiting for it.
     /// Asked again while that window is still open, closes it instead.
     fn preview(&self, path: &Path) -> io::Result<()>;
+
+    /// Puts text on the system clipboard, for other apps to paste.
+    fn copy_text(&self, text: &str) -> io::Result<()>;
 }
 
 #[derive(Default)]
@@ -33,6 +36,27 @@ impl System for MacSystem {
         // Quick Look, in a panel that lives as long as this process does.
         self.preview
             .toggle(|| quiet(Command::new("qlmanage").arg("-p").arg(path)).spawn())
+    }
+
+    fn copy_text(&self, text: &str) -> io::Result<()> {
+        pipe_into(&mut Command::new("pbcopy"), text)
+    }
+}
+
+/// Runs a command with `text` as its input and waits for it to take it.
+fn pipe_into(command: &mut Command, text: &str) -> io::Result<()> {
+    let mut child = quiet(command).stdin(Stdio::piped()).spawn()?;
+    // The pipe closes as this statement ends, which is what lets the command finish.
+    let fed = match child.stdin.take() {
+        Some(mut pipe) => pipe.write_all(text.as_bytes()),
+        None => Err(io::Error::other("it takes no input")),
+    };
+    let status = child.wait()?;
+    fed?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("it didn't take the text"))
     }
 }
 
@@ -117,6 +141,23 @@ mod tests {
         gone.toggle(open).unwrap();
         assert!(gone.is_open());
         assert_eq!(opened.get(), 3);
+    }
+
+    #[test]
+    fn text_for_the_clipboard_is_piped_into_the_command_that_takes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join("taken.txt");
+        // Stands in for `pbcopy`: keeps what it is given, here in a file.
+        let mut keep = Command::new("sh");
+        keep.arg("-c").arg("cat > \"$0\"").arg(&taken);
+        pipe_into(&mut keep, "/Users/añb/notes.txt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&taken).unwrap(),
+            "/Users/añb/notes.txt"
+        );
+
+        assert!(pipe_into(&mut Command::new("false"), "text").is_err());
+        assert!(pipe_into(&mut Command::new("/nonexistent/pbcopy"), "text").is_err());
     }
 
     #[test]

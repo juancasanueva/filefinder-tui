@@ -3,7 +3,9 @@
 mod app;
 mod format;
 mod icons;
+mod input;
 mod model;
+mod ops;
 mod places;
 mod state;
 mod system;
@@ -46,6 +48,7 @@ fn main() -> io::Result<()> {
     let config = Config {
         state_dir: Some(home.join(".config/filefinder-tui")),
         thumbs: Some(Thumbs::new(picker, Arc::new(thumbnailer))),
+        trash_dir: home.join(".Trash"),
         home,
         start,
         date_style: DateStyle::from_env(),
