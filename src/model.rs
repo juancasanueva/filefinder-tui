@@ -65,12 +65,16 @@ pub struct Entry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// The item's own type and permission bits (`st_mode`); for a link,
+    /// the link's, the way `ls -l` shows it.
+    pub mode: u32,
     items: OnceCell<Option<usize>>,
 }
 
 impl Entry {
     pub fn from_path(path: PathBuf) -> io::Result<Self> {
         let link = fs::symlink_metadata(&path)?;
+        let mode = std::os::unix::fs::MetadataExt::mode(&link);
         let is_symlink = link.file_type().is_symlink();
         // A symlink reads as what it points at; a broken one as itself.
         let meta = if is_symlink {
@@ -87,6 +91,7 @@ impl Entry {
             is_dir: meta.is_dir() && extension(&name).as_deref() != Some("app"),
             size: meta.len(),
             modified: meta.modified().ok(),
+            mode,
             items: OnceCell::new(),
             name,
             path,
@@ -338,6 +343,30 @@ mod tests {
         let entries = list_dir(dir.path(), false, SortMode::Name).unwrap();
         assert!(!entries[0].is_dir);
         assert_eq!(entries[0].kind(), "Application");
+    }
+
+    #[test]
+    fn entries_keep_their_own_permissions_and_type() {
+        use crate::format::permissions;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("private");
+        let file = dir.path().join("notes.txt");
+        fs::create_dir(&folder).unwrap();
+        fs::write(&file, "hi").unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&folder, dir.path().join("shortcut")).unwrap();
+
+        let entry = |name: &str| Entry::from_path(dir.path().join(name)).unwrap();
+        assert_eq!(permissions(entry("private").mode), "drwx------");
+        assert_eq!(permissions(entry("notes.txt").mode), "-rw-r-----");
+        // A link is shown as the link itself, the way `ls -l` shows it,
+        // while it still opens like the folder it points at.
+        let shortcut = entry("shortcut");
+        assert!(permissions(shortcut.mode).starts_with('l'));
+        assert!(shortcut.is_dir);
     }
 
     #[test]

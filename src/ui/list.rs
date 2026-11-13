@@ -1,4 +1,4 @@
-//! The list view: name, size and date, no headings.
+//! The list view: name, permissions, size and date, no headings.
 
 use std::time::SystemTime;
 
@@ -15,6 +15,8 @@ use crate::icons::Icon;
 use crate::model::Entry;
 use crate::theme;
 
+/// `drwx------`
+const MODE_WIDTH: usize = 10;
 const SIZE_WIDTH: usize = 11;
 const DATE_WIDTH: usize = 10;
 
@@ -40,11 +42,16 @@ pub fn draw(
     pane.offset = scroll(pane.offset, pane.cursor, rows);
 
     let width = area.width as usize;
-    // The date steps aside first when it gets narrow, then the size.
+    // When it gets narrow the permissions step aside first, then the date,
+    // then the size.
     let show_size = width >= 44;
     let show_date = width >= 60;
-    let fixed =
-        4 + if show_size { SIZE_WIDTH + 2 } else { 0 } + if show_date { DATE_WIDTH + 2 } else { 0 };
+    let show_mode = width >= 74;
+    let column = |shown: bool, width: usize| if shown { width + 2 } else { 0 };
+    let fixed = 4
+        + column(show_mode, MODE_WIDTH)
+        + column(show_size, SIZE_WIDTH)
+        + column(show_date, DATE_WIDTH);
     let name_width = width.saturating_sub(fixed + 2);
     let now = SystemTime::now();
 
@@ -71,6 +78,12 @@ pub fn draw(
             ),
             Span::styled(pad(&entry.name, name_width), row),
         ];
+        if show_mode {
+            spans.push(Span::styled(
+                pad_left(&format::permissions(entry.mode), MODE_WIDTH + 2),
+                meta,
+            ));
+        }
         if show_size {
             spans.push(Span::styled(
                 pad_left(&size_text(entry), SIZE_WIDTH + 2),
@@ -112,4 +125,55 @@ pub fn empty(frame: &mut Frame, area: Rect, pane: &Pane) {
             .alignment(Alignment::Center),
         middle,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use ratatui::crossterm::event::KeyCode;
+
+    use crate::app::testing::{fixture, press};
+    use crate::ui::testing::screen;
+
+    fn row<'a>(lines: &'a [String], name: &str) -> &'a str {
+        lines
+            .iter()
+            .find(|line| line.contains(name))
+            .unwrap_or_else(|| panic!("no row for {name}"))
+    }
+
+    #[test]
+    fn rows_show_permissions_between_the_name_and_the_size() {
+        let mut f = fixture();
+        let set = |name: &str, mode| {
+            fs::set_permissions(f.home.join(name), fs::Permissions::from_mode(mode)).unwrap()
+        };
+        set("Documents", 0o700);
+        set("notes.txt", 0o640);
+        press(&mut f.app, &[KeyCode::F(5)]);
+
+        // 150 columns leave the list 92 cells: room for every column.
+        let lines = screen(&mut f.app, 150, 20);
+        assert!(row(&lines, "Documents").contains("drwx------"));
+        let notes = row(&lines, "notes.txt");
+        let name = notes.find("notes.txt").unwrap();
+        let mode = notes.find("-rw-r-----").expect("permissions shown");
+        let size = notes.find("5 B").expect("size shown");
+        assert!(name < mode && mode < size, "{notes}");
+    }
+
+    #[test]
+    fn permissions_step_aside_first_when_the_list_is_narrow() {
+        let mut f = fixture();
+        fs::set_permissions(f.home.join("notes.txt"), fs::Permissions::from_mode(0o640)).unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
+
+        // 120 columns leave the list 62 cells: size and date stay, as before.
+        let lines = screen(&mut f.app, 120, 20);
+        let notes = row(&lines, "notes.txt");
+        assert!(!notes.contains("rw-"), "{notes}");
+        assert!(notes.contains("5 B"), "{notes}");
+    }
 }

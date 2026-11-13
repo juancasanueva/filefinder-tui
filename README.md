@@ -4,7 +4,7 @@ A keyboard-first terminal file manager for macOS, written in Rust with [ratatui]
 
 Nothing runs in the background. Folders are read when you open them, and thumbnails are made when a tile needs one.
 
-- **Three views**: a grid with real thumbnails, a list, and Finder-style columns. Ctrl+1/2/3 switches; the choice is remembered.
+- **Three views**: a grid with real thumbnails, a list with permissions (`drwx------`), size and date, and Finder-style columns. Ctrl+1/2/3 switches; the choice is remembered.
 - **Details pane**: a large preview, the kind and size, the modified date, picture dimensions, and the opening lines of text files. Space opens Quick Look.
 - **Sidebar**: every folder in your home, pinned folders, Recents (from Spotlight), the Trash with Restore and Empty Trash, and mounted drives.
 - **File operations** that never overwrite: copy, cut, paste, duplicate, rename, new folder, compress, move to the trash, and delete permanently after asking. Everything except a permanent delete can be undone.
