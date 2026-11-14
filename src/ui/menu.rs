@@ -16,6 +16,12 @@ use crate::theme;
 /// menu and each of its lines are spots for the mouse.
 pub fn draw(frame: &mut Frame, menu: &Menu, anchor: Rect, area: Rect, hits: &mut HitMap) {
     let label_width = |row: &MenuRow| match row {
+        // A tag's square and a space go before its name.
+        MenuRow::Item {
+            label,
+            tag: Some(_),
+            ..
+        } => label.width() + 2,
         MenuRow::Item { label, .. } => label.width(),
         MenuRow::Separator => 0,
     };
@@ -40,6 +46,21 @@ pub fn draw(frame: &mut Frame, menu: &Menu, anchor: Rect, area: Rect, hits: &mut
     let first = (menu.cursor + 1).saturating_sub(rows);
     let cells = inner.width as usize;
     let line = |(index, row): (usize, &MenuRow)| match row {
+        MenuRow::Item {
+            label,
+            enabled,
+            tag: Some(tag),
+            ..
+        } => {
+            let style = theme::menu_item(index == menu.cursor, *enabled);
+            let (glyph, color) = theme::tag_mark(*tag);
+            let rest = pad(&format!(" {label}"), cells.saturating_sub(2));
+            Line::from(vec![
+                Span::styled(" ", style),
+                Span::styled(glyph, style.fg(color)),
+                Span::styled(rest, style),
+            ])
+        }
         MenuRow::Item { label, enabled, .. } => {
             let style = theme::menu_item(index == menu.cursor, *enabled);
             Line::from(Span::styled(pad(&format!(" {label}"), cells), style))
@@ -219,6 +240,19 @@ mod tests {
         for (width, height) in [(3, 2), (20, 5), (40, 3)] {
             buffer(&mut f.app, width, height);
         }
+    }
+
+    #[test]
+    fn the_tags_menu_shows_each_tag_with_its_colour_square() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::End, KeyCode::Char('T')]);
+        let drawn = buffer(&mut f.app, 120, 30);
+        for (index, name) in crate::tags::NAMES.iter().enumerate() {
+            let (x, y) = find(&drawn, name, 26..120).expect("the tag's line");
+            assert_eq!(drawn[(x - 2, y)].symbol(), "■", "{name}");
+            assert_eq!(drawn[(x - 2, y)].fg, theme::TAGS[index], "{name}");
+        }
+        assert_eq!(find(&drawn, "Remove All Tags", 26..120), None);
     }
 
     #[test]

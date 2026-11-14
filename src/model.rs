@@ -96,6 +96,8 @@ pub struct Entry {
     pub uid: u32,
     /// Where a symbolic link points, as it is written; `None` for anything else.
     pub link: Option<PathBuf>,
+    /// Which of the seven Finder tags it carries, one bit each, bit 0 for Red.
+    pub tags: u8,
     items: OnceCell<Option<usize>>,
 }
 
@@ -123,6 +125,7 @@ impl Entry {
             mode,
             uid,
             link: is_symlink.then(|| fs::read_link(&path).ok()).flatten(),
+            tags: crate::tags::mask(&crate::tags::labels(&path)),
             items: OnceCell::new(),
             name,
             path,

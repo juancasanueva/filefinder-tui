@@ -18,8 +18,8 @@ use crate::format::DateStyle;
 use crate::input::Input;
 use crate::matcher::{self, Query, Tier};
 use crate::model::{self, Entry, SortMode};
-use crate::ops::Collide;
 use crate::ops::{self, Change, History, Kind, Report, Step};
+use crate::ops::{Collide, Format};
 use crate::search::{Hit, Looking, Reach, Walk};
 use crate::state::{self, Saved, Trashed};
 use crate::system::{System, Volume};
@@ -155,6 +155,14 @@ pub enum Action {
     EmptyTrash,
     /// Open Terminal Here, in the menu for the folder itself.
     TerminalHere,
+    /// One archive of the selection in a format.
+    CompressAs(Format),
+    /// Extract, for an archive.
+    Extract,
+    /// One of the seven tags, by its place: on or off over the selection.
+    Tag(usize),
+    /// Remove All Tags: none of the seven on the selection.
+    RemoveTags,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +172,8 @@ pub enum MenuRow {
         action: Action,
         /// Whether it can be used right now; one that can't is shown dim.
         enabled: bool,
+        /// The tag whose colour square goes before the label.
+        tag: Option<usize>,
     },
     /// The hairline between two groups.
     Separator,
@@ -234,6 +244,7 @@ fn item_if(enabled: bool, label: &'static str, action: Action) -> MenuRow {
         label,
         action,
         enabled,
+        tag: None,
     }
 }
 
@@ -693,7 +704,8 @@ impl Pane {
     pub fn matching(&self) -> String {
         match &self.listing {
             Listing::Filter(filter) => filter.input.text(),
-            Listing::Search(search) => search.input.text(),
+            // What Find asks for besides `tag:` terms.
+            Listing::Search(search) => find_terms(&search.input.text()).1,
             Listing::Folder => String::new(),
         }
     }
@@ -814,6 +826,28 @@ impl Pane {
         if let Listing::Search(search) = &mut self.listing {
             search.held = true;
         }
+    }
+
+    /// Has every copy of an item this pane holds carry these tags, as they
+    /// are now on disk: in its list, its parent's, the folders above and
+    /// what a filter or a search keeps aside.
+    fn retagged(&mut self, path: &Path, tags: u8) {
+        let kept: Vec<&mut Entry> = match &mut self.listing {
+            Listing::Filter(filter) => filter.all.iter_mut().collect(),
+            Listing::Search(search) => search.hits.iter_mut().map(|hit| &mut hit.entry).collect(),
+            Listing::Folder => Vec::new(),
+        };
+        let above = self
+            .ancestors
+            .iter_mut()
+            .flat_map(|above| &mut above.entries);
+        let copies = (self.entries.iter_mut())
+            .chain(self.parent.iter_mut())
+            .chain(above)
+            .chain(kept);
+        copies
+            .filter(|entry| entry.path == path)
+            .for_each(|entry| entry.tags = tags);
     }
 
     /// The search that is open in the pane.
@@ -1392,6 +1426,7 @@ impl App {
             KeyCode::Char('z') if plain => self.undo(),
             KeyCode::Char('E') if plain => self.edit_file(),
             KeyCode::Char('I') if plain => self.next_detail(),
+            KeyCode::Char('T') if plain => self.open_tags(),
             _ if ctrl_shift && letter == Some('c') => self.copy_path(),
             _ if ctrl_shift && letter == Some('n') => self.ask_new_folder(),
             _ if ctrl_shift && letter == Some('z') => self.redo(),
@@ -1814,6 +1849,8 @@ impl App {
         let together = selection
             .iter()
             .all(|path| path.parent() == selection[0].parent());
+        let extract = (one && !entry.is_dir && self.unpacks(&entry.path))
+            .then(|| item("Extract", Action::Extract));
         let paste_into = entry
             .is_dir
             .then(|| item_if(one && pasting, "Paste Into Folder", Action::PasteInto));
@@ -1831,7 +1868,13 @@ impl App {
                 item("Duplicate", Action::Duplicate),
             ],
             clipboard.into_iter().flatten().collect(),
-            vec![item_if(together, "Compress", Action::Compress)],
+            [
+                Some(item_if(together, "Compress", Action::Compress)),
+                extract,
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             vec![item("Open Terminal Here", Action::Terminal)],
             vec![
                 item("Move to Trash", Action::Trash),
@@ -1868,6 +1911,16 @@ impl App {
                     return;
                 }
             }
+            // In the tags' menu a digit is the tag of that place.
+            KeyCode::Char(digit @ '1'..='7') => {
+                let tag = Action::Tag(digit as usize - '1' as usize);
+                let offered =
+                    |row: &MenuRow| matches!(row, MenuRow::Item { action, .. } if *action == tag);
+                if menu.rows.iter().any(offered) {
+                    self.run(tag);
+                    return;
+                }
+            }
             _ => {}
         }
         self.menu = Some(menu);
@@ -1885,7 +1938,9 @@ impl App {
             Action::Paste => self.paste(false),
             Action::PasteInto => self.paste_into_selected(),
             Action::CopyPath => self.copy_path(),
-            Action::Compress => self.compress(),
+            Action::Compress => self.compress_menu(),
+            Action::CompressAs(format) => self.compress(format),
+            Action::Extract => self.extract(),
             Action::Terminal => self.open_terminal(),
             Action::TerminalHere => self.open_terminal_here(),
             Action::Trash => self.trash(),
@@ -1893,6 +1948,66 @@ impl App {
             Action::NewFolder => self.ask_new_folder(),
             Action::Restore => self.restore(),
             Action::EmptyTrash => self.ask_empty_trash(),
+            Action::Tag(index) => self.retag(ops::Tagging::Toggle(index)),
+            Action::RemoveTags => self.retag(ops::Tagging::RemoveAll),
+        }
+    }
+
+    /// `T`: the seven tags for the selection, each with its colour, and
+    /// Remove All Tags while one of them is on any of it.
+    fn open_tags(&mut self) {
+        let paths = self.selection();
+        if paths.is_empty() || self.in_trash() {
+            return;
+        }
+        let tagged = paths
+            .iter()
+            .any(|path| crate::tags::mask(&crate::tags::labels(path)) != 0);
+        let seven = (0..crate::tags::NAMES.len()).map(|index| MenuRow::Item {
+            label: crate::tags::NAMES[index],
+            action: Action::Tag(index),
+            enabled: true,
+            tag: Some(index),
+        });
+        let mut groups = vec![seven.collect()];
+        if tagged {
+            groups.push(vec![item("Remove All Tags", Action::RemoveTags)]);
+        }
+        self.show_menu(groups, None);
+    }
+
+    /// Changes the tags of the selection and says what it did, in flea's words.
+    fn retag(&mut self, tagging: ops::Tagging) {
+        if self.busy() {
+            return;
+        }
+        let paths = self.selection();
+        if paths.is_empty() {
+            return;
+        }
+        match ops::retag(&paths, tagging) {
+            Ok((what, change)) => {
+                let items = ops::count(change.steps.len());
+                let said = match what {
+                    ops::Retagged::Added(index) => {
+                        format!("Tagged {items} {}", crate::tags::NAMES[index])
+                    }
+                    ops::Retagged::Removed(index) => {
+                        format!("Removed {} from {items}", crate::tags::NAMES[index])
+                    }
+                    ops::Retagged::Cleared => format!("Removed all tags from {items}"),
+                };
+                let undoable = !change.steps.is_empty();
+                // Shown as they are now, and the marks stay where they are.
+                for path in change.landed() {
+                    let tags = crate::tags::mask(&crate::tags::labels(&path));
+                    let panes = self.tabs.iter_mut().flat_map(|tab| &mut tab.panes);
+                    panes.for_each(|pane| pane.retagged(&path, tags));
+                }
+                self.history.record(change);
+                self.receipt(said, undoable);
+            }
+            Err(error) => self.fail(error.to_string()),
         }
     }
 
@@ -2324,7 +2439,10 @@ impl App {
         search.hits.clear();
         search.scanned = 0;
         search.held = false;
-        if text.is_empty() {
+        // `tag:red` asks for a tag; the rest is looked for as it is.
+        let (tags, words) = find_terms(&text);
+        let query = Query::new(&words);
+        if query.is_none() && tags.is_empty() {
             self.revisit(&search.origin);
             self.pane_mut().listing = Listing::Search(search);
             return;
@@ -2334,12 +2452,12 @@ impl App {
             Some(root) => Reach::volume(root),
             None => Reach::everywhere(&self.home),
         };
-        let grep = (search.contents)
-            .then(|| self.system.grep(&reach.roots(), &text, self.show_hidden))
+        let grep = (search.contents && query.is_some())
+            .then(|| self.system.grep(&reach.roots(), &words, self.show_hidden))
             .flatten();
         let looking = match grep {
-            Some(grep) => Looking::Contents(grep),
-            None => Looking::Names(Query::new(&text).expect("something was typed")),
+            Some(grep) => Looking::Contents { grep, tags },
+            None => Looking::Names { query, tags },
         };
         search.root = reach.root.clone();
         search.walk = Some(Walk::start(reach, looking, self.show_hidden));
@@ -2503,8 +2621,17 @@ impl App {
         self.settle(report, neighbour);
     }
 
-    /// Compress, in the menu: zips the selection into one archive beside it.
-    fn compress(&mut self) {
+    /// Compress, in the menu: the formats it can write, in a menu of their own.
+    fn compress_menu(&mut self) {
+        let formats = self.system.formats();
+        let rows = formats
+            .into_iter()
+            .map(|format| item(format.extension(), Action::CompressAs(format)));
+        self.show_menu(vec![rows.collect()], None);
+    }
+
+    /// One archive of the selection beside it, in a format.
+    fn compress(&mut self, format: Format) {
         if self.busy() {
             return;
         }
@@ -2512,13 +2639,49 @@ impl App {
         if paths.is_empty() {
             return;
         }
-        let name = match ops::archive_name(&paths) {
-            Ok(name) => name,
-            Err(error) => return self.fail(error.to_string()),
+        if let Err(error) = ops::archive_name(&paths, format) {
+            return self.fail(error.to_string());
+        }
+        let what = match paths.as_slice() {
+            [one] => name_of(one),
+            many => ops::count(many.len()),
         };
-        let zip = self.system.archiver(&paths);
-        self.start(format!("Compressing into {name}…"), move |cancel| {
-            ops::compress(&paths, cancel, |archive| zip(archive, cancel))
+        let write = self.system.archiver(&paths, format);
+        let label = format!("Compressing {what} to .{}", format.extension());
+        self.start(label, move |cancel| {
+            ops::compress(&paths, format, cancel, |archive| write(archive, cancel))
+        });
+    }
+
+    /// Whether Extract can unpack an item: an archive by its name, of a kind
+    /// something installed reads.
+    fn unpacks(&self, path: &Path) -> bool {
+        let name = name_of(path);
+        Format::of_archive(&name)
+            .is_some_and(|(format, _)| self.system.extractor(path, format).is_some())
+    }
+
+    /// Extract, in the menu: the archive under the cursor into a new folder
+    /// beside it.
+    fn extract(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(entry) = self.selected() else { return };
+        let (archive, name) = (entry.path.clone(), entry.name.clone());
+        let Some((format, _)) = Format::of_archive(&name) else {
+            return;
+        };
+        let Some((list, unpack)) = self.system.extractor(&archive, format) else {
+            return;
+        };
+        self.start(format!("Extracting {name}"), move |cancel| {
+            ops::extract(
+                &archive,
+                cancel,
+                || list(cancel),
+                |into| unpack(into, cancel),
+            )
         });
     }
 
@@ -2741,8 +2904,11 @@ impl App {
         if self.busy() {
             return;
         }
-        // One name can only go to one item.
+        // Several are renamed together, in the editor.
         let selection = self.selection();
+        if selection.len() > 1 {
+            return self.bulk_rename(selection);
+        }
         let [path] = selection.as_slice() else { return };
         let entries = &self.pane().entries;
         let Some(entry) = entries.iter().find(|entry| entry.path == *path) else {
@@ -2757,6 +2923,50 @@ impl App {
             error: None,
             ghost: String::new(),
         });
+    }
+
+    /// `r` with several selected: their names in `$EDITOR`, a line each, and
+    /// what comes back renamed as one change, or nothing renamed at all.
+    fn bulk_rename(&mut self, items: Vec<PathBuf>) {
+        let mut names = Vec::with_capacity(items.len());
+        for item in &items {
+            match item.file_name().and_then(|name| name.to_str()) {
+                Some(name) => names.push(name.to_string()),
+                None => {
+                    let why = "Bulk rename cannot handle a name that is not valid text";
+                    return self.fail(why.to_string());
+                }
+            }
+        }
+        let system = &self.system;
+        let edited = ops::edit_names(&names, |file| system.edit(file));
+        // The terminal was the editor's meanwhile.
+        self.redraw = true;
+        let lines = match edited {
+            Ok(Some(lines)) => lines,
+            Ok(None) => {
+                let why = "The editor quit with an error; nothing was renamed.";
+                return self.fail(why.to_string());
+            }
+            Err(error) => return self.fail(error.to_string()),
+        };
+        let moves = match ops::plan_renames(&items, &lines) {
+            Ok(moves) => moves,
+            Err(error) => return self.fail(error.to_string()),
+        };
+        if moves.is_empty() {
+            return self.note(&format!("0 renamed · {} unchanged", items.len()));
+        }
+        match ops::bulk_rename(&moves) {
+            Ok(change) => {
+                let said = format!("Renamed {} · Undo reverts one", ops::count(moves.len()));
+                self.changed(change, said);
+            }
+            Err(error) => {
+                self.relist(&[], None);
+                self.fail(error.to_string());
+            }
+        }
     }
 
     /// `N` and Ctrl+Shift+N: asks on the bottom row for a new folder's
@@ -3588,6 +3798,15 @@ impl App {
     }
 }
 
+/// Find's text cut into the `tag:` terms it asks for and the rest; with no
+/// such term, the rest is the text just as it was typed.
+fn find_terms(text: &str) -> (Vec<String>, String) {
+    match crate::tags::split_query(text) {
+        (tags, _) if tags.is_empty() => (tags, text.to_string()),
+        split => split,
+    }
+}
+
 /// Why a name typed in a prompt can't be one, in flea's words.
 fn name_refusal(name: &str) -> Option<String> {
     let why = if name.trim().is_empty() {
@@ -3614,6 +3833,8 @@ fn outcome(report: &Report) -> (String, bool) {
     let text = if report.stopped && report.change.kind == Kind::Compress {
         // One archive is made whole or not at all: there is no part to count.
         "Stopped compressing.".to_string()
+    } else if report.stopped && report.change.kind == Kind::Extract {
+        "Extraction cancelled.".to_string()
     } else if report.stopped {
         let asked = ops::count(report.asked);
         format!("Stopped after {} of {asked}.", report.done)
@@ -3625,8 +3846,11 @@ fn outcome(report: &Report) -> (String, bool) {
             Kind::Duplicate => format!("Duplicated {done}."),
             Kind::Trash => format!("Moved {done} to Trash"),
             Kind::Compress => format!("Compressed into {}.", report.change.name()),
+            Kind::Extract => "Extracted.".to_string(),
             Kind::Restore => format!("Restored {done}."),
-            Kind::Move | Kind::Rename | Kind::NewFolder => format!("Moved {done}."),
+            Kind::Move | Kind::Rename | Kind::NewFolder | Kind::Tag | Kind::BulkRename => {
+                format!("Moved {done}.")
+            }
         }
     };
     // What a paste left out because its name was taken.
@@ -3648,6 +3872,9 @@ fn undone(change: &Change) -> &'static str {
         Kind::NewFolder => "the new folder",
         Kind::Compress => "the compress",
         Kind::Restore => "the restore",
+        Kind::Tag => "the tag change",
+        Kind::BulkRename => "the renames",
+        Kind::Extract => "the extract",
     }
 }
 
@@ -3665,6 +3892,9 @@ fn told(verb: &str, change: &Change) -> String {
         Kind::NewFolder => format!("{verb} making {name}."),
         Kind::Compress => format!("{verb} compressing into {name}."),
         Kind::Restore => format!("{verb} restoring {items}."),
+        Kind::Tag => format!("{verb} the tag change on {items}."),
+        Kind::BulkRename => format!("{verb} the renames."),
+        Kind::Extract => format!("{verb} extracting into {name}."),
     }
 }
 
@@ -3700,7 +3930,7 @@ fn read_error(path: &Path, error: &io::Error) -> String {
 #[cfg(test)]
 pub mod testing {
     use super::*;
-    use crate::system::{Archiver, Grep};
+    use crate::system::{Archiver, Grep, Lister, Unpacker};
     use crate::thumbs::testing::FakeThumbnailer;
     use std::cell::{Cell, RefCell};
     use std::fs;
@@ -3723,12 +3953,18 @@ pub mod testing {
         pub terminals: Rc<RefCell<Vec<PathBuf>>>,
         /// Whether no terminal can be started.
         pub no_terminal: Rc<Cell<bool>>,
-        /// How the stand-in for the program that zips behaves.
+        /// How the stand-ins for the programs that write and read archives behave.
         pub archiving: Rc<Cell<Archiving>>,
+        /// Every format an archive was asked of.
+        pub formats_asked: Rc<RefCell<Vec<Format>>>,
+        /// Whether 7-Zip is installed.
+        pub seven_zip: Rc<Cell<bool>>,
         /// Every file handed to the editor.
         pub edited: Rc<RefCell<Vec<PathBuf>>>,
         /// Whether the editor can't be started.
         pub no_editor: Rc<Cell<bool>>,
+        /// What the stand-in for the editor does to the file it is given.
+        pub editor: Rc<RefCell<Option<Editor>>>,
         /// What the stand-in for ripgrep finds, whatever it is asked;
         /// `None` when ripgrep isn't installed.
         pub grep_finds: Rc<RefCell<Option<Vec<PathBuf>>>>,
@@ -3738,6 +3974,9 @@ pub mod testing {
         /// through here, as it comes, until the other end goes.
         pub grep_feed: Rc<RefCell<Option<mpsc::Receiver<PathBuf>>>>,
     }
+
+    /// The stand-in for the editor: what it does to the file.
+    pub type Editor = Rc<dyn Fn(&Path) -> io::Result<()>>;
 
     /// A search of contents asked of the stand-in for ripgrep: where, and for what.
     pub type Grepped = (Vec<PathBuf>, String);
@@ -3778,7 +4017,8 @@ pub mod testing {
             Ok(())
         }
 
-        fn archiver(&self, items: &[PathBuf]) -> Archiver {
+        fn archiver(&self, items: &[PathBuf], format: Format) -> Archiver {
+            self.formats_asked.borrow_mut().push(format);
             let names: Vec<String> = items.iter().map(|item| name_of(item)).collect();
             let archiving = self.archiving.get();
             Box::new(move |archive, stop| {
@@ -3796,6 +4036,49 @@ pub mod testing {
             })
         }
 
+        fn formats(&self) -> Vec<Format> {
+            let mut formats = Format::WRITTEN.to_vec();
+            if self.seven_zip.get() {
+                formats.push(Format::SevenZ);
+            }
+            formats
+        }
+
+        /// An archive holds names, a line each; unpacked, each is a file
+        /// saying where it came from.
+        fn extractor(&self, archive: &Path, format: Format) -> Option<(Lister, Unpacker)> {
+            if format == Format::SevenZ && !self.seven_zip.get() {
+                return None;
+            }
+            let (archive, archiving) = (archive.to_path_buf(), self.archiving.get());
+            let listed = archive.clone();
+            let lister: Lister = Box::new(move |_stop| {
+                let text = fs::read_to_string(&listed)?;
+                Ok(text.lines().map(str::to_string).collect())
+            });
+            let unpacker: Unpacker = Box::new(move |into, stop| {
+                let text = fs::read_to_string(&archive)?;
+                let said = format!("from {}", name_of(&archive));
+                for name in text.lines() {
+                    let file = into.join(name);
+                    fs::create_dir_all(file.parent().unwrap_or(into))?;
+                    fs::write(&file, &said)?;
+                    if archiving != Archiving::Works {
+                        break;
+                    }
+                }
+                while archiving == Archiving::Hangs && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                match archiving {
+                    Archiving::Works => Ok(()),
+                    Archiving::Hangs => Err(io::ErrorKind::Interrupted.into()),
+                    Archiving::Fails => Err(io::Error::other("it couldn't be read")),
+                }
+            });
+            Some((lister, unpacker))
+        }
+
         fn volume(&self, _folder: &Path) -> Option<Volume> {
             self.volumes_asked.set(self.volumes_asked.get() + 1);
             self.volume.borrow().clone()
@@ -3806,7 +4089,8 @@ pub mod testing {
                 return Err(io::Error::other("no editor started"));
             }
             self.edited.borrow_mut().push(path.to_path_buf());
-            Ok(())
+            let editor = self.editor.borrow().clone();
+            editor.map_or(Ok(()), |editor| editor(path))
         }
 
         fn grep(&self, roots: &[PathBuf], text: &str, _show_hidden: bool) -> Option<Grep> {
@@ -4059,6 +4343,7 @@ mod tests {
     use crate::theme;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::rc::Rc;
 
     const BY_SIZE: SortMode = SortMode {
         key: SortKey::Size,
@@ -7350,91 +7635,90 @@ mod tests {
     fn compress_makes_a_zip_beside_the_item_and_undo_moves_it_to_the_trash() {
         let mut f = fixture();
         select(&mut f.app, "notes.txt");
-        pick(&mut f.app, "Compress");
-        assert_eq!(f.app.working(), Some("Compressing into notes.txt.zip…"));
+        compress_as(&mut f.app, "zip");
+        assert_eq!(f.app.working(), Some("Compressing notes.txt to .zip"));
         finish_work(&mut f.app);
         assert_eq!(
             all_on_disk(&f.home),
-            [
-                ".hidden",
-                "Documents",
-                "Pictures",
-                "notes.txt",
-                "notes.txt.zip"
-            ],
+            [".hidden", "Documents", "Pictures", "notes.txt", "notes.zip"],
             "the archive, and nothing left over from making it"
         );
-        assert_eq!(read(f.home.join("notes.txt.zip")), "notes.txt");
+        assert_eq!(read(f.home.join("notes.zip")), "notes.txt");
         assert_eq!(read(f.home.join("notes.txt")), "hello");
-        assert_eq!(said(&f.app), ("Compressed into notes.txt.zip.", false));
+        assert_eq!(said(&f.app), ("Compressed into notes.zip.", false));
         // The folder was listed again, the cursor on the archive.
         assert_eq!(
             names(&f.app),
-            ["Documents", "Pictures", "notes.txt", "notes.txt.zip"]
+            ["Documents", "Pictures", "notes.txt", "notes.zip"]
         );
-        assert_eq!(selected_name(&f.app), Some("notes.txt.zip"));
+        assert_eq!(selected_name(&f.app), Some("notes.zip"));
 
         f.app.handle_key(ctrl(KeyCode::Char('z')));
         assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
-        assert_eq!(read(f.trash.join("notes.txt.zip")), "notes.txt");
+        assert_eq!(read(f.trash.join("notes.zip")), "notes.txt");
         let undid = "Undid the compress";
         assert_eq!(said(&f.app), (undid, false));
         // There it is known like anything else this app moved to the trash.
-        let known = f.app.trashed(&f.trash.join("notes.txt.zip"));
+        let known = f.app.trashed(&f.trash.join("notes.zip"));
         assert_eq!(
             known.map(|record| &record.from),
-            Some(&f.home.join("notes.txt.zip"))
+            Some(&f.home.join("notes.zip"))
         );
         f.app.handle_key(ctrl_shift('z'));
-        assert_eq!(read(f.home.join("notes.txt.zip")), "notes.txt");
+        assert_eq!(read(f.home.join("notes.zip")), "notes.txt");
         assert!(on_disk(&f.trash).is_empty());
-        let redid = "Redid compressing into notes.txt.zip.";
+        let redid = "Redid compressing into notes.zip.";
         assert_eq!(said(&f.app), (redid, false));
     }
 
     #[test]
-    fn compressing_several_items_makes_archive_zip_and_a_taken_name_keeps_both() {
+    fn compressing_several_items_names_the_archive_after_their_folder_and_keeps_both() {
         let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        f.app.navigate(&pictures);
         f.app.handle_key(shift(KeyCode::Down));
-        assert_eq!(chosen(&f.app), ["Documents", "Pictures"]);
-        pick(&mut f.app, "Compress");
-        assert_eq!(f.app.working(), Some("Compressing into Archive.zip…"));
+        assert_eq!(chosen(&f.app), ["Trip", "a.jpg"]);
+        compress_as(&mut f.app, "zip");
+        assert_eq!(f.app.working(), Some("Compressing 2 items to .zip"));
         finish_work(&mut f.app);
-        assert_eq!(read(f.home.join("Archive.zip")), "Documents\nPictures");
-        assert_eq!(selected_name(&f.app), Some("Archive.zip"));
-        assert_eq!(said(&f.app), ("Compressed into Archive.zip.", false));
+        assert_eq!(read(pictures.join("Pictures.zip")), "Trip\na.jpg");
+        assert_eq!(selected_name(&f.app), Some("Pictures.zip"));
+        assert_eq!(said(&f.app), ("Compressed into Pictures.zip.", false));
 
         // Again: the name is taken, and what has it is not written over.
-        fs::write(f.home.join("Archive.zip"), "the first one").unwrap();
+        fs::write(pictures.join("Pictures.zip"), "the first one").unwrap();
         press(&mut f.app, &[KeyCode::Home]);
         f.app.handle_key(shift(KeyCode::Down));
-        pick(&mut f.app, "Compress");
-        let second = "Compressing into Archive copy.zip…";
-        assert_eq!(f.app.working(), Some(second));
+        compress_as(&mut f.app, "zip");
+        assert_eq!(f.app.working(), Some("Compressing 2 items to .zip"));
         finish_work(&mut f.app);
-        assert_eq!(read(f.home.join("Archive.zip")), "the first one");
-        assert_eq!(read(f.home.join("Archive copy.zip")), "Documents\nPictures");
-        assert_eq!(selected_name(&f.app), Some("Archive copy.zip"));
+        assert_eq!(read(pictures.join("Pictures.zip")), "the first one");
+        assert_eq!(read(pictures.join("Pictures copy.zip")), "Trip\na.jpg");
+        assert_eq!(selected_name(&f.app), Some("Pictures copy.zip"));
 
         // The same for one item.
-        fs::write(f.home.join("notes.txt.zip"), "someone else's").unwrap();
+        f.app.navigate(&f.home.clone());
+        fs::write(f.home.join("notes.zip"), "someone else's").unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
         select(&mut f.app, "notes.txt");
-        pick(&mut f.app, "Compress");
+        compress_as(&mut f.app, "zip");
         finish_work(&mut f.app);
-        assert_eq!(read(f.home.join("notes.txt.zip")), "someone else's");
-        assert_eq!(read(f.home.join("notes.txt copy.zip")), "notes.txt");
+        assert_eq!(read(f.home.join("notes.zip")), "someone else's");
+        assert_eq!(read(f.home.join("notes copy.zip")), "notes.txt");
         assert_eq!(
             all_on_disk(&f.home),
             [
                 ".hidden",
-                "Archive copy.zip",
-                "Archive.zip",
                 "Documents",
                 "Pictures",
+                "notes copy.zip",
                 "notes.txt",
-                "notes.txt copy.zip",
-                "notes.txt.zip",
+                "notes.zip"
             ]
+        );
+        assert_eq!(
+            all_on_disk(&pictures),
+            ["Pictures copy.zip", "Pictures.zip", "Trip", "a.jpg"]
         );
     }
 
@@ -7444,14 +7728,14 @@ mod tests {
         let untouched = [".hidden", "Documents", "Pictures", "notes.txt"];
         f.system.archiving.set(Archiving::Hangs);
         select(&mut f.app, "notes.txt");
-        pick(&mut f.app, "Compress");
-        assert_eq!(f.app.working(), Some("Compressing into notes.txt.zip…"));
+        compress_as(&mut f.app, "zip");
+        assert_eq!(f.app.working(), Some("Compressing notes.txt to .zip"));
         // The window isn't frozen meanwhile, and other changes wait.
         f.app.tick();
         press(&mut f.app, &[KeyCode::Delete]);
         let wait = ("Try again once the work under way is done.", false);
         assert_eq!(said(&f.app), wait);
-        assert_eq!(f.app.working(), Some("Compressing into notes.txt.zip…"));
+        assert_eq!(f.app.working(), Some("Compressing notes.txt to .zip"));
 
         press(&mut f.app, &[KeyCode::Esc]);
         finish_work(&mut f.app);
@@ -7462,7 +7746,7 @@ mod tests {
         assert_eq!(said(&f.app), ("There's nothing to undo.", false));
 
         f.system.archiving.set(Archiving::Fails);
-        pick(&mut f.app, "Compress");
+        compress_as(&mut f.app, "zip");
         finish_work(&mut f.app);
         let why = "Couldn't compress: The archive couldn't be written.";
         assert_eq!(said(&f.app), (why, true));
@@ -8256,6 +8540,430 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('h')));
         assert!(!f.app.show_hidden);
     }
+
+    // Compress formats and Extract, in the menu. The programs that write
+    // and read archives are fakes: an archive holds the names of what went
+    // in, a line each, and unpacking it makes a file of each name.
+
+    /// Compress, then the format, in its submenu.
+    fn compress_as(app: &mut App, format: &str) {
+        pick(app, "Compress");
+        let row = menu(app).iter().position(|label| *label == format);
+        let row = row.unwrap_or_else(|| panic!("{format} isn't in {:?}", menu(app)));
+        press(app, &vec![KeyCode::Down; row]);
+        press(app, &[KeyCode::Enter]);
+    }
+
+    #[test]
+    fn compress_offers_flea_formats_and_names_the_archive_after_the_item() {
+        let mut f = fixture();
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Compress");
+        assert_eq!(menu(&f.app), ["zip", "tar", "tar.gz", "tar.bz2", "tar.xz"]);
+        press(&mut f.app, &[KeyCode::Esc]);
+        // With 7-Zip installed, 7z too.
+        f.system.seven_zip.set(true);
+        pick(&mut f.app, "Compress");
+        assert_eq!(
+            menu(&f.app),
+            ["zip", "tar", "tar.gz", "tar.bz2", "tar.xz", "7z"]
+        );
+        press(&mut f.app, &[KeyCode::Esc]);
+
+        compress_as(&mut f.app, "tar.gz");
+        assert_eq!(f.app.working(), Some("Compressing notes.txt to .tar.gz"));
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("notes.tar.gz")), "notes.txt");
+        assert_eq!(*f.system.formats_asked.borrow(), [Format::TarGz]);
+        assert_eq!(said(&f.app), ("Compressed into notes.tar.gz.", false));
+        // Again: the next free copy name, the whole extension kept.
+        select(&mut f.app, "notes.txt");
+        compress_as(&mut f.app, "tar.gz");
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("notes copy.tar.gz")), "notes.txt");
+        select(&mut f.app, "notes.txt");
+        compress_as(&mut f.app, "tar.gz");
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("notes copy 2.tar.gz")), "notes.txt");
+        // Several: named after their folder.
+        press(&mut f.app, &[KeyCode::Home]);
+        f.app.handle_key(shift(KeyCode::Down));
+        compress_as(&mut f.app, "7z");
+        assert_eq!(f.app.working(), Some("Compressing 2 items to .7z"));
+        finish_work(&mut f.app);
+        let folder = name_of(&f.home);
+        assert_eq!(
+            read(f.home.join(format!("{folder}.7z"))),
+            "Documents\nPictures"
+        );
+    }
+
+    #[test]
+    fn extract_unpacks_an_archive_into_a_new_folder_beside_it_and_undo_trashes_it() {
+        let mut f = fixture();
+        fs::write(f.home.join("pack.tar.gz"), "a.txt\nsub/b.txt").unwrap();
+        fs::create_dir(f.home.join("pack")).unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
+        // Only an archive has the line.
+        select(&mut f.app, "notes.txt");
+        f.app.handle_key(key(KeyCode::Char('m')));
+        assert!(!menu(&f.app).contains(&"Extract"));
+        press(&mut f.app, &[KeyCode::Esc]);
+
+        select(&mut f.app, "pack.tar.gz");
+        pick(&mut f.app, "Extract");
+        assert_eq!(f.app.working(), Some("Extracting pack.tar.gz"));
+        finish_work(&mut f.app);
+        assert_eq!(said(&f.app), ("Extracted.", false));
+        assert!(f.app.message.as_ref().is_some_and(|said| said.undoable));
+        // pack is taken: pack copy, holding what the archive held.
+        assert_eq!(
+            read(f.home.join("pack copy").join("a.txt")),
+            "from pack.tar.gz"
+        );
+        assert_eq!(read(f.home.join("pack copy/sub/b.txt")), "from pack.tar.gz");
+        assert_eq!(selected_name(&f.app), Some("pack copy"));
+        assert_eq!(
+            all_on_disk(&f.home),
+            [
+                ".hidden",
+                "Documents",
+                "Pictures",
+                "notes.txt",
+                "pack",
+                "pack copy",
+                "pack.tar.gz"
+            ]
+        );
+
+        f.app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("Undid the extract", false));
+        assert!(!f.home.join("pack copy").exists());
+        assert_eq!(read(f.trash.join("pack copy/a.txt")), "from pack.tar.gz");
+    }
+
+    #[test]
+    fn an_extract_that_is_refused_stopped_or_fails_leaves_nothing_behind() {
+        let mut f = fixture();
+        fs::write(f.home.join("slip.zip"), "../evil.txt").unwrap();
+        fs::write(f.home.join("pack.zip"), "a.txt").unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
+        let untouched = all_on_disk(&f.home);
+        select(&mut f.app, "slip.zip");
+        pick(&mut f.app, "Extract");
+        finish_work(&mut f.app);
+        let outside =
+            "Couldn't extract slip.zip: it holds items that would land outside its folder.";
+        assert_eq!(said(&f.app), (outside, true));
+        assert_eq!(all_on_disk(&f.home), untouched);
+
+        f.system.archiving.set(Archiving::Hangs);
+        select(&mut f.app, "pack.zip");
+        pick(&mut f.app, "Extract");
+        f.app.tick();
+        press(&mut f.app, &[KeyCode::Esc]);
+        finish_work(&mut f.app);
+        assert_eq!(said(&f.app), ("Extraction cancelled.", false));
+        assert_eq!(all_on_disk(&f.home), untouched);
+
+        f.system.archiving.set(Archiving::Fails);
+        pick(&mut f.app, "Extract");
+        finish_work(&mut f.app);
+        let damaged = "Couldn't extract pack.zip: it is damaged or needs a password.";
+        assert_eq!(said(&f.app), (damaged, true));
+        assert_eq!(all_on_disk(&f.home), untouched);
+        f.app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("There's nothing to undo.", false));
+
+        // A 7z archive with no 7-Zip installed has no Extract.
+        fs::write(f.home.join("pack.7z"), "a.txt").unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
+        select(&mut f.app, "pack.7z");
+        f.app.handle_key(key(KeyCode::Char('m')));
+        assert!(!menu(&f.app).contains(&"Extract"));
+    }
+
+    // Bulk rename: `r` with several selected, in `$EDITOR`. The editor is
+    // a stand-in that rewrites the file of names as each test says.
+
+    fn editor(f: &Fixture, rewrite: impl Fn(&str) -> Option<String> + 'static) {
+        *f.system.editor.borrow_mut() = Some(Rc::new(move |file: &Path| {
+            let names = fs::read_to_string(file).unwrap();
+            match rewrite(&names) {
+                Some(edited) => fs::write(file, edited),
+                None => Err(io::Error::other("the editor failed")),
+            }
+        }));
+    }
+
+    fn mark_three(f: &mut Fixture) {
+        if chosen(&f.app) == ["a.txt", "b.txt", "c.txt"] {
+            return;
+        }
+        select(&mut f.app, "a.txt");
+        let mark = KeyCode::Char('v');
+        press(
+            &mut f.app,
+            &[mark, KeyCode::Down, mark, KeyCode::Down, mark],
+        );
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn r_with_several_selected_renames_them_in_the_editor_as_one_undo_step() {
+        let mut f = several();
+        editor(&f, |names| {
+            assert_eq!(names, "a.txt\nb.txt\nc.txt\n");
+            Some("b.txt\nc.txt\na.txt\n".to_string())
+        });
+        mark_three(&mut f);
+        press(&mut f.app, &[KeyCode::Char('r')]);
+        assert!(f.app.prompt.is_none());
+        // The file of names was in the system's temporary folder, and is gone.
+        let edited = f.system.edited.borrow().clone();
+        assert_eq!(edited.len(), 1);
+        assert!(edited[0].starts_with(std::env::temp_dir()));
+        assert!(!edited[0].exists());
+        // a → b, b → c, c → a.
+        assert_eq!(read(f.home.join("b.txt")), "a");
+        assert_eq!(read(f.home.join("c.txt")), "b");
+        assert_eq!(read(f.home.join("a.txt")), "c");
+        assert_eq!(
+            on_disk(&f.home),
+            [
+                "Documents",
+                "Pictures",
+                "a.txt",
+                "b.txt",
+                "c.txt",
+                "d.txt",
+                "e.txt",
+                "notes.txt"
+            ]
+        );
+        assert_eq!(said(&f.app), ("Renamed 3 items · Undo reverts one", false));
+        assert!(f.app.message.as_ref().is_some_and(|said| said.undoable));
+
+        f.app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("Undid the renames", false));
+        assert_eq!(read(f.home.join("a.txt")), "a");
+        assert_eq!(read(f.home.join("b.txt")), "b");
+        assert_eq!(read(f.home.join("c.txt")), "c");
+        f.app.handle_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(read(f.home.join("a.txt")), "c");
+
+        // Only the names that changed count.
+        editor(&f, |_| Some("a.txt\nx.txt\nc.txt\n".to_string()));
+        mark_three(&mut f);
+        press(&mut f.app, &[KeyCode::Char('r')]);
+        assert_eq!(said(&f.app), ("Renamed 1 item · Undo reverts one", false));
+        assert_eq!(read(f.home.join("x.txt")), "a");
+    }
+
+    #[test]
+    fn a_bulk_rename_that_is_refused_or_given_up_renames_nothing() {
+        let mut f = several();
+        let before = on_disk(&f.home);
+        let tries: [(&str, Option<&str>, (&str, bool)); 5] = [
+            (
+                "a.txt\nb.txt\n",
+                Some("a.txt\nb.txt\n"),
+                ("Bulk rename refused: the number of names changed", true),
+            ),
+            (
+                "x.txt\nx.txt\nc.txt\n",
+                Some("x.txt\nx.txt\nc.txt\n"),
+                (
+                    "Line 2: same as line 1. Give each item a different name.",
+                    true,
+                ),
+            ),
+            (
+                "a.txt\nnotes.txt\nc.txt\n",
+                Some("a.txt\nnotes.txt\nc.txt\n"),
+                ("Bulk rename refused: a destination already exists", true),
+            ),
+            ("unchanged", None, ("0 renamed · 3 unchanged", false)),
+            (
+                "the editor fails",
+                None,
+                ("The editor quit with an error; nothing was renamed.", true),
+            ),
+        ];
+        for (what, edited, expected) in tries {
+            let edited = edited.map(str::to_string);
+            let fails = what == "the editor fails";
+            editor(&f, move |names| {
+                if fails {
+                    None
+                } else {
+                    Some(edited.clone().unwrap_or_else(|| names.to_string()))
+                }
+            });
+            mark_three(&mut f);
+            press(&mut f.app, &[KeyCode::Char('r')]);
+            assert_eq!(said(&f.app), expected, "{what}");
+            assert_eq!(on_disk(&f.home), before, "{what}");
+            assert_eq!(read(f.home.join("a.txt")), "a");
+        }
+        f.app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("There's nothing to undo.", false));
+        // One item is renamed on the bottom row, as before.
+        press(&mut f.app, &[KeyCode::Esc]);
+        select(&mut f.app, "a.txt");
+        press(&mut f.app, &[KeyCode::Char('r')]);
+        assert!(matches!(asking(&f.app), Some(Asking::Rename(_))));
+    }
+
+    // Finder tags: `T`, the receipts, undo and `tag:` in Find. The tags are
+    // real ones, written on the fixture's files in a temporary folder.
+
+    fn tags_of(path: PathBuf) -> Vec<String> {
+        crate::tags::labels(&path)
+    }
+
+    fn tag(path: PathBuf, labels: &[&str]) {
+        let labels: Vec<String> = labels.iter().map(|label| label.to_string()).collect();
+        crate::tags::write(&path, Some(&crate::tags::encode(&labels))).unwrap();
+    }
+
+    const SEVEN: [&str; 7] = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "Gray"];
+
+    #[test]
+    fn capital_t_offers_the_seven_tags_and_a_digit_toggles_one_over_the_selection() {
+        let mut f = several();
+        let (a, b) = (f.home.join("a.txt"), f.home.join("b.txt"));
+        tag(a.clone(), &["Red\n6", "Work"]);
+        select(&mut f.app, "a.txt");
+        press(
+            &mut f.app,
+            &[KeyCode::Char('v'), KeyCode::Down, KeyCode::Char('v')],
+        );
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
+
+        // A tag on one of them: Remove All Tags is offered under the seven.
+        press(&mut f.app, &[KeyCode::Char('T')]);
+        let mut offered = SEVEN.to_vec();
+        offered.extend(["-", "Remove All Tags"]);
+        assert_eq!(menu(&f.app), offered);
+        // Red is on a, not on b: added where it is missing.
+        press(&mut f.app, &[KeyCode::Char('1')]);
+        assert!(f.app.menu.is_none());
+        assert_eq!(tags_of(a.clone()), ["Red\n6", "Work"]);
+        assert_eq!(tags_of(b.clone()), ["Red\n6"]);
+        assert_eq!(said(&f.app), ("Tagged 1 item Red", false));
+        assert!(f.app.message.as_ref().is_some_and(|said| said.undoable));
+        assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
+
+        // On both now: taken off both.
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('1')]);
+        assert_eq!(tags_of(a.clone()), ["Work"]);
+        assert!(tags_of(b.clone()).is_empty());
+        assert_eq!(said(&f.app), ("Removed Red from 2 items", false));
+
+        // None of the seven on either: no Remove All Tags, and Escape
+        // closes the menu with nothing done.
+        press(&mut f.app, &[KeyCode::Char('T')]);
+        assert_eq!(menu(&f.app), SEVEN);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.menu.is_none());
+        assert_eq!(tags_of(a.clone()), ["Work"]);
+
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('5')]);
+        assert_eq!(said(&f.app), ("Tagged 2 items Blue", false));
+        pick_tag_remove_all(&mut f.app);
+        assert_eq!(said(&f.app), ("Removed all tags from 2 items", false));
+        // The user's own tag stays.
+        assert_eq!(tags_of(a.clone()), ["Work"]);
+        assert!(tags_of(b.clone()).is_empty());
+
+        // Undo puts Blue back on both, redo takes it off again.
+        f.app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("Undid the tag change", false));
+        assert_eq!(tags_of(a.clone()), ["Work", "Blue\n4"]);
+        assert_eq!(tags_of(b.clone()), ["Blue\n4"]);
+        f.app.handle_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(tags_of(a.clone()), ["Work"]);
+        assert!(tags_of(b).is_empty());
+
+        // One item: the singular.
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('7')]);
+        assert_eq!(said(&f.app), ("Tagged 1 item Gray", false));
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('7')]);
+        assert_eq!(said(&f.app), ("Removed Gray from 1 item", false));
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('3')]);
+        pick_tag_remove_all(&mut f.app);
+        assert_eq!(said(&f.app), ("Removed all tags from 1 item", false));
+    }
+
+    fn pick_tag_remove_all(app: &mut App) {
+        press(app, &[KeyCode::Char('T')]);
+        press(app, &[KeyCode::Down; 8]);
+        assert_eq!(menu(app)[menu_cursor(app)], "Remove All Tags");
+        press(app, &[KeyCode::Enter]);
+    }
+
+    #[test]
+    fn tags_show_after_the_name_once_the_folder_is_listed_again() {
+        let mut f = fixture();
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('2')]);
+        let entry = f.app.selected().expect("notes.txt");
+        assert_eq!(entry.name, "notes.txt");
+        assert_eq!(entry.tags, 0b10);
+    }
+
+    #[test]
+    fn tagging_on_a_disk_without_room_for_tags_says_so_and_changes_nothing() {
+        let mut f = fixture();
+        crate::tags::testing::pretend_unsupported(&f.home);
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('1')]);
+        let unsupported = "This filesystem does not support file tags.";
+        assert_eq!(said(&f.app), (unsupported, true));
+        assert!(tags_of(f.home.join("notes.txt")).is_empty());
+        f.app.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(said(&f.app), ("There's nothing to undo.", false));
+    }
+
+    #[test]
+    fn find_takes_tag_terms_and_finds_only_what_carries_every_tag_named() {
+        let mut f = several();
+        tag(f.home.join("a.txt"), &["Red\n6"]);
+        tag(f.home.join("b.txt"), &["red\n6", "Blue\n4"]);
+        tag(f.home.join("Pictures").join("a.jpg"), &["Red\n6", "Work"]);
+        tag(f.home.join("c.txt"), &["Blue\n4"]);
+        let found = |app: &App| {
+            let mut found = names(app);
+            found.sort();
+            found
+        };
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        type_text(&mut f.app, "tag:red");
+        finish_search(&mut f.app);
+        assert_eq!(found(&f.app), ["a.jpg", "a.txt", "b.txt"]);
+        // Nothing is bold: no text was asked for.
+        assert_eq!(f.app.pane().matching(), "");
+
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "TAG:red tag:BLUE");
+        finish_search(&mut f.app);
+        assert_eq!(found(&f.app), ["b.txt"]);
+
+        // With text as well: what carries the tag and matches the text.
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "TAG:red a");
+        finish_search(&mut f.app);
+        assert_eq!(found(&f.app), ["a.jpg", "a.txt"]);
+        assert_eq!(f.app.pane().matching(), "a");
+
+        // A tag of the user's own is found the same way.
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "tag:work");
+        finish_search(&mut f.app);
+        assert_eq!(found(&f.app), ["a.jpg"]);
+    }
 }
 
 /// The mouse: every click lands on what the last frame drew under it, and
@@ -8616,6 +9324,7 @@ mod mouse_tests {
                 label: "Rename",
                 action: Action::Rename,
                 enabled: false,
+                tag: None,
             };
             assert!(rows.contains(&rename), "one name for several items");
         }

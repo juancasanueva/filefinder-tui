@@ -24,12 +24,18 @@ pub const BELOW_LIMIT: usize = 20_000;
 
 /// What a walk looks for.
 pub enum Looking {
-    /// Names that match, scored the way Find ranks them.
-    Names(Query),
+    /// Names that match, scored the way Find ranks them, of items that
+    /// carry every one of `tags` (`tag:` terms, in small letters). With no
+    /// query, every item carrying them.
+    Names {
+        query: Option<Query>,
+        tags: Vec<String>,
+    },
     /// Every item in the folders under the root, not the root's own.
     Below,
-    /// Files whose contents hold the text, as the program that greps finds them.
-    Contents(Grep),
+    /// Files whose contents hold the text, as the program that greps finds
+    /// them, that carry every one of `tags`.
+    Contents { grep: Grep, tags: Vec<String> },
 }
 
 /// Something a walk found: the item, how well it matched, and its path
@@ -125,11 +131,19 @@ impl Walk {
                 // Nobody listening any more means the search was left.
                 let mut hand_over = |hit| sender.send(hit).is_ok();
                 match looking {
-                    Looking::Contents(grep) => {
+                    Looking::Contents { grep, tags } => {
                         let root = reach.root.clone();
                         let mut found = |path: PathBuf| match Entry::from_path(path) {
                             // One that went since it was found is simply not found.
                             Err(_) => true,
+                            Ok(entry)
+                                if !crate::tags::carries(
+                                    &crate::tags::labels(&entry.path),
+                                    &tags,
+                                ) =>
+                            {
+                                true
+                            }
                             Ok(entry) => {
                                 count.fetch_add(1, Ordering::Relaxed);
                                 let path = shown_below(&root, &entry.path);
@@ -217,7 +231,17 @@ fn walk(
             scanned.fetch_add(1, Ordering::Relaxed);
             let below = shown_below(&reach.root, &path);
             let score = match looking {
-                Looking::Names(query) => matcher::score(query, &name, &below),
+                // The tags are read here, on the walk's own thread.
+                Looking::Names { tags, .. }
+                    if !tags.is_empty()
+                        && !crate::tags::carries(&crate::tags::labels(&path), tags) =>
+                {
+                    None
+                }
+                Looking::Names {
+                    query: Some(query), ..
+                } => matcher::score(query, &name, &below),
+                Looking::Names { query: None, .. } => Some(anything),
                 _ if depth > 0 => Some(anything),
                 _ => None,
             };
@@ -299,7 +323,10 @@ mod tests {
     }
 
     fn names(text: &str) -> Looking {
-        Looking::Names(Query::new(text).unwrap())
+        Looking::Names {
+            query: Query::new(text),
+            tags: Vec::new(),
+        }
     }
 
     /// Everything a walk finds, in the order it finds it, as paths below `root`.
@@ -580,7 +607,10 @@ mod tests {
         });
         let (hits, _) = settle(Walk::start(
             Reach::volume(root),
-            Looking::Contents(grep),
+            Looking::Contents {
+                grep,
+                tags: Vec::new(),
+            },
             false,
         ));
         let found: Vec<&str> = hits.iter().map(|hit| hit.path.as_str()).collect();

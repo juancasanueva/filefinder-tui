@@ -15,7 +15,8 @@ mod topbar;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect, Size};
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_image::Image;
 use ratatui_image::protocol::Protocol;
@@ -329,6 +330,28 @@ pub fn scroll(offset: usize, cursor: usize, rows: usize) -> usize {
 }
 
 /// Shortens text to a width in cells, ending in an ellipsis when it had to cut.
+/// The marks of the tags an item carries, after its name: a space, then a
+/// mark for each in the order of the seven, on the row's own fill.
+pub fn tag_marks(tags: u8, style: Style) -> Vec<Span<'static>> {
+    if tags == 0 {
+        return Vec::new();
+    }
+    let mut spans = vec![Span::styled(" ", style)];
+    for index in (0..crate::tags::NAMES.len()).filter(|index| tags & 1 << index != 0) {
+        let (glyph, color) = theme::tag_mark(index);
+        spans.push(Span::styled(glyph, style.fg(color)));
+    }
+    spans
+}
+
+/// How many cells `tag_marks` takes.
+pub fn tag_width(tags: u8) -> usize {
+    match tags.count_ones() {
+        0 => 0,
+        count => count as usize + 1,
+    }
+}
+
 pub fn fit(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
@@ -920,7 +943,7 @@ mod tests {
     fn the_help_overlay_lists_the_shortcuts() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Char('?')]);
-        let all = screen(&mut f.app, 120, 53).join("\n");
+        let all = screen(&mut f.app, 120, 55).join("\n");
         assert!(all.contains("Keyboard shortcuts"));
         assert!(all.contains("Go to the parent folder"));
         for (keys, does) in [
@@ -938,7 +961,14 @@ mod tests {
             ("y / x / p", "Copy, cut, paste (or Ctrl+C / X / V)"),
             ("M", "Move here what was copied or cut"),
             ("U", "Duplicate"),
-            ("r / F2", "Rename"),
+            (
+                "r / F2",
+                "Rename; with several marked, all of them in $EDITOR",
+            ),
+            (
+                "T",
+                "Finder tags: 1–7 turn a tag on or off, Remove All Tags",
+            ),
             ("N / Ctrl+Shift+N", "New folder"),
             ("dd / Delete", "Move to Trash"),
             ("Shift+Delete", "Delete permanently (asks first)"),

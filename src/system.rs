@@ -10,10 +10,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-/// What writes one zip archive. It is handed to the thread that does file
+use crate::ops::Format;
+
+/// What writes one archive. It is handed to the thread that does file
 /// work, and run there with the new file the archive goes in and the flag
 /// that stops it: once that is set it gives up, with an error.
 pub type Archiver = Box<dyn FnOnce(&Path, &AtomicBool) -> io::Result<()> + Send>;
+
+/// What lists the names inside an archive, on the thread that does file
+/// work, until the flag stops it.
+pub type Lister = Box<dyn FnOnce(&AtomicBool) -> io::Result<Vec<String>> + Send>;
+
+/// What writes what an archive holds into the folder it is given, on the
+/// thread that does file work, until the flag stops it.
+pub type Unpacker = Box<dyn FnOnce(&Path, &AtomicBool) -> io::Result<()> + Send>;
 
 /// What finds the files whose contents hold some text. It is handed to the
 /// thread that searches, and run there with what takes each file it finds
@@ -35,8 +45,16 @@ pub trait System {
     /// Opens a terminal window in a folder.
     fn open_terminal(&self, folder: &Path) -> io::Result<()>;
 
-    /// What zips these items, which are all in one folder, into one archive.
-    fn archiver(&self, items: &[PathBuf]) -> Archiver;
+    /// What writes these items, which are all in one folder, into one
+    /// archive of a format.
+    fn archiver(&self, items: &[PathBuf], format: Format) -> Archiver;
+
+    /// The formats Compress offers: flea's, and 7z when 7-Zip is installed.
+    fn formats(&self) -> Vec<Format>;
+
+    /// What lists and unpacks an archive of a format; `None` when nothing
+    /// installed reads it.
+    fn extractor(&self, archive: &Path, format: Format) -> Option<(Lister, Unpacker)>;
 
     /// The volume a folder is on; `None` when that can't be told.
     fn volume(&self, folder: &Path) -> Option<Volume>;
@@ -110,9 +128,69 @@ impl System for MacSystem {
         }
     }
 
-    fn archiver(&self, items: &[PathBuf]) -> Archiver {
+    fn archiver(&self, items: &[PathBuf], format: Format) -> Archiver {
         let items = items.to_vec();
-        Box::new(move |archive, stop| run_until(&mut zip_command(&items, archive)?, stop))
+        Box::new(move |archive, stop| {
+            let mut command = match format {
+                Format::Zip => zip_command(&items, archive)?,
+                Format::SevenZ => seven_zip_command(&items, archive)?,
+                _ => tar_command(&items, archive)?,
+            };
+            run_until(&mut command, stop)
+        })
+    }
+
+    fn formats(&self) -> Vec<Format> {
+        let mut formats = Format::WRITTEN.to_vec();
+        if seven_zip().is_some() {
+            formats.push(Format::SevenZ);
+        }
+        formats
+    }
+
+    fn extractor(&self, archive: &Path, format: Format) -> Option<(Lister, Unpacker)> {
+        let archive = archive.to_path_buf();
+        if format == Format::SevenZ {
+            let seven = seven_zip()?;
+            let mut list = Command::new(&seven);
+            list.args(["l", "-slt", "-ba", "--"]).arg(&archive);
+            let lister: Lister = Box::new(move |stop| {
+                let listed = output_of(&mut list, stop)?;
+                let paths = listed
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("Path = "));
+                Ok(paths.map(str::to_string).collect())
+            });
+            let unpacker: Unpacker = Box::new(move |into, stop| {
+                let mut unpack = Command::new(&seven);
+                let out = format!("-o{}", into.display());
+                unpack.args(["x", "-bd", "-y", &out, "--"]).arg(&archive);
+                run_until(&mut unpack, stop)
+            });
+            return Some((lister, unpacker));
+        }
+        // bsdtar lists every kind; a zip is unpacked by `ditto`, which
+        // keeps what macOS knows about each file and never asks for a
+        // password.
+        let mut list = Command::new("/usr/bin/tar");
+        list.args(["-t", "-f"]).arg(&archive);
+        let lister: Lister = Box::new(move |stop| {
+            let listed = output_of(&mut list, stop)?;
+            Ok(listed.lines().map(str::to_string).collect())
+        });
+        let unpacker: Unpacker = Box::new(move |into, stop| {
+            let mut unpack = if format == Format::Zip {
+                let mut ditto = Command::new("/usr/bin/ditto");
+                ditto.args(["-x", "-k"]).arg(&archive).arg(into);
+                ditto
+            } else {
+                let mut tar = Command::new("/usr/bin/tar");
+                tar.args(["-x", "-f"]).arg(&archive).arg("-C").arg(into);
+                tar
+            };
+            run_until(&mut unpack, stop)
+        });
+        Some((lister, unpacker))
     }
 
     fn volume(&self, folder: &Path) -> Option<Volume> {
@@ -372,10 +450,93 @@ fn zip_command(items: &[PathBuf], archive: &Path) -> io::Result<Command> {
     Ok(zip)
 }
 
+/// The command that writes items of one folder into a tar archive,
+/// compressed as the archive's ending says (`-a`). The items go in by name,
+/// from their folder, written `./name` so that none is taken for an option
+/// or for another archive to copy in (`@name`); the `./` is taken off again
+/// in the archive. Links stay links.
+fn tar_command(items: &[PathBuf], archive: &Path) -> io::Result<Command> {
+    let nowhere = || io::Error::other("there is nothing to compress");
+    let folder = items.first().and_then(|item| item.parent());
+    let mut tar = Command::new("/usr/bin/tar");
+    tar.args(["-a", "-c", "-f"])
+        .arg(archive)
+        .arg("-C")
+        .arg(folder.ok_or_else(nowhere)?)
+        .args(["-s", ",^\\./,,S", "--"]);
+    for item in items {
+        let mut name = std::ffi::OsString::from("./");
+        name.push(item.file_name().ok_or_else(nowhere)?);
+        tar.arg(name);
+    }
+    Ok(tar)
+}
+
+/// The command that writes items into a 7z archive: each by its whole path,
+/// which 7-Zip stores under its name, taken literally (`-spd`), links as
+/// links (`-snl`).
+fn seven_zip_command(items: &[PathBuf], archive: &Path) -> io::Result<Command> {
+    let seven = seven_zip().ok_or_else(|| io::Error::other("7-Zip isn't installed"))?;
+    let mut command = Command::new(seven);
+    command
+        .args(["a", "-bd", "-spd", "-snl", "--"])
+        .arg(archive)
+        .args(items);
+    Ok(command)
+}
+
+/// Where 7-Zip is, as `7zz` or `7z`, when it is installed.
+fn seven_zip() -> Option<PathBuf> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{path}:/opt/homebrew/bin:/usr/local/bin");
+    program_on("7zz", Some(&path)).or_else(|| program_on("7z", Some(&path)))
+}
+
+/// What a command writes, once it ends well, unless it is stopped first.
+fn output_of(command: &mut Command, stop: &AtomicBool) -> io::Result<String> {
+    use std::io::Read;
+    let mut child = detached(quiet(command).stdout(Stdio::piped())).spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("no output"))?;
+    // Reading waits for the command, so it goes on beside the waiting.
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let ended = wait_until(&mut child, stop);
+    let bytes = reader
+        .join()
+        .map_err(|_| io::Error::other("the output couldn't be read"))??;
+    ended?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Lets a command run without the terminal, in a session of its own, so
+/// that it can never ask on it for anything, like a password.
+fn detached(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid` is safe to call between `fork` and `exec`.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Runs a command to its end, looking now and then whether it should stop:
 /// then it is killed, and that is an error like its failing is.
 fn run_until(command: &mut Command, stop: &AtomicBool) -> io::Result<()> {
-    let mut child = quiet(command).spawn()?;
+    let mut child = detached(quiet(command)).spawn()?;
+    wait_until(&mut child, stop)
+}
+
+/// Waits for a command to end well, killing it once `stop` is set.
+fn wait_until(child: &mut Child, stop: &AtomicBool) -> io::Result<()> {
     let ended = loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
@@ -693,5 +854,113 @@ mod tests {
         assert!(stopped.is_ok());
         assert_eq!(seen, 1);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A folder `pack` holding `a.txt` and a link to it, and two files whose
+    /// names a program could take for something else, in a folder of their own.
+    fn packable() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("pack").join("sub")).unwrap();
+        fs::write(root.join("pack").join("a.txt"), "alpha").unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("pack").join("link")).unwrap();
+        fs::write(root.join("@weird"), "at").unwrap();
+        fs::write(root.join("-dash"), "dash").unwrap();
+        let items = ["pack", "@weird", "-dash"].map(|name| root.join(name));
+        (dir, items.to_vec())
+    }
+
+    #[test]
+    fn compress_offers_flea_formats_in_order_and_seven_zip_only_when_installed() {
+        let formats = MacSystem::default().formats();
+        let written = [
+            Format::Zip,
+            Format::Tar,
+            Format::TarGz,
+            Format::TarBz2,
+            Format::TarXz,
+        ];
+        assert_eq!(formats[..5], written);
+        assert_eq!(formats.contains(&Format::SevenZ), seven_zip().is_some());
+    }
+
+    #[test]
+    fn every_format_is_written_and_read_back_by_the_system_tools_names_taken_literally() {
+        let (dir, items) = packable();
+        let system = MacSystem::default();
+        let go = AtomicBool::new(false);
+        // How each kind of file starts.
+        let starts: [(Format, &[u8], usize); 5] = [
+            (Format::Zip, b"PK", 0),
+            (Format::Tar, b"ustar", 257),
+            (Format::TarGz, b"\x1f\x8b", 0),
+            (Format::TarBz2, b"BZh", 0),
+            (Format::TarXz, b"\xfd7zXZ", 0),
+        ];
+        for (format, magic, at) in starts {
+            let archive = dir.path().join(format!("out.{}", format.extension()));
+            system.archiver(&items, format)(&archive, &go).unwrap();
+            let bytes = fs::read(&archive).unwrap();
+            assert_eq!(&bytes[at..at + magic.len()], magic, "{format:?}");
+
+            let (list, unpack) = system.extractor(&archive, format).expect("a reader");
+            let mut names = list(&go).unwrap();
+            names.sort();
+            let names: Vec<&str> = names
+                .iter()
+                .map(|name| name.trim_end_matches('/'))
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    "-dash",
+                    "@weird",
+                    "pack",
+                    "pack/a.txt",
+                    "pack/link",
+                    "pack/sub"
+                ],
+                "{format:?}"
+            );
+            let into = dir.path().join(format!("into-{}", format.extension()));
+            fs::create_dir(&into).unwrap();
+            unpack(&into, &go).unwrap();
+            assert_eq!(
+                fs::read_to_string(into.join("pack/a.txt")).unwrap(),
+                "alpha"
+            );
+            assert_eq!(fs::read_to_string(into.join("@weird")).unwrap(), "at");
+            assert_eq!(fs::read_to_string(into.join("-dash")).unwrap(), "dash");
+            // The link is still a link, to the same name.
+            assert_eq!(
+                fs::read_link(into.join("pack/link")).unwrap(),
+                Path::new("a.txt"),
+                "{format:?}"
+            );
+            assert!(into.join("pack/sub").is_dir());
+        }
+    }
+
+    #[test]
+    fn an_archive_with_a_password_fails_to_unpack_without_asking_for_it() {
+        let (dir, items) = packable();
+        let zip = Command::new("/usr/bin/zip")
+            .current_dir(dir.path())
+            .args(["-q", "-r", "-P", "secret", "enc.zip", "pack"])
+            .status()
+            .unwrap();
+        assert!(zip.success());
+        let _ = items;
+        let archive = dir.path().join("enc.zip");
+        let go = AtomicBool::new(false);
+        let (list, unpack) = MacSystem::default()
+            .extractor(&archive, Format::Zip)
+            .unwrap();
+        assert!(list(&go).unwrap().contains(&"pack/a.txt".to_string()));
+        let into = dir.path().join("into");
+        fs::create_dir(&into).unwrap();
+        let started = std::time::Instant::now();
+        assert!(unpack(&into, &go).is_err());
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

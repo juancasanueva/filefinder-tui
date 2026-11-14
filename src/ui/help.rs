@@ -29,11 +29,16 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("/", "Filter this folder (Tab: and its subfolders)"),
     ("f / Ctrl+F", "Find below this folder (Tab: where)"),
     ("Ctrl+G", "In Find: names or what files hold"),
+    ("tag:red", "In Find: only what has that tag"),
     ("o", "Show what Find found in its folder"),
     ("Space", "Quick Look the file"),
     (".", "Show hidden files"),
     ("s / S", "Next sort key / reverse the sort"),
     ("I", "Detail column: size, modified, mode, owner"),
+    (
+        "T",
+        "Finder tags: 1–7 turn a tag on or off, Remove All Tags",
+    ),
     ("Alt+P", "Show or hide the preview pane"),
     ("Ctrl+R / F5", "Reload"),
     ("v", "Mark or unmark the item"),
@@ -42,7 +47,10 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("y / x / p", "Copy, cut, paste (or Ctrl+C / X / V)"),
     ("M", "Move here what was copied or cut"),
     ("U", "Duplicate"),
-    ("r / F2", "Rename"),
+    (
+        "r / F2",
+        "Rename; with several marked, all of them in $EDITOR",
+    ),
     ("N / Ctrl+Shift+N", "New folder"),
     ("dd / Delete", "Move to Trash"),
     ("Shift+Delete", "Delete permanently (asks first)"),
@@ -295,9 +303,27 @@ mod tests {
     }
 
     #[test]
+    fn tags_and_bulk_rename_are_among_the_shortcuts() {
+        let does = |keys: &str| SHORTCUTS.iter().find(|(k, _)| *k == keys).map(|(_, d)| *d);
+        assert_eq!(
+            does("T"),
+            Some("Finder tags: 1–7 turn a tag on or off, Remove All Tags")
+        );
+        assert_eq!(
+            does("r / F2"),
+            Some("Rename; with several marked, all of them in $EDITOR")
+        );
+        assert_eq!(
+            does("f / Ctrl+F"),
+            Some("Find below this folder (Tab: where)")
+        );
+        assert_eq!(does("tag:red"), Some("In Find: only what has that tag"));
+    }
+
+    #[test]
     fn a_window_tall_enough_shows_them_all_at_once_as_before() {
         let mut f = fixture();
-        let screens = read_through(&mut f.app, 120, 53);
+        let screens = read_through(&mut f.app, 120, 55);
         assert_eq!(screens.len(), 1, "nothing to scroll");
         assert!(!screens[0].contains("more"));
         for (keys, does) in SHORTCUTS {

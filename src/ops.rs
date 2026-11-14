@@ -56,11 +56,84 @@ pub enum Kind {
     Trash,
     Compress,
     Restore,
+    Tag,
+    /// Several items renamed at once, in `$EDITOR`.
+    BulkRename,
+    Extract,
+}
+
+/// The kinds of archive Compress writes and Extract reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Zip,
+    Tar,
+    TarGz,
+    TarBz2,
+    TarXz,
+    SevenZ,
+}
+
+impl Format {
+    /// What Compress always offers, in flea's order; 7z follows when
+    /// 7-Zip is installed.
+    pub const WRITTEN: [Format; 5] = [
+        Format::Zip,
+        Format::Tar,
+        Format::TarGz,
+        Format::TarBz2,
+        Format::TarXz,
+    ];
+
+    /// The ending its archives get, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Zip => "zip",
+            Format::Tar => "tar",
+            Format::TarGz => "tar.gz",
+            Format::TarBz2 => "tar.bz2",
+            Format::TarXz => "tar.xz",
+            Format::SevenZ => "7z",
+        }
+    }
+
+    /// The kind of archive a name ends like, whatever its case, and the
+    /// name without that ending: the folder Extract makes for it.
+    pub fn of_archive(name: &str) -> Option<(Format, &str)> {
+        // The longest endings first, so `.tar.gz` comes before `.tar`.
+        const ENDINGS: [(&str, Format); 7] = [
+            (".tar.bz2", Format::TarBz2),
+            (".tar.gz", Format::TarGz),
+            (".tar.xz", Format::TarXz),
+            (".tgz", Format::TarGz),
+            (".tar", Format::Tar),
+            (".zip", Format::Zip),
+            (".7z", Format::SevenZ),
+        ];
+        ENDINGS.iter().find_map(|(ending, format)| {
+            let cut = name
+                .len()
+                .checked_sub(ending.len())
+                .filter(|cut| *cut > 0)?;
+            let tail = name.get(cut..)?;
+            tail.eq_ignore_ascii_case(ending)
+                .then(|| (*format, &name[..cut]))
+        })
+    }
 }
 
 /// One thing that was done to one item, with what it takes to take it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// Several items renamed together, each from its first path to its
+    /// second, through temporary names so that names can swap.
+    Renamed { moves: Vec<(PathBuf, PathBuf)> },
+    /// Its Finder tags changed from `before` to `after`: the attribute's
+    /// bytes, `None` for none at all.
+    Tagged {
+        at: PathBuf,
+        before: Option<Vec<u8>>,
+        after: Option<Vec<u8>>,
+    },
     /// Moved or renamed.
     Moved { from: PathBuf, to: PathBuf },
     /// Made new: a copy, a duplicate or a folder. Undoing it moves it to the
@@ -83,21 +156,24 @@ pub struct Change {
 impl Change {
     /// Where the things this change made or moved are now.
     pub fn landed(&self) -> Vec<PathBuf> {
-        let landed = self.steps.iter().filter_map(|step| match step {
-            Step::Moved { to, .. } => Some(to.clone()),
-            Step::Created { at, parked: None } => Some(at.clone()),
-            _ => None,
+        let landed = self.steps.iter().map(|step| match step {
+            Step::Moved { to, .. } => vec![to.clone()],
+            Step::Created { at, parked: None } | Step::Tagged { at, .. } => vec![at.clone()],
+            Step::Renamed { moves } => moves.iter().map(|(_, to)| to.clone()).collect(),
+            _ => Vec::new(),
         });
-        landed.collect()
+        landed.flatten().collect()
     }
 
     /// Where the things this change moved or trashed came from.
     pub fn origins(&self) -> Vec<PathBuf> {
-        let origins = self.steps.iter().filter_map(|step| match step {
-            Step::Moved { from, .. } | Step::Trashed { from, .. } => Some(from.clone()),
-            Step::Created { .. } => None,
+        let origins = self.steps.iter().map(|step| match step {
+            Step::Moved { from, .. } | Step::Trashed { from, .. } => vec![from.clone()],
+            Step::Tagged { at, .. } => vec![at.clone()],
+            Step::Renamed { moves } => moves.iter().map(|(from, _)| from.clone()).collect(),
+            Step::Created { .. } => Vec::new(),
         });
-        origins.collect()
+        origins.flatten().collect()
     }
 
     /// The name of the first item it touched, as it was before a rename.
@@ -105,9 +181,317 @@ impl Change {
         match self.steps.first() {
             Some(Step::Moved { from: path, .. })
             | Some(Step::Trashed { from: path, .. })
-            | Some(Step::Created { at: path, .. }) => shown(path),
+            | Some(Step::Created { at: path, .. })
+            | Some(Step::Tagged { at: path, .. }) => shown(path),
+            Some(Step::Renamed { moves }) => moves
+                .first()
+                .map(|(from, _)| shown(from))
+                .unwrap_or_default(),
             None => String::new(),
         }
+    }
+}
+
+/// The longest name a file can have on a Mac, in bytes.
+const NAME_MAX: usize = 255;
+
+/// Bulk rename: the items' new names, a line each, as they came back from
+/// the editor, made into renames. Every line is checked first, in flea's
+/// words, and with one wrong nothing is renamed. Unchanged names are left
+/// out; a name may be one another item of the batch is giving up.
+pub fn plan_renames(items: &[PathBuf], names: &[String]) -> Result<Vec<(PathBuf, PathBuf)>, Error> {
+    if names.len() != items.len() {
+        return Err(Error(
+            "Bulk rename refused: the number of names changed".into(),
+        ));
+    }
+    let nested = items.iter().any(|item| {
+        let holds = |other: &&PathBuf| *other != item && item.starts_with(other);
+        items.iter().any(|other| holds(&other))
+    });
+    if nested {
+        return Err(Error(
+            "Rename selected folders separately from their selected contents".into(),
+        ));
+    }
+    for (index, name) in names.iter().enumerate() {
+        let reason = if name.trim().is_empty() {
+            "empty".to_string()
+        } else if name.contains('/') {
+            "contains /".to_string()
+        } else if matches!(name.as_str(), "." | "..") || name.contains('\0') {
+            "invalid".to_string()
+        } else if name.len() > NAME_MAX {
+            "too long".to_string()
+        } else {
+            let folder = items[index].parent();
+            let alike = |(earlier, other): &(usize, &String)| {
+                items[*earlier].parent() == folder && other.to_lowercase() == name.to_lowercase()
+            };
+            match names.iter().enumerate().take(index).find(alike) {
+                Some((earlier, _)) => format!(
+                    "same as line {}. Give each item a different name.",
+                    earlier + 1
+                ),
+                None => continue,
+            }
+        };
+        return Err(Error(format!("Line {}: {reason}", index + 1)));
+    }
+    let moves: Vec<(PathBuf, PathBuf)> = items
+        .iter()
+        .zip(names)
+        .filter(|(item, name)| item.file_name() != Some(OsStr::new(name.as_str())))
+        .map(|(item, name)| (item.clone(), item.with_file_name(name)))
+        .collect();
+    let ours = |place: &Path| moves.iter().any(|(from, _)| same_entry(from, place));
+    if moves.iter().any(|(_, to)| exists(to) && !ours(to)) {
+        return Err(Error(
+            "Bulk rename refused: a destination already exists".into(),
+        ));
+    }
+    Ok(moves)
+}
+
+/// Renames the items as planned, as one change for the undo log.
+pub fn bulk_rename(moves: &[(PathBuf, PathBuf)]) -> Result<Change, Error> {
+    run_batch(moves)?;
+    Ok(Change {
+        kind: Kind::BulkRename,
+        steps: vec![Step::Renamed {
+            moves: moves.to_vec(),
+        }],
+    })
+}
+
+/// The same renames the other way round.
+fn reversed(moves: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
+    let back = moves.iter().map(|(from, to)| (to.clone(), from.clone()));
+    back.collect()
+}
+
+/// Renames each item to its new name: first every one to a temporary name
+/// of its own in its folder, then each to its new name, so that names can
+/// swap or go round. Nothing is ever renamed onto a name that is taken.
+/// When one can't be renamed, every item is put back under its old name.
+fn run_batch(moves: &[(PathBuf, PathBuf)]) -> Result<(), Error> {
+    let mut aside = Vec::with_capacity(moves.len());
+    for (from, _) in moves {
+        match set_aside(from) {
+            Ok(temporary) => aside.push(temporary),
+            Err(error) => {
+                let left = put_back(&moves[..aside.len()], &aside);
+                return Err(batch_error(from, &error, &left));
+            }
+        }
+    }
+    for (index, ((from, to), temporary)) in moves.iter().zip(&aside).enumerate() {
+        if let Err(error) = rename_new(temporary, to) {
+            // The ones already renamed step aside again, then all go back.
+            let mut left = Vec::new();
+            for ((_, to), temporary) in moves[..index].iter().zip(&aside) {
+                if rename_new(to, temporary).is_err() {
+                    left.push(to.clone());
+                }
+            }
+            left.extend(put_back(moves, &aside));
+            return Err(batch_error(from, &error, &left));
+        }
+    }
+    Ok(())
+}
+
+/// Renames an item to a temporary name of its own in its folder.
+fn set_aside(item: &Path) -> io::Result<PathBuf> {
+    let folder = item
+        .parent()
+        .ok_or_else(|| io::Error::other("it has no folder"))?;
+    for n in 0..TRIES {
+        let temporary = folder.join(format!(".filefinder-rename-{}-{n}", std::process::id()));
+        match rename_new(item, &temporary) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            done => return done.map(|()| temporary),
+        }
+    }
+    Err(io::ErrorKind::AlreadyExists.into())
+}
+
+/// Puts items set aside back under their old names. Where any had to be
+/// left instead.
+fn put_back(moves: &[(PathBuf, PathBuf)], aside: &[PathBuf]) -> Vec<PathBuf> {
+    let back = moves.iter().zip(aside);
+    back.filter(|((from, _), temporary)| rename_new(temporary, from).is_err())
+        .map(|(_, temporary)| temporary.clone())
+        .collect()
+}
+
+fn batch_error(item: &Path, error: &io::Error, left: &[PathBuf]) -> Error {
+    let mut said = format!("Couldn't rename {}{}", shown(item), because(error));
+    if !left.is_empty() {
+        let names: Vec<String> = left.iter().map(|path| shown(path)).collect();
+        said.push_str(&format!(
+            " Some items could not be put back and are named {}.",
+            names.join(", ")
+        ));
+    }
+    Error(said)
+}
+
+/// Has the editor change the names, a line each, in a file of its own in a
+/// private folder of the system's temporary folder, taken away again after.
+/// `None` when the editor failed: nothing is to be renamed then.
+pub fn edit_names(
+    names: &[String],
+    edit: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<Option<Vec<String>>, Error> {
+    if names
+        .iter()
+        .any(|name| name.contains('\n') || name.contains('\r'))
+    {
+        return Err(Error(
+            "Bulk rename cannot represent a filename containing a line break".into(),
+        ));
+    }
+    let base = std::env::temp_dir();
+    let folder = (0..TRIES)
+        .map(|n| base.join(format!("filefinder-rename-{}-{n}", std::process::id())))
+        .find(|folder| fs::DirBuilder::new().mode(0o700).create(folder).is_ok())
+        .ok_or_else(|| Error("Bulk rename could not make its edit directory.".into()))?;
+    let file = folder.join("names.txt");
+    let mut text = names.join("\n");
+    text.push('\n');
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file)
+        .and_then(|mut out| io::Write::write_all(&mut out, text.as_bytes()));
+    if written.is_err() {
+        let _ = fs::remove_dir_all(&folder);
+        return Err(Error("Bulk rename could not make its edit file.".into()));
+    }
+    let edited = edit(&file);
+    let read = fs::read(&file);
+    let _ = fs::remove_dir_all(&folder);
+    if edited.is_err() {
+        return Ok(None);
+    }
+    let text = read
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| Error("Bulk rename cannot handle a name that is not valid text".into()))?;
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect();
+    // The line break that ends the last line ends no line of its own.
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    Ok(Some(lines))
+}
+
+/// What a tag key asks for: one of the seven on or off, or none of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tagging {
+    /// Taken off where every item has it, added where it is missing.
+    Toggle(usize),
+    /// Every one of the seven taken off; tags of the user's own stay.
+    RemoveAll,
+}
+
+/// What a tag change turned out to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retagged {
+    Added(usize),
+    Removed(usize),
+    Cleared,
+}
+
+/// Changes the Finder tags of the items, as `tagging` asks. Every item's
+/// attribute is read first: one that can't be read is never written over.
+/// When one can't be written, the ones already written are put back, so
+/// either every item changed or none did.
+pub fn retag(items: &[PathBuf], tagging: Tagging) -> Result<(Retagged, Change), Error> {
+    use crate::tags;
+    let mut read = Vec::with_capacity(items.len());
+    for item in items {
+        let refused = |why: String| Error(format!("Couldn't tag {}: {why}", shown(item)));
+        let raw = match tags::read(item) {
+            Ok(raw) => raw,
+            Err(error) if tags::is_unsupported(&error) => {
+                return Err(Error(tags::UNSUPPORTED.to_string()));
+            }
+            Err(error) => return Err(refused(why_failed(&error))),
+        };
+        let labels = match &raw {
+            None => Vec::new(),
+            Some(bytes) => {
+                tags::decode(bytes).ok_or_else(|| refused("its tags can't be read.".into()))?
+            }
+        };
+        read.push((item, raw, labels));
+    }
+    let has = |labels: &[String], index: usize| tags::mask(labels) & 1 << index != 0;
+    let what = match tagging {
+        Tagging::Toggle(index) if read.iter().all(|(_, _, labels)| has(labels, index)) => {
+            Retagged::Removed(index)
+        }
+        Tagging::Toggle(index) => Retagged::Added(index),
+        Tagging::RemoveAll => Retagged::Cleared,
+    };
+    let mut steps = Vec::new();
+    for (item, before, labels) in read {
+        let wanted = match what {
+            Retagged::Added(index) => tags::with(&labels, index),
+            Retagged::Removed(index) => tags::without(&labels, index),
+            Retagged::Cleared => tags::without_known(&labels),
+        };
+        if wanted == labels {
+            continue;
+        }
+        let after = (!wanted.is_empty()).then(|| tags::encode(&wanted));
+        if let Err(error) = write_tags(item, after.as_deref()) {
+            // The ones already done go back to what they were.
+            for step in steps.iter().rev() {
+                if let Step::Tagged { at, before, .. } = step {
+                    let _ = tags::write(at, before.as_deref());
+                }
+            }
+            return Err(error);
+        }
+        steps.push(Step::Tagged {
+            at: item.clone(),
+            before,
+            after,
+        });
+    }
+    let change = Change {
+        kind: Kind::Tag,
+        steps,
+    };
+    Ok((what, change))
+}
+
+/// Writes an item's tags, unless the system would write a file of the
+/// user's over to keep them: on a disk without attributes of its own, they
+/// go in a `._name` file next to it.
+fn write_tags(item: &Path, value: Option<&[u8]>) -> Result<(), Error> {
+    let refused = |why: String| Error(format!("Couldn't tag {}: {why}", shown(item)));
+    if let (Some(folder), Some(name)) = (item.parent(), item.file_name()) {
+        let mut companion = OsString::from("._");
+        companion.push(name);
+        let companion = folder.join(companion);
+        if exists(&companion) && !is_apple_double(&companion) && keeps_companions(folder) {
+            let error = io::Error::other(SideBySide(name.to_string_lossy().into_owned()));
+            return Err(refused(why_failed(&error)));
+        }
+    }
+    match crate::tags::write(item, value) {
+        Ok(()) => Ok(()),
+        Err(error) if crate::tags::is_unsupported(&error) => {
+            Err(Error(crate::tags::UNSUPPORTED.to_string()))
+        }
+        Err(error) => Err(refused(why_failed(&error))),
     }
 }
 
@@ -423,13 +807,13 @@ pub fn delete(items: &[PathBuf]) -> Deleted {
     Deleted { done, error }
 }
 
-/// The name the archive of these items would get right now: the item's own
-/// with `.zip` after it, `Archive.zip` for several, or the first "keep both"
-/// name after that which is free in their folder.
-pub fn archive_name(items: &[PathBuf]) -> Result<String, Error> {
-    let named = archive_place(items).and_then(|(folder, name)| {
-        let mut free =
-            candidates(OsStr::new(&name), false).filter(|name| !exists(&folder.join(name)));
+/// The name the archive of these items would get right now, flea's way:
+/// one item's name without its extension, or the name of the folder
+/// several are in, then the format's ending; or the first of flea's copy
+/// names after that which is free in their folder (`pack copy.tar.gz`).
+pub fn archive_name(items: &[PathBuf], format: Format) -> Result<String, Error> {
+    let named = archive_place(items).and_then(|(folder, stem)| {
+        let mut free = archive_candidates(&stem, format).filter(|name| !exists(&folder.join(name)));
         free.next()
             .ok_or_else(|| io::ErrorKind::AlreadyExists.into())
     });
@@ -439,15 +823,27 @@ pub fn archive_name(items: &[PathBuf]) -> Result<String, Error> {
     }
 }
 
-/// Makes one zip archive of the items, beside them. `zip` is what writes it,
-/// to the path it is given: a new file in a folder made for it alone, which
-/// takes its "keep both" name next to the items only once it is whole.
-/// Nothing is overwritten, and an archive that fails or is stopped halfway
-/// is removed again.
+/// An archive's name, then flea's copy names: `pack.tar.gz`,
+/// `pack copy.tar.gz`, `pack copy 2.tar.gz` and so on.
+fn archive_candidates(stem: &str, format: Format) -> impl Iterator<Item = OsString> {
+    let (stem, extension) = (stem.to_string(), format.extension());
+    (0..TRIES).map(move |n| match n {
+        0 => format!("{stem}.{extension}").into(),
+        1 => format!("{stem} copy.{extension}").into(),
+        n => format!("{stem} copy {n}.{extension}").into(),
+    })
+}
+
+/// Makes one archive of the items in a format, beside them. `write` is what
+/// writes it, to the path it is given: a new file in a folder made for it
+/// alone, which takes its free name next to the items only once it is
+/// whole. Nothing is overwritten, and an archive that fails or is stopped
+/// halfway is removed again.
 pub fn compress(
     items: &[PathBuf],
+    format: Format,
     cancel: &dyn Cancel,
-    zip: impl FnOnce(&Path) -> io::Result<()>,
+    write: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Report {
     let mut report = Report {
         change: Change {
@@ -465,7 +861,7 @@ pub fn compress(
         report.stopped = true;
         return report;
     }
-    match archive(items, zip) {
+    match archive(items, format, write) {
         Ok(at) => {
             report.done = items.len();
             report.change.steps.push(created(at));
@@ -480,7 +876,8 @@ fn not_compressed(error: &io::Error) -> Error {
     Error(format!("Couldn't compress: {}", why_failed(error)))
 }
 
-/// The folder an archive of these items goes in, and the name it asks for.
+/// The folder an archive of these items goes in, and its name before the
+/// format's ending.
 fn archive_place(items: &[PathBuf]) -> io::Result<(PathBuf, String)> {
     let nowhere = || io::Error::other("there is nothing to compress");
     let first = items.first().ok_or_else(nowhere)?;
@@ -488,19 +885,34 @@ fn archive_place(items: &[PathBuf]) -> io::Result<(PathBuf, String)> {
     if items.iter().any(|item| item.parent() != Some(folder)) {
         return Err(io::Error::other("the items are in different folders"));
     }
-    let name = match items {
-        [one] => format!("{}.zip", shown(one)),
-        _ => "Archive.zip".to_string(),
+    let stem = match items {
+        [one] => {
+            let name = shown(one);
+            match name.rfind('.') {
+                Some(dot) if dot > 0 => name[..dot].to_string(),
+                _ => name,
+            }
+        }
+        _ => match folder.file_name() {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => "archive".to_string(),
+        },
     };
-    Ok((folder.to_path_buf(), name))
+    Ok((folder.to_path_buf(), stem))
 }
 
 /// Has the archive written and puts it in place. Where it ended up.
-fn archive(items: &[PathBuf], zip: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<PathBuf> {
-    let (folder, name) = archive_place(items)?;
+fn archive(
+    items: &[PathBuf],
+    format: Format,
+    write: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    let (folder, stem) = archive_place(items)?;
+    let name = format!("{stem}.{}", format.extension());
     let scratch = scratch_folder(&folder, &name)?;
     let part = scratch.join(&name);
-    let placed = zip(&part).and_then(|()| park(&part, &folder, &rename_new));
+    let names = archive_candidates(&stem, format);
+    let placed = write(&part).and_then(|()| park_as(&part, &folder, names, &rename_new));
     // The folder was made a moment ago for this archive alone: what is left
     // in it is the half of one that failed, or nothing.
     let _ = remove(&scratch);
@@ -519,6 +931,140 @@ fn scratch_folder(folder: &Path, name: &str) -> io::Result<PathBuf> {
         }
     }
     Err(io::ErrorKind::AlreadyExists.into())
+}
+
+/// Extracts an archive into a new folder beside it, named after it without
+/// its ending (`pack.tar.gz` into `pack`), or the next free copy name. `list`
+/// gives the names inside it and `unpack` writes what it holds into the
+/// folder it is given. Nothing is written when a name would land outside
+/// that folder: one from the root, or one with `..`. The folder is filled
+/// out of sight, then takes its name only once it is whole and holds no
+/// link that leads outside it; otherwise it is removed, as it is when the
+/// work fails or is stopped halfway.
+pub fn extract(
+    archive: &Path,
+    cancel: &dyn Cancel,
+    list: impl FnOnce() -> io::Result<Vec<String>>,
+    unpack: impl FnOnce(&Path) -> io::Result<()>,
+) -> Report {
+    let mut report = Report {
+        change: Change {
+            kind: Kind::Extract,
+            steps: Vec::new(),
+        },
+        asked: 1,
+        done: 0,
+        skipped: 0,
+        declined: 0,
+        stopped: false,
+        error: None,
+    };
+    let name = shown(archive);
+    let refused = |why: &str| Some(Error(format!("Couldn't extract {name}: {why}")));
+    let damaged = "it is damaged or needs a password.";
+    let (Some(folder), Some((_, stem))) = (archive.parent(), Format::of_archive(&name)) else {
+        report.error = refused("it isn't an archive.");
+        return report;
+    };
+    let names = match list() {
+        _ if cancel.cancelled() => {
+            report.stopped = true;
+            return report;
+        }
+        Ok(names) => names,
+        Err(_) => {
+            report.error = refused(damaged);
+            return report;
+        }
+    };
+    if names.iter().any(|name| leaves_its_folder(name)) {
+        report.error = refused("it holds items that would land outside its folder.");
+        return report;
+    }
+    let scratch = match scratch_folder(folder, stem) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            report.error = refused(&why_failed(&error));
+            return report;
+        }
+    };
+    let inside = scratch.join(stem);
+    let unpacked = fs::create_dir(&inside).and_then(|()| unpack(&inside));
+    let outcome = match unpacked {
+        _ if cancel.cancelled() => Err(None),
+        Err(_) => Err(refused(damaged)),
+        Ok(()) if links_lead_outside(&inside, &inside) => {
+            Err(refused("a link in it points outside its folder."))
+        }
+        Ok(()) => {
+            let names = candidates(OsStr::new(stem), true);
+            park_as(&inside, folder, names, &rename_new)
+                .map_err(|error| refused(&why_failed(&error)))
+        }
+    };
+    // The folder was made a moment ago for this alone: what is left in it
+    // is the part of one that failed, or nothing.
+    let _ = remove(&scratch);
+    match outcome {
+        Ok(at) => {
+            report.done = 1;
+            report.change.steps.push(created(at));
+        }
+        Err(None) => report.stopped = true,
+        Err(error) => report.error = error,
+    }
+    report
+}
+
+/// Whether a name inside an archive would land outside the folder it is
+/// extracted in: one from the root, or one that goes up with `..`.
+fn leaves_its_folder(name: &str) -> bool {
+    use std::path::Component;
+    let path = Path::new(name);
+    path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::RootDir))
+}
+
+/// Whether any link in `folder`, or below it, points outside `root`: to a
+/// path from the root, or up past `root` with `..`.
+fn links_lead_outside(root: &Path, folder: &Path) -> bool {
+    use std::path::Component;
+    let Ok(items) = fs::read_dir(folder) else {
+        // What can't be looked through can't be vouched for.
+        return true;
+    };
+    items.flatten().any(|item| {
+        let path = item.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return true;
+        };
+        if meta.is_dir() {
+            return links_lead_outside(root, &path);
+        }
+        if !meta.file_type().is_symlink() {
+            return false;
+        }
+        let Ok(target) = fs::read_link(&path) else {
+            return true;
+        };
+        // How deep below the root the link is, then where its target goes.
+        let mut depth = path.parent().map_or(0, |parent| {
+            parent
+                .strip_prefix(root)
+                .map_or(0, |below| below.components().count())
+        }) as isize;
+        target.components().any(|part| {
+            match part {
+                Component::Normal(_) => depth += 1,
+                Component::ParentDir => depth -= 1,
+                Component::CurDir => {}
+                Component::RootDir | Component::Prefix(_) => return true,
+            }
+            depth < 0
+        })
+    })
 }
 
 /// Moves items out of the trash, each back to the exact place given for it:
@@ -736,13 +1282,56 @@ impl Step {
             (Step::Moved { to, .. }, Way::Undo) => Some(to),
             (Step::Created { at, .. }, Way::Undo) => Some(at),
             (Step::Moved { from, .. } | Step::Trashed { from, .. }, Way::Redo) => Some(from),
-            (Step::Trashed { .. }, Way::Undo) | (Step::Created { .. }, Way::Redo) => None,
+            (Step::Trashed { .. }, Way::Undo)
+            | (Step::Created { .. }, Way::Redo)
+            | (Step::Tagged { .. } | Step::Renamed { .. }, _) => None,
         }
     }
 
     /// Why this step can't be taken back, or done again, as the world is
     /// now, once the places in `freed` are free.
     fn blocked(&self, way: Way, freed: &[&Path]) -> Option<String> {
+        if let Step::Renamed { moves } = self {
+            // Each item is where the batch left it, and each old name free
+            // but for the items of the batch itself.
+            let turned: Vec<(PathBuf, PathBuf)>;
+            let moves = match way {
+                Way::Redo => moves,
+                Way::Undo => {
+                    turned = reversed(moves);
+                    &turned
+                }
+            };
+            for (from, _) in moves {
+                if !exists(from) {
+                    return Some(format!("{} isn't where it was left.", shown(from)));
+                }
+            }
+            let ours = |place: &Path| moves.iter().any(|(from, _)| same_entry(from, place));
+            let taken = moves
+                .iter()
+                .map(|(_, to)| to)
+                .find(|to| exists(to) && !ours(to))?;
+            return Some(format!(
+                "{} already exists in {}.",
+                shown(taken),
+                folder_name(taken)
+            ));
+        }
+        if let Step::Tagged { at, before, after } = self {
+            // The item is still there, tagged as this change left it.
+            let left = match way {
+                Way::Undo => after,
+                Way::Redo => before,
+            };
+            if !exists(at) {
+                return Some(format!("{} isn't where it was left.", shown(at)));
+            }
+            return match crate::tags::read(at) {
+                Ok(now) if now == *left => None,
+                _ => Some(format!("the tags of {} changed since.", shown(at))),
+            };
+        }
         // What has to be there, the place that has to be free, and the item's name.
         let (source, free, item) = match (self, way) {
             (Step::Moved { from, to }, Way::Undo) => (Some(to), Some(from), to),
@@ -751,6 +1340,7 @@ impl Step {
             (Step::Trashed { from, .. }, Way::Redo) => (Some(from), None, from),
             (Step::Created { at, .. }, Way::Undo) => (Some(at), None, at),
             (Step::Created { at, parked }, Way::Redo) => (parked.as_ref(), Some(at), at),
+            (Step::Tagged { .. } | Step::Renamed { .. }, _) => return None,
         };
         let Some(source) = source.filter(|path| exists(path)) else {
             return Some(format!("{} isn't where it was left.", shown(item)));
@@ -774,6 +1364,8 @@ impl Step {
                 *parked = Some(trash_item(at, trash_dir, &rename_new, &volume_trash)?);
                 Ok(())
             }
+            Step::Tagged { at, before, .. } => write_tags(at, before.as_deref()),
+            Step::Renamed { moves } => run_batch(&reversed(moves)),
         }
     }
 
@@ -791,6 +1383,8 @@ impl Step {
                 *parked = None;
                 Ok(())
             }
+            Step::Tagged { at, after, .. } => write_tags(at, after.as_deref()),
+            Step::Renamed { moves } => run_batch(moves),
         }
     }
 }
@@ -1408,7 +2002,17 @@ fn park(item: &Path, dir: &Path, rename: Rename) -> io::Result<PathBuf> {
     let name = item
         .file_name()
         .ok_or_else(|| io::Error::other("it has no name"))?;
-    for candidate in candidates(name, names_like_folder(item)) {
+    park_as(item, dir, candidates(name, names_like_folder(item)), rename)
+}
+
+/// Renames an item into a folder under the first of `names` that is free.
+fn park_as(
+    item: &Path,
+    dir: &Path,
+    names: impl Iterator<Item = OsString>,
+    rename: Rename,
+) -> io::Result<PathBuf> {
+    for candidate in names {
         let to = dir.join(candidate);
         match rename(item, &to) {
             Ok(()) => return Ok(to),
@@ -3015,49 +3619,56 @@ mod tests {
     // the real one is another program, behind the `System` port.
 
     #[test]
-    fn compressing_one_item_makes_a_zip_beside_it_under_its_name() {
+    fn compressing_one_item_makes_a_zip_beside_it_under_its_name_without_extension() {
         let w = world();
         let notes = w.file("Docs/notes.txt", "hello");
         let trip = w.folder("Docs/Trip");
         assert_eq!(
-            archive_name(std::slice::from_ref(&notes)).unwrap(),
-            "notes.txt.zip"
+            archive_name(std::slice::from_ref(&notes), Format::Zip).unwrap(),
+            "notes.zip"
         );
-        let report = compress(std::slice::from_ref(&notes), &go(), |archive| {
-            fs::write(archive, "zip of notes")
-        });
-        assert_eq!(w.names("Docs"), ["Trip", "notes.txt", "notes.txt.zip"]);
-        assert_eq!(w.read("Docs/notes.txt.zip"), "zip of notes");
+        let report = compress(
+            std::slice::from_ref(&notes),
+            Format::Zip,
+            &go(),
+            |archive| fs::write(archive, "zip of notes"),
+        );
+        assert_eq!(w.names("Docs"), ["Trip", "notes.txt", "notes.zip"]);
+        assert_eq!(w.read("Docs/notes.zip"), "zip of notes");
         assert_eq!(w.read("Docs/notes.txt"), "hello");
         assert_eq!((report.asked, report.done, report.stopped), (1, 1, false));
         assert_eq!(said(&report), None);
         assert_eq!(report.change.kind, Kind::Compress);
-        let archive = w.path("Docs/notes.txt.zip");
+        let archive = w.path("Docs/notes.zip");
         assert_eq!(report.change.steps, [created(archive.clone())]);
         assert_eq!(report.change.landed(), [archive]);
 
         // A folder's archive has the folder's whole name.
-        let report = compress(&[trip], &go(), |archive| fs::write(archive, "zip of Trip"));
+        let report = compress(&[trip], Format::Zip, &go(), |archive| {
+            fs::write(archive, "zip of Trip")
+        });
         assert_eq!(said(&report), None);
         assert_eq!(w.read("Docs/Trip.zip"), "zip of Trip");
         assert_eq!(
             w.names("Docs"),
-            ["Trip", "Trip.zip", "notes.txt", "notes.txt.zip"]
+            ["Trip", "Trip.zip", "notes.txt", "notes.zip"]
         );
     }
 
     #[test]
-    fn compressing_several_items_makes_one_archive_in_their_folder() {
+    fn compressing_several_items_makes_one_archive_named_after_their_folder() {
         let w = world();
         let items = [w.file("Docs/a.txt", "a"), w.folder("Docs/Trip")];
-        assert_eq!(archive_name(&items).unwrap(), "Archive.zip");
-        let report = compress(&items, &go(), |archive| fs::write(archive, "zip of both"));
-        assert_eq!(w.names("Docs"), ["Archive.zip", "Trip", "a.txt"]);
-        assert_eq!(w.read("Docs/Archive.zip"), "zip of both");
+        assert_eq!(archive_name(&items, Format::Zip).unwrap(), "Docs.zip");
+        let report = compress(&items, Format::Zip, &go(), |archive| {
+            fs::write(archive, "zip of both")
+        });
+        assert_eq!(w.names("Docs"), ["Docs.zip", "Trip", "a.txt"]);
+        assert_eq!(w.read("Docs/Docs.zip"), "zip of both");
         assert_eq!((report.asked, report.done, said(&report)), (2, 2, None));
         assert_eq!(
             report.change.steps,
-            [created(w.path("Docs/Archive.zip"))],
+            [created(w.path("Docs/Docs.zip"))],
             "one archive, one thing to undo"
         );
     }
@@ -3066,34 +3677,36 @@ mod tests {
     fn a_taken_archive_name_keeps_both_and_nothing_is_overwritten() {
         let w = world();
         let notes = w.file("notes.txt", "hello");
-        w.file("notes.txt.zip", "old archive");
+        w.file("notes.zip", "old archive");
         let items = [notes];
-        assert_eq!(archive_name(&items).unwrap(), "notes.txt copy.zip");
-        let report = compress(&items, &go(), |archive| fs::write(archive, "second"));
+        assert_eq!(archive_name(&items, Format::Zip).unwrap(), "notes copy.zip");
+        let report = compress(&items, Format::Zip, &go(), |archive| {
+            fs::write(archive, "second")
+        });
         assert_eq!(said(&report), None);
-        assert_eq!(report.change.steps, [created(w.path("notes.txt copy.zip"))]);
-        assert_eq!(w.read("notes.txt.zip"), "old archive");
-        assert_eq!(w.read("notes.txt copy.zip"), "second");
+        assert_eq!(report.change.steps, [created(w.path("notes copy.zip"))]);
+        assert_eq!(w.read("notes.zip"), "old archive");
+        assert_eq!(w.read("notes copy.zip"), "second");
 
         // A file that takes the name while the archive is being written is
         // not written over either.
-        let late = w.path("notes.txt copy 2.zip");
-        let report = compress(&items, &go(), |archive| {
+        let late = w.path("notes copy 2.zip");
+        let report = compress(&items, Format::Zip, &go(), |archive| {
             fs::write(&late, "appeared meanwhile")?;
             fs::write(archive, "third")
         });
         assert_eq!(said(&report), None);
-        assert_eq!(w.read("notes.txt copy 2.zip"), "appeared meanwhile");
-        assert_eq!(w.read("notes.txt copy 3.zip"), "third");
+        assert_eq!(w.read("notes copy 2.zip"), "appeared meanwhile");
+        assert_eq!(w.read("notes copy 3.zip"), "third");
         assert_eq!(
             w.names(""),
             [
                 ".Trash",
+                "notes copy 2.zip",
+                "notes copy 3.zip",
+                "notes copy.zip",
                 "notes.txt",
-                "notes.txt copy 2.zip",
-                "notes.txt copy 3.zip",
-                "notes.txt copy.zip",
-                "notes.txt.zip",
+                "notes.zip",
             ],
             "and nothing else is left behind"
         );
@@ -3104,7 +3717,7 @@ mod tests {
         let w = world();
         let notes = w.file("Docs/notes.txt", "hello");
         let items = [notes];
-        let report = compress(&items, &go(), |archive| {
+        let report = compress(&items, Format::Zip, &go(), |archive| {
             fs::write(archive, "half an archive")?;
             Err(io::Error::other("the archive couldn't be written"))
         });
@@ -3118,7 +3731,7 @@ mod tests {
 
         // Stopped: the same, without it being a failure.
         let stop = AtomicBool::new(false);
-        let report = compress(&items, &stop, |archive| {
+        let report = compress(&items, Format::Zip, &stop, |archive| {
             fs::write(archive, "half an archive")?;
             stop.store(true, Ordering::Relaxed);
             Err(io::ErrorKind::Interrupted.into())
@@ -3133,7 +3746,9 @@ mod tests {
 
         // A folder that takes nothing new: said, and the archiver never runs.
         fs::set_permissions(w.path("Docs"), Permissions::from_mode(0o555)).unwrap();
-        let report = compress(&items, &go(), |_| panic!("there is nowhere to write"));
+        let report = compress(&items, Format::Zip, &go(), |_| {
+            panic!("there is nowhere to write")
+        });
         fs::set_permissions(w.path("Docs"), Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             said(&report).as_deref(),
@@ -3147,8 +3762,11 @@ mod tests {
         let w = world();
         let items = [w.file("One/a.txt", "a"), w.file("Two/b.txt", "b")];
         let why = "Couldn't compress: The items are in different folders.";
-        assert_eq!(archive_name(&items).unwrap_err().to_string(), why);
-        let report = compress(&items, &go(), |_| panic!("nothing to write"));
+        assert_eq!(
+            archive_name(&items, Format::Zip).unwrap_err().to_string(),
+            why
+        );
+        let report = compress(&items, Format::Zip, &go(), |_| panic!("nothing to write"));
         assert_eq!(said(&report).as_deref(), Some(why));
         assert_eq!(w.names("One"), ["a.txt"]);
         assert_eq!(w.names("Two"), ["b.txt"]);
@@ -3609,5 +4227,590 @@ mod tests {
         assert!(there.exists());
         assert!(w.names(".Trash").is_empty());
         assert!(report.change.steps.is_empty());
+    }
+
+    fn tag_names(path: &Path) -> Vec<String> {
+        crate::tags::labels(path)
+    }
+
+    fn put_tags(path: &Path, labels: &[&str]) {
+        let labels: Vec<String> = labels.iter().map(|label| label.to_string()).collect();
+        crate::tags::write(path, Some(&crate::tags::encode(&labels))).unwrap();
+    }
+
+    #[test]
+    fn a_tag_is_added_where_it_is_missing_and_removed_only_where_every_item_has_it() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        let b = w.file("b.txt", "beta");
+        put_tags(&a, &["Red\n6"]);
+        let a_before = crate::tags::read(&a).unwrap();
+
+        // Red on a, not on b: added to b, a left alone.
+        let (what, change) = retag(&[a.clone(), b.clone()], Tagging::Toggle(0)).unwrap();
+        assert_eq!(what, Retagged::Added(0));
+        assert_eq!(change.kind, Kind::Tag);
+        assert_eq!(change.steps.len(), 1);
+        assert_eq!(crate::tags::read(&a).unwrap(), a_before);
+        assert_eq!(tag_names(&b), ["Red\n6"]);
+
+        // Now both have it: taken off both.
+        let (what, change) = retag(&[a.clone(), b.clone()], Tagging::Toggle(0)).unwrap();
+        assert_eq!(what, Retagged::Removed(0));
+        assert_eq!(change.steps.len(), 2);
+        assert_eq!(crate::tags::read(&a).unwrap(), None);
+        assert_eq!(crate::tags::read(&b).unwrap(), None);
+        // The files themselves never change.
+        assert_eq!(w.read("a.txt"), "alpha");
+        assert_eq!(w.read("b.txt"), "beta");
+    }
+
+    #[test]
+    fn tags_this_app_does_not_know_are_kept_through_every_change() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        put_tags(&a, &["Work", "Blue\n4", "Custom\n0"]);
+        retag(std::slice::from_ref(&a), Tagging::Toggle(0)).unwrap();
+        assert_eq!(tag_names(&a), ["Work", "Blue\n4", "Custom\n0", "Red\n6"]);
+        retag(std::slice::from_ref(&a), Tagging::Toggle(4)).unwrap();
+        assert_eq!(tag_names(&a), ["Work", "Custom\n0", "Red\n6"]);
+        let (what, _) = retag(std::slice::from_ref(&a), Tagging::RemoveAll).unwrap();
+        assert_eq!(what, Retagged::Cleared);
+        assert_eq!(tag_names(&a), ["Work", "Custom\n0"]);
+        // With only tags of its own, Remove All changes nothing.
+        let (_, change) = retag(std::slice::from_ref(&a), Tagging::RemoveAll).unwrap();
+        assert!(change.steps.is_empty());
+        assert_eq!(tag_names(&a), ["Work", "Custom\n0"]);
+    }
+
+    #[test]
+    fn undoing_a_tag_change_puts_back_the_exact_attribute_and_redo_does_it_again() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        let b = w.file("b.txt", "beta");
+        put_tags(&a, &["Custom\n0"]);
+        let a_before = crate::tags::read(&a).unwrap();
+        let mut history = History::default();
+        let (_, change) = retag(&[a.clone(), b.clone()], Tagging::Toggle(2)).unwrap();
+        history.record(change);
+        let (a_after, b_after) = (
+            crate::tags::read(&a).unwrap(),
+            crate::tags::read(&b).unwrap(),
+        );
+
+        let undone = history.undo(&w.trash).unwrap().unwrap();
+        assert_eq!(undone.kind, Kind::Tag);
+        assert_eq!(crate::tags::read(&a).unwrap(), a_before);
+        // b had no attribute at all, and has none again.
+        assert_eq!(crate::tags::read(&b).unwrap(), None);
+        history.redo(&w.trash).unwrap().unwrap();
+        assert_eq!(crate::tags::read(&a).unwrap(), a_after);
+        assert_eq!(crate::tags::read(&b).unwrap(), b_after);
+
+        // Moved away, it isn't tagged back where it isn't.
+        fs::rename(&b, w.path("c.txt")).unwrap();
+        let error = history.undo(&w.trash).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Can't undo that: b.txt isn't where it was left."
+        );
+        assert_eq!(crate::tags::read(&a).unwrap(), a_after);
+        fs::rename(w.path("c.txt"), &b).unwrap();
+
+        // Tagged again since by someone else: that is never undone over.
+        put_tags(&a, &["Purple\n3"]);
+        let error = history.undo(&w.trash).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Can't undo that: the tags of a.txt changed since."
+        );
+        assert_eq!(tag_names(&a), ["Purple\n3"]);
+        assert_eq!(crate::tags::read(&b).unwrap(), b_after);
+    }
+
+    #[test]
+    fn a_disk_that_cannot_keep_tags_says_so_and_nothing_is_changed() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        let b = w.file("Stick/b.txt", "beta");
+        crate::tags::testing::pretend_unsupported(&w.path("Stick"));
+        let error = retag(&[a.clone(), b.clone()], Tagging::Toggle(0)).unwrap_err();
+        assert_eq!(error.to_string(), crate::tags::UNSUPPORTED);
+        // a was tagged first, and untagged again when b couldn't be.
+        assert_eq!(crate::tags::read(&a).unwrap(), None);
+        assert_eq!(crate::tags::read(&b).unwrap(), None);
+    }
+
+    #[test]
+    fn tags_are_never_written_where_the_system_would_write_over_a_file_of_the_users() {
+        let w = world();
+        let usb = w.folder("USB");
+        let _fat = Fat::at(usb.clone());
+        let x = w.file("USB/x.txt", "x");
+        w.file("USB/._x.txt", "my own notes");
+        let error = retag(std::slice::from_ref(&x), Tagging::Toggle(0)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Couldn't tag x.txt: x.txt and ._x.txt can't be side by side on this disk."
+        );
+        assert_eq!(w.read("USB/._x.txt"), "my own notes");
+        assert_eq!(crate::tags::read(&x).unwrap(), None);
+    }
+
+    #[test]
+    fn tags_that_cannot_be_read_are_never_written_over() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        crate::tags::write(&a, Some(b"not a property list")).unwrap();
+        let error = retag(std::slice::from_ref(&a), Tagging::Toggle(0)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Couldn't tag a.txt: its tags can't be read."
+        );
+        assert_eq!(
+            crate::tags::read(&a).unwrap().as_deref(),
+            Some(&b"not a property list"[..])
+        );
+    }
+
+    fn moves(pairs: &[(&PathBuf, &PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
+        pairs
+            .iter()
+            .map(|(from, to)| (from.to_path_buf(), to.to_path_buf()))
+            .collect()
+    }
+
+    #[test]
+    fn a_batch_renames_through_temporary_names_so_names_can_swap_and_go_round() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        let b = w.file("b.txt", "beta");
+        let c = w.file("c.txt", "gamma");
+        // a and b swap names.
+        let change = bulk_rename(&moves(&[(&a, &b), (&b, &a)])).unwrap();
+        assert_eq!(change.kind, Kind::BulkRename);
+        assert_eq!(change.steps.len(), 1);
+        assert_eq!(w.read("a.txt"), "beta");
+        assert_eq!(w.read("b.txt"), "alpha");
+        assert_eq!(w.names(""), [".Trash", "a.txt", "b.txt", "c.txt"]);
+        // a → b, b → c, c → a.
+        let mut history = History::default();
+        history.record(bulk_rename(&moves(&[(&a, &b), (&b, &c), (&c, &a)])).unwrap());
+        assert_eq!(w.read("b.txt"), "beta");
+        assert_eq!(w.read("c.txt"), "alpha");
+        assert_eq!(w.read("a.txt"), "gamma");
+        assert_eq!(w.names(""), [".Trash", "a.txt", "b.txt", "c.txt"]);
+
+        // One undo takes the whole batch back, and redo does it again.
+        let undone = history.undo(&w.trash).unwrap().unwrap();
+        assert_eq!(undone.kind, Kind::BulkRename);
+        assert_eq!(w.read("a.txt"), "beta");
+        assert_eq!(w.read("b.txt"), "alpha");
+        assert_eq!(w.read("c.txt"), "gamma");
+        history.redo(&w.trash).unwrap().unwrap();
+        assert_eq!(w.read("a.txt"), "gamma");
+        assert_eq!(w.names(""), [".Trash", "a.txt", "b.txt", "c.txt"]);
+
+        // An item moved away since is never renamed back where it isn't.
+        fs::rename(&c, w.path("elsewhere.txt")).unwrap();
+        let error = history.undo(&w.trash).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Can't undo that: c.txt isn't where it was left."
+        );
+        assert_eq!(w.read("a.txt"), "gamma");
+        assert_eq!(w.read("b.txt"), "beta");
+    }
+
+    #[test]
+    fn a_batch_that_fails_part_way_puts_every_item_back_under_its_old_name() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        let b = w.file("b.txt", "beta");
+        let taken = w.file("taken.txt", "someone else's");
+        let x = w.path("x.txt");
+        // a gets its new name first; b's is taken by then.
+        let error = bulk_rename(&moves(&[(&a, &x), (&b, &taken)])).unwrap_err();
+        assert_eq!(error.to_string(), "Couldn't rename b.txt.");
+        assert_eq!(w.read("a.txt"), "alpha");
+        assert_eq!(w.read("b.txt"), "beta");
+        assert_eq!(w.read("taken.txt"), "someone else's");
+        assert_eq!(w.names(""), [".Trash", "a.txt", "b.txt", "taken.txt"]);
+    }
+
+    #[test]
+    fn a_batch_of_names_is_refused_in_flea_words_before_anything_is_renamed() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        let b = w.file("b.txt", "beta");
+        let c = w.file("c.txt", "gamma");
+        w.file("other.txt", "other");
+        let items = [a.clone(), b.clone(), c.clone()];
+        let plan = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            plan_renames(&items, &names).map_err(|error| error.to_string())
+        };
+        let refused = |text: &str| Err(text.to_string());
+        assert_eq!(
+            plan(&["a.txt", "b.txt"]),
+            refused("Bulk rename refused: the number of names changed")
+        );
+        assert_eq!(plan(&["a.txt", "  ", "c.txt"]), refused("Line 2: empty"));
+        assert_eq!(
+            plan(&["a/x.txt", "b.txt", "c.txt"]),
+            refused("Line 1: contains /")
+        );
+        assert_eq!(plan(&["a.txt", "..", "c.txt"]), refused("Line 2: invalid"));
+        assert_eq!(plan(&["a.txt", "b\0", "c.txt"]), refused("Line 2: invalid"));
+        let long = "x".repeat(256);
+        assert_eq!(
+            plan(&["a.txt", "b.txt", &long]),
+            refused("Line 3: too long")
+        );
+        assert_eq!(
+            plan(&["d.txt", "e.txt", "D.TXT"]),
+            refused("Line 3: same as line 1. Give each item a different name.")
+        );
+        // An unchanged name counts: c keeps it, so a can't have it.
+        assert_eq!(
+            plan(&["c.txt", "b.txt", "c.txt"]),
+            refused("Line 3: same as line 1. Give each item a different name.")
+        );
+        assert_eq!(
+            plan(&["other.txt", "b.txt", "c.txt"]),
+            refused("Bulk rename refused: a destination already exists")
+        );
+        assert_eq!(
+            w.names(""),
+            [".Trash", "a.txt", "b.txt", "c.txt", "other.txt"]
+        );
+
+        // Unchanged names are left out; names taken by the batch itself are fine.
+        assert_eq!(
+            plan(&["b.txt", "a.txt", "c.txt"]),
+            Ok(moves(&[(&a, &b), (&b, &a)]))
+        );
+        assert_eq!(plan(&["a.txt", "b.txt", "c.txt"]), Ok(Vec::new()));
+        assert_eq!(
+            plan(&["A.txt", "b.txt", "c.txt"]),
+            Ok(vec![(a.clone(), w.path("A.txt"))])
+        );
+        // A folder and what is in it can't be renamed together.
+        let folder = w.folder("Dir");
+        let inside = w.file("Dir/d.txt", "delta");
+        let names = vec!["Box".to_string(), "e.txt".to_string()];
+        assert_eq!(
+            plan_renames(&[folder, inside], &names)
+                .unwrap_err()
+                .to_string(),
+            "Rename selected folders separately from their selected contents"
+        );
+    }
+
+    #[test]
+    fn the_names_are_edited_in_a_private_file_of_the_system_temporary_folder() {
+        let names = vec!["a.txt".to_string(), "b c.txt".to_string()];
+        let seen = std::cell::RefCell::new(None);
+        let edited = edit_names(&names, |file| {
+            assert!(file.starts_with(std::env::temp_dir()));
+            assert_eq!(fs::read_to_string(file).unwrap(), "a.txt\nb c.txt\n");
+            let folder = file.parent().unwrap();
+            let mode = fs::metadata(folder).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+            *seen.borrow_mut() = Some(file.to_path_buf());
+            fs::write(file, "x.txt\r\ny z.txt\n")
+        });
+        assert_eq!(
+            edited.unwrap(),
+            Some(vec!["x.txt".to_string(), "y z.txt".to_string()])
+        );
+        let file = seen.into_inner().unwrap();
+        assert!(!file.exists() && !file.parent().unwrap().exists());
+
+        // An editor that fails gives nothing back, and leaves nothing behind.
+        let seen = std::cell::RefCell::new(None);
+        let edited = edit_names(&names, |file| {
+            *seen.borrow_mut() = Some(file.to_path_buf());
+            Err(io::Error::other("the editor failed"))
+        });
+        assert_eq!(edited.unwrap(), None);
+        assert!(!seen.into_inner().unwrap().parent().unwrap().exists());
+
+        // A name holding a line break can't be one line of the file.
+        let names = vec!["a\nb".to_string()];
+        let error = edit_names(&names, |_| unreachable!()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Bulk rename cannot represent a filename containing a line break"
+        );
+    }
+
+    #[test]
+    fn an_archive_is_named_after_its_item_or_folder_and_never_takes_a_name_in_use() {
+        let w = world();
+        let notes = w.file("Work/notes.txt", "hello");
+        let pack = w.folder("Work/pack");
+        let dotted = w.file("Work/.profile", "dot");
+        let name = |items: &[PathBuf], format| archive_name(items, format).unwrap();
+        // One item: its name without its extension.
+        assert_eq!(
+            name(std::slice::from_ref(&notes), Format::TarGz),
+            "notes.tar.gz"
+        );
+        assert_eq!(name(std::slice::from_ref(&pack), Format::Zip), "pack.zip");
+        assert_eq!(
+            name(std::slice::from_ref(&dotted), Format::Tar),
+            ".profile.tar"
+        );
+        // Several: the folder they are in.
+        assert_eq!(
+            name(&[notes.clone(), pack.clone()], Format::TarXz),
+            "Work.tar.xz"
+        );
+        // Taken: flea's copy names, the format's whole extension kept.
+        w.file("Work/pack.tar.gz", "taken");
+        assert_eq!(
+            name(std::slice::from_ref(&pack), Format::TarGz),
+            "pack copy.tar.gz"
+        );
+        w.file("Work/pack copy.tar.gz", "taken");
+        assert_eq!(
+            name(std::slice::from_ref(&pack), Format::TarGz),
+            "pack copy 2.tar.gz"
+        );
+    }
+
+    #[test]
+    fn an_archive_of_each_format_is_made_beside_its_items_under_a_free_name() {
+        use crate::system::{MacSystem, System};
+        let w = world();
+        let pack = w.folder("pack");
+        w.file("pack/a.txt", "alpha");
+        w.file("pack.tar.gz", "someone else's");
+        let system = MacSystem::default();
+        for format in [
+            Format::Zip,
+            Format::Tar,
+            Format::TarGz,
+            Format::TarBz2,
+            Format::TarXz,
+        ] {
+            let items = std::slice::from_ref(&pack);
+            let write = system.archiver(items, format);
+            let report = compress(items, format, &go(), |archive| write(archive, &go()));
+            assert_eq!(said(&report), None, "{format:?}");
+            let named = match format {
+                Format::TarGz => "pack copy.tar.gz".to_string(),
+                _ => format!("pack.{}", format.extension()),
+            };
+            assert_eq!(report.change.steps, [created(w.path(&named))]);
+        }
+        assert_eq!(w.read("pack.tar.gz"), "someone else's");
+        assert_eq!(
+            w.names(""),
+            [
+                ".Trash",
+                "pack",
+                "pack copy.tar.gz",
+                "pack.tar",
+                "pack.tar.bz2",
+                "pack.tar.gz",
+                "pack.tar.xz",
+                "pack.zip"
+            ]
+        );
+    }
+
+    /// Extracts with the system's own tools, as the app does.
+    fn extract_here(archive: &Path, cancel: &dyn Cancel) -> Report {
+        use crate::system::{MacSystem, System};
+        let (format, _) = Format::of_archive(&shown(archive)).expect("an archive");
+        let (list, unpack) = MacSystem::default().extractor(archive, format).unwrap();
+        let go = go();
+        extract(archive, cancel, || list(&go), |into| unpack(into, &go))
+    }
+
+    #[test]
+    fn extracting_makes_a_new_folder_beside_the_archive_named_after_it() {
+        use crate::system::{MacSystem, System};
+        let w = world();
+        let pack = w.folder("Src/pack");
+        w.file("Src/pack/a.txt", "alpha");
+        for format in [
+            Format::Zip,
+            Format::Tar,
+            Format::TarGz,
+            Format::TarBz2,
+            Format::TarXz,
+        ] {
+            let archive = w.path(&format!("pack.{}", format.extension()));
+            let write = MacSystem::default().archiver(std::slice::from_ref(&pack), format);
+            write(&archive, &go()).unwrap();
+            let report = extract_here(&archive, &go());
+            assert_eq!(said(&report), None, "{format:?}");
+            assert_eq!(report.change.kind, Kind::Extract);
+            assert_eq!(report.done, 1);
+            let folder = match format {
+                Format::Zip => "pack".to_string(),
+                _ => format!(
+                    "pack copy{}",
+                    match format {
+                        Format::Tar => "".to_string(),
+                        Format::TarGz => " 2".to_string(),
+                        Format::TarBz2 => " 3".to_string(),
+                        _ => " 4".to_string(),
+                    }
+                ),
+            };
+            assert_eq!(
+                report.change.steps,
+                [created(w.path(&folder))],
+                "{format:?}"
+            );
+            assert_eq!(w.read(&format!("{folder}/pack/a.txt")), "alpha");
+        }
+        // Nothing of the work is left behind, and the archives are whole.
+        assert_eq!(
+            w.names(""),
+            [
+                ".Trash",
+                "Src",
+                "pack",
+                "pack copy",
+                "pack copy 2",
+                "pack copy 3",
+                "pack copy 4",
+                "pack.tar",
+                "pack.tar.bz2",
+                "pack.tar.gz",
+                "pack.tar.xz",
+                "pack.zip"
+            ]
+        );
+
+        // Undo moves the folder to the trash; redo brings it back.
+        let report = extract_here(&w.path("pack.zip"), &go());
+        assert_eq!(report.change.steps, [created(w.path("pack copy 5"))]);
+        let mut history = History::default();
+        history.record(report.change);
+        history.undo(&w.trash).unwrap().unwrap();
+        assert!(!w.has("pack copy 5"));
+        assert_eq!(w.read(".Trash/pack copy 5/pack/a.txt"), "alpha");
+        history.redo(&w.trash).unwrap().unwrap();
+        assert_eq!(w.read("pack copy 5/pack/a.txt"), "alpha");
+    }
+
+    #[test]
+    fn an_archive_whose_items_would_land_outside_its_folder_is_refused_with_nothing_written() {
+        let w = world();
+        let src = w.folder("Src");
+        w.file("Src/x.txt", "evil");
+        std::os::unix::fs::symlink("../../outside", src.join("up")).unwrap();
+        std::os::unix::fs::symlink("/etc", src.join("abs")).unwrap();
+        std::os::unix::fs::symlink("sub/../x.txt", src.join("fine")).unwrap();
+        let tar = |args: &[&str]| {
+            let made = std::process::Command::new("/usr/bin/tar")
+                .current_dir(&src)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(made.success());
+        };
+        let x = src.join("x.txt");
+        tar(&["-c", "-f", "../slip.tar", "-s", ",^,../,", "x.txt"]);
+        tar(&[
+            "--format",
+            "zip",
+            "-c",
+            "-f",
+            "../slip.zip",
+            "-s",
+            ",^,../,",
+            "x.txt",
+        ]);
+        tar(&["-c", "-P", "-f", "../absolute.tar", x.to_str().unwrap()]);
+        tar(&["-c", "-f", "../up.tar", "x.txt", "up"]);
+        tar(&["-c", "-f", "../abs.tar.gz", "-z", "x.txt", "abs"]);
+        let outside = "Couldn't extract {}: it holds items that would land outside its folder.";
+        let linked = "Couldn't extract {}: a link in it points outside its folder.";
+        for (archive, why) in [
+            ("slip.tar", outside),
+            ("slip.zip", outside),
+            ("absolute.tar", outside),
+            ("up.tar", linked),
+            ("abs.tar.gz", linked),
+        ] {
+            let report = extract_here(&w.path(archive), &go());
+            assert_eq!(said(&report), Some(why.replace("{}", archive)), "{archive}");
+            assert!(report.change.steps.is_empty());
+            assert_eq!(
+                w.names(""),
+                [
+                    ".Trash",
+                    "Src",
+                    "abs.tar.gz",
+                    "absolute.tar",
+                    "slip.tar",
+                    "slip.zip",
+                    "up.tar"
+                ],
+                "{archive}"
+            );
+            assert!(!w.root.parent().unwrap().join("x.txt").exists());
+        }
+        // A link that stays inside is fine.
+        tar(&["-c", "-f", "../fine.tar", "x.txt", "fine"]);
+        let report = extract_here(&w.path("fine.tar"), &go());
+        assert_eq!(said(&report), None);
+        assert_eq!(w.read("fine/x.txt"), "evil");
+    }
+
+    #[test]
+    fn an_extract_that_fails_or_is_stopped_leaves_nothing_behind() {
+        let w = world();
+        let archive = w.file("pack.zip", "PK not really");
+        // Damaged, or locked with a password: said, and nothing is left.
+        let report = extract_here(&archive, &go());
+        assert_eq!(
+            said(&report),
+            Some("Couldn't extract pack.zip: it is damaged or needs a password.".to_string())
+        );
+        assert_eq!(w.names(""), [".Trash", "pack.zip"]);
+
+        // Stopped halfway: the part written so far goes too.
+        let stop = AtomicBool::new(false);
+        let report = extract(
+            &archive,
+            &stop,
+            || Ok(vec!["a.txt".to_string(), "b.txt".to_string()]),
+            |into| {
+                fs::write(into.join("a.txt"), "half")?;
+                stop.store(true, Ordering::Relaxed);
+                Err(io::ErrorKind::Interrupted.into())
+            },
+        );
+        assert!(report.stopped);
+        assert!(report.change.steps.is_empty());
+        assert_eq!(w.names(""), [".Trash", "pack.zip"]);
+    }
+
+    #[test]
+    fn an_archive_is_known_by_its_ending_and_unpacks_under_its_name_without_it() {
+        let cases = [
+            ("pack.zip", Some((Format::Zip, "pack"))),
+            ("Pack.TAR.GZ", Some((Format::TarGz, "Pack"))),
+            ("pack.tgz", Some((Format::TarGz, "pack"))),
+            ("pack.tar.bz2", Some((Format::TarBz2, "pack"))),
+            ("pack.tar.xz", Some((Format::TarXz, "pack"))),
+            ("pack.tar", Some((Format::Tar, "pack"))),
+            ("pack.7z", Some((Format::SevenZ, "pack"))),
+            ("notes.txt", None),
+            (".zip", None),
+        ];
+        for (name, expected) in cases {
+            let found = Format::of_archive(name).map(|(format, stem)| (format, stem.to_string()));
+            let expected = expected.map(|(format, stem)| (format, stem.to_string()));
+            assert_eq!(found, expected, "{name}");
+        }
     }
 }

@@ -10,6 +10,7 @@ mod ops;
 mod search;
 mod state;
 mod system;
+mod tags;
 mod theme;
 mod thumbs;
 mod ui;

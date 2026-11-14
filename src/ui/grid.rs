@@ -7,10 +7,10 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::list::{self, Look, bold_match, inks};
-use super::{fit, picture, scroll};
+use super::{fit, picture, scroll, tag_marks, tag_width};
 use crate::app::{App, HitMap, Spot, TileSize};
 use crate::icons;
 use crate::model::{self, Entry};
@@ -161,13 +161,22 @@ pub fn draw(
         let (ink, _) = inks(entry, look);
         let text = fill.fg(theme::ink(ink));
         let width = thumb.width as usize;
-        for (line, words) in caption_lines(&entry.name, width, CAPTION_LINES)
-            .into_iter()
-            .enumerate()
+        let mut caption = caption_lines(&entry.name, width, CAPTION_LINES);
+        // The tags follow the last line of the name, which makes room for them.
+        let marks = Some(tag_width(entry.tags)).filter(|marks| marks + 2 <= width);
+        if let (Some(marks), Some(last)) = (marks, caption.last_mut())
+            && last.width() + marks > width
         {
+            *last = fit(last, width - marks);
+        }
+        let lines = caption.len();
+        for (line, words) in caption.into_iter().enumerate() {
             let row = Rect::new(thumb.x, thumb.bottom() + line as u16, thumb.width, 1);
             let Some(row) = clip(row, area) else { continue };
-            let spans: Vec<Span> = bold_match(&words, &query, text);
+            let mut spans: Vec<Span> = bold_match(&words, &query, text);
+            if marks.is_some() && line + 1 == lines {
+                spans.extend(tag_marks(entry.tags, fill));
+            }
             let line = Line::from(spans).alignment(Alignment::Center);
             frame.render_widget(Paragraph::new(line).style(fill), row);
         }

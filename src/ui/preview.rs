@@ -4,6 +4,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Rect, Size};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui_image::Image;
@@ -134,8 +135,9 @@ fn name_line(entry: &Entry, width: usize) -> Line<'static> {
     } else {
         String::new()
     };
-    let name = fit(&format!("{mark}{}", entry.name), width);
-    let used = name.width();
+    let marks = Some(super::tag_width(entry.tags)).filter(|marks| marks + 2 <= width);
+    let name = fit(&format!("{mark}{}", entry.name), width - marks.unwrap_or(0));
+    let used = name.width() + marks.unwrap_or(0);
     let mut spans = Vec::new();
     // Only the name is bold, not the glyph or the space after it.
     match name.strip_prefix(&mark) {
@@ -144,6 +146,9 @@ fn name_line(entry: &Entry, width: usize) -> Line<'static> {
             spans.push(Span::styled(rest.to_string(), theme::title()));
         }
         _ => spans.push(Span::styled(name, theme::title())),
+    }
+    if marks.is_some() {
+        spans.extend(super::tag_marks(entry.tags, Style::default()));
     }
     if let Some(link) = &entry.link {
         let target = fit(

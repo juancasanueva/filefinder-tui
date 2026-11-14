@@ -10,7 +10,10 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 - **Tabs**: `t` opens one in the folder you are in, `O` the folder under the cursor; `[` / `]` go round them, `1`–`9` jump to one, `{` / `}` move it, `w` closes it (the last one quits). Each tab keeps its own folder, view, panes, marks and history; the strip in the header shows once there are two, at most nine.
 - **Colours**: truecolor when `COLORTERM` says so, the nearest of 256 colours otherwise, and none with `NO_COLOR` (the cursor row is then reverse video and marked rows underlined). `FILEFINDER_ICONS=plain` replaces the Nerd Font glyphs with plain marks.
 - **Trash**: `~/.Trash`, with Restore and Empty Trash in its menu; reach it with `:`.
-- **File operations** that never overwrite: copy, cut, paste, duplicate, rename, new folder, compress, edit in `$EDITOR`, move to the trash, and delete permanently after asking. Everything except a permanent delete can be undone.
+- **File operations** that never overwrite: copy, cut, paste, duplicate, rename, new folder, compress, extract, edit in `$EDITOR`, move to the trash, and delete permanently after asking. Everything except a permanent delete can be undone.
+- **Finder tags**: `T` opens flea's seven tags (Red, Orange, Yellow, Green, Blue, Purple, Gray); `1`–`7` turns one on, or off where every selected item already has it, and Remove All Tags takes the seven off. They are real Finder tags, kept in the `com.apple.metadata:_kMDItemUserTags` attribute exactly as Finder writes it, so Finder, Spotlight and `mdfind` see them, and tags of your own stay as they are. They show as coloured squares after the name (their digits without colour), and Find takes `tag:red` (any case; every tag named must be there, and the rest of the text is looked for as usual: `tag:red holiday`). Undo takes a change back exactly. A drive whose file system has no room for them says "This filesystem does not support file tags."
+- **Bulk rename**: `r` with several items marked puts their names in `$EDITOR`, one a line, in a private file of the system's temporary folder. Change the lines, save and quit; the renames run together, so names can swap (`a` ↔ `b`) or go round, and one undo takes them all back. The same number of lines in the same order is needed; a line that is empty, holds `/`, is `.` or `..`, is too long, repeats another, or names something else already there refuses the lot with the line it is about, and nothing is renamed. Quitting the editor with an error renames nothing either.
+- **Compress and Extract**, in the menu (`m`). Compress writes zip, tar, tar.gz, tar.bz2 or tar.xz (and 7z when [7-Zip](https://www.7-zip.org/) is installed as `7zz` or `7z`), named after the item without its extension, or after the folder several are in. Extract unpacks a zip, tar, tar.gz/.tgz, tar.bz2, tar.xz (or 7z) into a new folder beside it named after it without its ending. A name in use is never written over: the next free copy name is taken (`pack copy.tar.gz`, `pack copy 2.tar.gz`, `pack copy`). An archive holding a name from the root, one with `..`, or a link that leads out of its folder is refused with nothing written; one that is damaged or needs a password says so and leaves nothing behind; Escape stops either. Undo moves what was made to the Trash.
 - **Two panes** with Ctrl+4, `|` or Alt+1 to move things between folders (`y`/`x` in one, `p` or `M` in the other); the same key goes back to the view you came from.
 - **Filter and Find**, both typed on the bottom row. The filter (`/`) narrows the folder you are looking at as you type: part of a name in any case, or a `*` / `?` pattern; close matches (a letter or two off, depending on how long the text is) show only when nothing matches exactly. Tab widens it to every folder below. Find (`f` or Ctrl+F) walks the folders below and ranks what it finds: the whole name, then its start, the start of a word, the letters in order, and typos last. Tab looks in this folder, home, or everywhere; Ctrl+G looks inside files instead, through [ripgrep](https://github.com/BurntSushi/ripgrep) when it is installed. Go to a path with `:`.
 - **Mouse friendly**: click, double-click, right-click for the menu, Shift+click for a range.
@@ -75,11 +78,13 @@ flea's own terminal keys. Digits are never counts.
 | `/` | Filter this folder; in the field Tab adds its subfolders, ⏎ or ↓ keeps the filter, Escape clears it, Ctrl+A marks what it shows |
 | `f`, Ctrl+F | Find below this folder; in the field Tab changes where (this folder, home, everywhere), ⏎ or ↓ moves into what it found |
 | Ctrl+G | In Find's field: names or what files hold (needs `rg`) |
+| `tag:red` | In Find's field: only what carries that tag |
 | `o` | Show what Find found under the cursor in its own folder |
 | Space | Quick Look |
 | `.` | Show hidden files |
 | `s` / `S` | Next sort key (name, size, modified, kind) / reverse the sort |
 | `I` | Detail column: size, modified, mode (`drwx------`), owner |
+| `T` | Finder tags: `1`–`7` turn a tag on or off, Remove All Tags |
 | Alt+P | Show or hide the preview pane |
 | Ctrl+R, F5 | Reload |
 | `v` | Mark or unmark the item under the cursor |
@@ -88,7 +93,7 @@ flea's own terminal keys. Digits are never counts.
 | `y`, `x`, `p` (Ctrl+C / X / V) | Copy, cut, paste |
 | `M` | Move here what was copied or cut |
 | `U` | Duplicate |
-| `r`, F2 | Rename |
+| `r`, F2 | Rename; with several marked, all of them in `$EDITOR` |
 | `N`, Ctrl+Shift+N | New folder |
 | `dd`, Delete | Move to Trash |
 | Shift+Delete | Delete permanently (asks first) |

@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use super::{centered, empty_text, fit, scroll};
+use super::{centered, empty_text, fit, scroll, tag_marks, tag_width};
 use crate::app::{App, Detail, HitMap, Pane, Spot};
 use crate::format;
 use crate::format::DateStyle;
@@ -61,8 +61,12 @@ pub fn row(
     }
     let size = size.filter(|size| !size.is_empty() && size.width() + 6 <= width);
     let name_width = width - 3 - size.map_or(1, |size| size.width() + 3);
-    let name = fit(&entry.name, entry.name.width().min(name_width));
-    let room = name_width - name.width();
+    // The tags go right after the name, when two cells of it still show.
+    let marks = Some(tag_width(entry.tags)).filter(|marks| marks + 2 <= name_width);
+    let marks_width = marks.unwrap_or(0);
+    let name_room = name_width - marks_width;
+    let name = fit(&entry.name, entry.name.width().min(name_room));
+    let room = name_room - name.width();
     let after = match (folder, &entry.link) {
         (Some(folder), _) => fit(&format!(" {folder}"), room),
         (None, Some(link)) => fit(&format!(" → {}", link.display()), room),
@@ -73,6 +77,9 @@ pub fn row(
         Span::styled(format!("{} ", icons::of(entry)), text(meta)),
     ];
     spans.extend(bold_match(&name, query, text(ink)));
+    if marks.is_some() {
+        spans.extend(tag_marks(entry.tags, fill));
+    }
     let after_width = after.width();
     spans.push(Span::styled(after, text(meta)));
     spans.push(Span::styled(" ".repeat(room - after_width), text(ink)));
@@ -343,6 +350,76 @@ mod tests {
         // Cut short with the name kept whole.
         let line = row(&found, 14, None, Look::default(), "", Some("Trip/Day"));
         assert_eq!(text(&line), format!(" {} a.jpg Tri… ", "\u{eaea}"));
+    }
+
+    fn tag(path: &Path, labels: &[&str]) {
+        let labels: Vec<String> = labels.iter().map(|label| label.to_string()).collect();
+        crate::tags::write(path, Some(&crate::tags::encode(&labels))).unwrap();
+    }
+
+    #[test]
+    fn tags_show_as_squares_in_their_colours_after_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        fs::write(&path, "hello").unwrap();
+        tag(&path, &["Blue\n4", "Work", "Red\n6"]);
+        let notes = entry(dir.path(), "notes.txt");
+        let glyph = icons::TEXT;
+        let line = row(&notes, 24, Some("5 B"), Look::default(), "", None);
+        // In the order of the seven, whatever order they were added in.
+        assert_eq!(text(&line), format!(" {glyph} notes.txt ■■    5 B  "));
+        let squares: Vec<Option<Color>> = (line.spans.iter())
+            .filter(|span| span.content == "■")
+            .map(|span| span.style.fg)
+            .collect();
+        assert_eq!(squares, [Some(theme::TAGS[0]), Some(theme::TAGS[4])]);
+        // A name too long for them is cut first.
+        let line = row(&notes, 20, Some("5 B"), Look::default(), "", None);
+        assert_eq!(text(&line), format!(" {glyph} notes.t… ■■ 5 B  "));
+        // Without colour, each is its digit.
+        theme::set_depth(theme::Depth::Mono);
+        let line = row(&notes, 24, Some("5 B"), Look::default(), "", None);
+        theme::set_depth(theme::Depth::Truecolor);
+        assert_eq!(text(&line), format!(" {glyph} notes.txt 15    5 B  "));
+        // In 256 colours, the nearest of the palette.
+        theme::set_depth(theme::Depth::Indexed);
+        let line = row(&notes, 24, Some("5 B"), Look::default(), "", None);
+        theme::set_depth(theme::Depth::Truecolor);
+        let first = line.spans.iter().find(|span| span.content == "■").unwrap();
+        assert!(matches!(first.style.fg, Some(Color::Indexed(_))));
+    }
+
+    #[test]
+    fn tags_show_in_the_list_the_columns_the_grid_and_the_preview_head() {
+        use crate::app::testing::{ctrl, fixture, key, press};
+        use crate::ui::testing::{buffer, find};
+        use ratatui::crossterm::event::KeyCode;
+        let mut f = fixture();
+        tag(&f.home.join("notes.txt"), &["Green\n2"]);
+        press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
+        let green = theme::TAGS[3];
+        let after = |drawn: &ratatui::buffer::Buffer, at: (u16, u16)| {
+            let cell = &drawn[(at.0 + "notes.txt".len() as u16 + 1, at.1)];
+            (cell.symbol().to_string(), cell.fg)
+        };
+        let square = ("■".to_string(), green);
+        // The list, and the preview's head on the right.
+        let drawn = buffer(&mut f.app, 120, 30);
+        let listed = find(&drawn, "notes.txt", 26..73).expect("the row");
+        assert_eq!(after(&drawn, listed), square);
+        let head = find(&drawn, "notes.txt", 73..120).expect("the preview's head");
+        assert_eq!(after(&drawn, head), square);
+        // The columns.
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        let drawn = buffer(&mut f.app, 120, 30);
+        let listed = find(&drawn, "notes.txt", 0..80).expect("the row");
+        assert_eq!(after(&drawn, listed), square);
+        // The grid's caption.
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(key(KeyCode::F(5)));
+        let drawn = buffer(&mut f.app, 120, 30);
+        let caption = find(&drawn, "notes.txt", 0..80).expect("the caption");
+        assert_eq!(after(&drawn, caption), square);
     }
 
     #[test]

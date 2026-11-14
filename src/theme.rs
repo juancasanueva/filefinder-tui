@@ -48,6 +48,28 @@ pub const DIMMED: Color = Color::Rgb(0x6d, 0x70, 0x70);
 /// Without a theme the accent is the foreground itself.
 pub const ACCENT: Color = FOREGROUND;
 
+/// The seven Finder tags' colours, in their order: Red, Orange, Yellow,
+/// Green, Blue, Purple, Gray.
+pub const TAGS: [Color; 7] = [
+    Color::Rgb(0xf7, 0x76, 0x8e),
+    Color::Rgb(0xeb, 0x92, 0x7b),
+    Color::Rgb(0xe0, 0xaf, 0x68),
+    Color::Rgb(0x9e, 0xce, 0x6a),
+    Color::Rgb(0x7a, 0xa2, 0xf7),
+    Color::Rgb(0xad, 0x8e, 0xe6),
+    Color::Rgb(0x56, 0x5f, 0x89),
+];
+
+/// The mark a tag gets after a name: a square in its colour, or without
+/// colour, its digit, which tells the seven apart all the same.
+pub fn tag_mark(index: usize) -> (String, Color) {
+    let glyph = match depth() {
+        Depth::Mono => (index + 1).to_string(),
+        _ => "■".to_string(),
+    };
+    (glyph, ink(TAGS[index % TAGS.len()]))
+}
+
 /// How many colours the terminal can show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Depth {
