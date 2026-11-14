@@ -167,10 +167,10 @@ fn draw_buttons(frame: &mut Frame, app: &App, x: u16, y: u16, hits: &mut HitMap)
 /// What a view button's tooltip says: the view, and its keys.
 fn tip_text(view: ViewMode) -> (&'static str, &'static str) {
     match view {
-        ViewMode::List => ("List view", "ctrl-1"),
-        ViewMode::Columns => ("Columns view", "ctrl-2"),
-        ViewMode::Grid => ("Grid view", "ctrl-3"),
-        ViewMode::Dual => ("Dual pane", "ctrl-4"),
+        ViewMode::List => ("List view", "ctrl-opt-1"),
+        ViewMode::Columns => ("Columns view", "ctrl-opt-2"),
+        ViewMode::Grid => ("Grid view", "ctrl-opt-3"),
+        ViewMode::Dual => ("Dual pane", "ctrl-opt-4"),
     }
 }
 
@@ -338,10 +338,10 @@ mod tests {
         };
         let drawn = buffer(&mut f.app, 120, 30);
         let tips = [
-            (ViewMode::List, "List view", "ctrl-1"),
-            (ViewMode::Columns, "Columns view", "ctrl-2"),
-            (ViewMode::Grid, "Grid view", "ctrl-3"),
-            (ViewMode::Dual, "Dual pane", "ctrl-4"),
+            (ViewMode::List, "List view", "ctrl-opt-1"),
+            (ViewMode::Columns, "Columns view", "ctrl-opt-2"),
+            (ViewMode::Grid, "Grid view", "ctrl-opt-3"),
+            (ViewMode::Dual, "Dual pane", "ctrl-opt-4"),
         ];
         for (view, label, keys) in tips {
             let (x, y) = find(&drawn, icons::view(view), 0..120).expect("the button");

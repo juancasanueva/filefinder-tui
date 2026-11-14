@@ -1556,6 +1556,9 @@ impl App {
         let held = key.modifiers;
         let alt = held.contains(KeyModifiers::ALT) && !held.contains(KeyModifiers::CONTROL);
         let ctrl = held.contains(KeyModifiers::CONTROL) && !held.contains(KeyModifiers::ALT);
+        // Control and Option together: the views' keys where a window
+        // manager takes Ctrl+1–4 for itself (Terrazzo's workspaces).
+        let ctrl_alt = held.contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
         // Shift is what it takes to type a capital, `?`, `:` or `|`, so it
         // may come along with a plain key.
         let plain =
@@ -1595,7 +1598,8 @@ impl App {
             KeyCode::Char('v') if ctrl => self.paste(false),
             KeyCode::Char('z') if ctrl => self.undo(),
             KeyCode::Char('y') if ctrl => self.redo(),
-            KeyCode::Char('t') if ctrl => self.open_terminal(),
+            // Alt+T where a window manager takes Ctrl+T (Terrazzo's float).
+            KeyCode::Char('t') if ctrl || alt => self.open_terminal(),
             // Selecting.
             KeyCode::Char('v') if plain => self.pane_mut().toggle_mark(),
             KeyCode::Char('V') if plain => self.pane_mut().invert(),
@@ -1650,10 +1654,10 @@ impl App {
             KeyCode::Menu => self.open_menu(),
             KeyCode::F(10) if shift => self.open_menu(),
             // Views, panes and the window.
-            KeyCode::Char('1') if ctrl => self.set_view(ViewMode::List),
-            KeyCode::Char('2') if ctrl => self.set_view(ViewMode::Columns),
-            KeyCode::Char('3') if ctrl => self.set_view(ViewMode::Grid),
-            KeyCode::Char('4') if ctrl => self.toggle_split(),
+            KeyCode::Char('1') if ctrl || ctrl_alt => self.set_view(ViewMode::List),
+            KeyCode::Char('2') if ctrl || ctrl_alt => self.set_view(ViewMode::Columns),
+            KeyCode::Char('3') if ctrl || ctrl_alt => self.set_view(ViewMode::Grid),
+            KeyCode::Char('4') if ctrl || ctrl_alt => self.toggle_split(),
             KeyCode::Char('|') if plain => self.toggle_split(),
             // Option+1 is the bar on a Spanish Mac keyboard; with Option sent
             // as Alt, it arrives as Alt+1.
@@ -4235,6 +4239,9 @@ fn window_key(key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Tab | KeyCode::BackTab | KeyCode::F(5) => true,
         KeyCode::Char('b' | 'r' | 'w' | '1'..='4') if ctrl => true,
+        KeyCode::Char('1'..='4') if held.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            true
+        }
         KeyCode::Char('1' | 'p' | 'P') if alt => true,
         KeyCode::Char('?' | 'q' | 'Q' | '|' | '.' | 's' | 'S' | 'I') if plain => true,
         KeyCode::Char('t' | 'w' | '[' | ']' | '{' | '}' | '1'..='9') if plain => true,
@@ -4847,6 +4854,11 @@ pub mod testing {
 
     pub fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// Control and Option (sent as Alt) held together.
+    pub fn ctrl_alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::ALT)
     }
 
     pub fn shift(code: KeyCode) -> KeyEvent {
@@ -8389,6 +8401,45 @@ mod tests {
         pick(&mut f.app, "Open Trash");
         assert_eq!(f.app.pane().cwd, f.trash);
         assert_eq!(f.app.pane().back.len(), 2, "in the history");
+    }
+
+    #[test]
+    fn ctrl_opt_1_to_4_switch_views_where_a_window_manager_takes_ctrl_1_to_4() {
+        let mut f = fixture();
+        let digit = |c| ctrl_alt(KeyCode::Char(c));
+        f.app.handle_key(digit('2'));
+        assert_eq!(f.app.view(), ViewMode::Columns);
+        f.app.handle_key(digit('3'));
+        assert_eq!(f.app.view(), ViewMode::Grid);
+        f.app.handle_key(digit('1'));
+        assert_eq!(f.app.view(), ViewMode::List);
+        f.app.handle_key(digit('4'));
+        assert_eq!(f.app.panes().len(), 2);
+        f.app.handle_key(digit('4'));
+        assert_eq!(f.app.panes().len(), 1);
+        // From the places panel too, like the window's other keys.
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(f.app.focus, Focus::Places);
+        f.app.handle_key(digit('3'));
+        assert_eq!(f.app.view(), ViewMode::Grid);
+        // Ctrl+1–4 still do the same.
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        assert_eq!(f.app.view(), ViewMode::Columns);
+        // And Alt+1 is still the bar of a Spanish keyboard.
+        f.app.handle_key(alt(KeyCode::Char('1')));
+        assert_eq!(f.app.panes().len(), 2);
+    }
+
+    #[test]
+    fn alt_t_starts_a_terminal_like_ctrl_t() {
+        let mut f = fixture();
+        select(&mut f.app, "Pictures");
+        f.app.handle_key(alt(KeyCode::Char('t')));
+        f.app.handle_key(ctrl(KeyCode::Char('t')));
+        let pictures = f.home.join("Pictures");
+        assert_eq!(*f.system.terminals.borrow(), [pictures.clone(), pictures]);
+        // A plain `t` is still a new tab.
+        assert_eq!(f.app.tabs.len(), 1);
     }
 
     #[test]
