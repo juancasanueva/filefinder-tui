@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use super::{centered, empty_text, fit, scroll, tag_marks, tag_width};
+use super::{AppRows, app_icon, centered, empty_text, fit, note_app, scroll, tag_marks, tag_width};
 use crate::app::{App, Detail, HitMap, Pane, Spot};
 use crate::format;
 use crate::format::DateStyle;
@@ -187,13 +187,16 @@ pub fn draw(
     let query = pane.matching();
     let width = area.width as usize;
     let mut lines = Vec::new();
+    let mut apps = AppRows::new();
     for (item, entry) in pane.entries.iter().enumerate().skip(pane.offset).take(rows) {
         let y = area.y + lines.len() as u16;
         let spot = Spot::Item {
             pane: index,
             index: item,
         };
-        hits.add(Rect::new(area.x, y, area.width, 1), spot);
+        let line = Rect::new(area.x, y, area.width, 1);
+        hits.add(line, spot);
+        note_app(&mut apps, entry, line);
         let look = Look {
             cursor: item == pane.cursor,
             focused,
@@ -213,6 +216,9 @@ pub fn draw(
         ));
     }
     frame.render_widget(Paragraph::new(lines), area);
+    for (entry, line) in apps {
+        app_icon(frame, app.thumbs.as_mut(), &entry, line);
+    }
 }
 
 /// What the detail column says about an item: its size, when it was
@@ -277,8 +283,64 @@ pub fn notice(frame: &mut Frame, area: Rect, glyph: &str, text: &str, style: Sty
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::testing::{ctrl, key, pictures_through, settle};
+    use crate::ui::testing::{buffer, find};
+    use ratatui::buffer::Buffer;
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui_image::picker::ProtocolType;
     use std::fs;
     use std::path::Path;
+
+    /// Whether a cell holds a piece of a picture the terminal draws itself.
+    fn pictured(cell: &ratatui::buffer::Cell) -> bool {
+        cell.symbol().contains('\u{10EEEE}')
+    }
+
+    /// The cells left of a name in a range of columns, where its glyph is.
+    fn glyph_slot(drawn: &Buffer, name: &str, columns: std::ops::Range<u16>) -> [(u16, u16); 2] {
+        let (x, y) = find(drawn, name, columns).expect(name);
+        [(x - 2, y), (x - 1, y)]
+    }
+
+    #[test]
+    fn an_app_shows_its_icon_where_its_glyph_was_in_the_list_and_the_columns() {
+        for (view, columns) in [('1', 26..73), ('2', 26..73)] {
+            let (mut f, _thumbnailer) = pictures_through(ProtocolType::Kitty);
+            fs::write(f.home.join("Safari.app"), "x").unwrap();
+            f.app.handle_key(key(KeyCode::F(5)));
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            // Until the icon is ready, the glyph shows.
+            let first = buffer(&mut f.app, 120, 30);
+            let [glyph, space] = glyph_slot(&first, "Safari.app", columns.clone());
+            assert_eq!(
+                first[glyph].symbol(),
+                icons::of(&entry(&f.home, "Safari.app"))
+            );
+            assert_eq!(first[space].symbol(), " ");
+            settle(&mut f.app);
+            let drawn = buffer(&mut f.app, 120, 30);
+            for at in glyph_slot(&drawn, "Safari.app", columns.clone()) {
+                assert!(pictured(&drawn[at]), "{view} {at:?}");
+            }
+            // Other files keep their glyphs.
+            for at in glyph_slot(&drawn, "notes.txt", columns.clone()) {
+                assert!(!pictured(&drawn[at]), "{view} {at:?}");
+            }
+        }
+        // A terminal that draws pictures with half blocks keeps the glyph:
+        // two cells of them make no icon.
+        let (mut f, _thumbnailer) = pictures_through(ProtocolType::Halfblocks);
+        fs::write(f.home.join("Safari.app"), "x").unwrap();
+        f.app.handle_key(key(KeyCode::F(5)));
+        buffer(&mut f.app, 120, 30);
+        settle(&mut f.app);
+        let drawn = buffer(&mut f.app, 120, 30);
+        let [glyph, _] = glyph_slot(&drawn, "Safari.app", 26..73);
+        assert_eq!(
+            drawn[glyph].symbol(),
+            icons::of(&entry(&f.home, "Safari.app"))
+        );
+    }
 
     fn text(line: &Line) -> String {
         line.spans

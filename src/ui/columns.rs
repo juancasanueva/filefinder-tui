@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Paragraph;
 
 use super::list::{self, Look, detail_text};
-use super::{NAME_INDENT, scroll, separator};
+use super::{AppRows, NAME_INDENT, app_icon, note_app, scroll, separator};
 use crate::app::{App, HitMap, Spot};
 
 /// How many columns a window `width` cells wide has room for, flea's way:
@@ -57,6 +57,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, tracks: &[Rect], hits: &mut HitMap
     let rows = own.height as usize;
     pane.page_rows = rows.max(1);
     let total = pane.ancestors.len() + 1;
+    let mut apps = AppRows::new();
     for (slot, track) in tracks.iter().enumerate() {
         if slot > 0 {
             separator(frame, Rect::new(track.x - 1, track.y, 1, track.height));
@@ -75,7 +76,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, tracks: &[Rect], hits: &mut HitMap
                 depth,
                 index: row,
             };
-            hits.add(Rect::new(track.x, y, track.width, 1), spot);
+            let line = Rect::new(track.x, y, track.width, 1);
+            hits.add(line, spot);
+            note_app(&mut apps, entry, line);
             let look = Look {
                 cursor: above.on_path == Some(row),
                 parent: true,
@@ -91,6 +94,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, tracks: &[Rect], hits: &mut HitMap
     let mut item = Rect::new(own.x + NAME_INDENT, own.y, 0, 1);
     if pane.entries.is_empty() {
         list::empty(frame, own, pane, caption);
+        for (entry, line) in apps {
+            app_icon(frame, app.thumbs.as_mut(), &entry, line);
+        }
         return item;
     }
     pane.offset = scroll(pane.offset, pane.cursor, rows);
@@ -102,7 +108,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, tracks: &[Rect], hits: &mut HitMap
             pane: index,
             index: row,
         };
-        hits.add(Rect::new(own.x, y, own.width, 1), spot);
+        let line = Rect::new(own.x, y, own.width, 1);
+        hits.add(line, spot);
+        note_app(&mut apps, entry, line);
         if row == pane.cursor {
             item.y = y;
         }
@@ -117,5 +125,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, tracks: &[Rect], hits: &mut HitMap
         lines.push(list::row(entry, width, Some(&value), look, &query, None));
     }
     frame.render_widget(Paragraph::new(lines), own);
+    for (entry, line) in apps {
+        app_icon(frame, app.thumbs.as_mut(), &entry, line);
+    }
     item
 }

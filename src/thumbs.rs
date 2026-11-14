@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use ratatui::layout::Size;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{FilterType, Resize};
 
@@ -251,6 +251,8 @@ pub struct Thumbs {
     failed: HashMap<PathBuf, Option<SystemTime>>,
     clock: u64,
     covered: bool,
+    /// Whether the terminal draws pictures itself, not with half blocks.
+    sharp: bool,
 }
 
 impl Thumbs {
@@ -259,6 +261,7 @@ impl Thumbs {
         let shared = Arc::new(Shared::default());
         let (sender, results) = mpsc::channel();
         let queue = shared.clone();
+        let sharp = picker.protocol_type() != ProtocolType::Halfblocks;
         // Without its thread the service still answers: nothing is ever ready.
         let _ = thread::Builder::new()
             .name("thumbnails".to_string())
@@ -271,7 +274,14 @@ impl Thumbs {
             failed: HashMap::new(),
             clock: 0,
             covered: false,
+            sharp,
         }
+    }
+
+    /// Whether the terminal draws pictures itself, sharp enough to show one
+    /// in the two cells of a row's glyph. Half blocks make a smudge of it.
+    pub fn sharp(&self) -> bool {
+        self.sharp
     }
 
     /// The picture of a file fitted into `size` cells when it is ready. When it

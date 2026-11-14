@@ -25,7 +25,7 @@ use ratatui_image::protocol::Protocol;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Focus, HitMap, Pane, Spot, ViewMode};
-use crate::model::Entry;
+use crate::model::{Category, Entry};
 use crate::theme;
 use crate::thumbs::Thumbs;
 
@@ -303,6 +303,32 @@ pub fn picture(
         return false;
     }
     true
+}
+
+/// Draws an app's icon over its glyph and the space after it in a list
+/// row, where the terminal draws pictures sharp enough; until the icon is
+/// ready, and anywhere else, the glyph stays.
+pub fn app_icon(frame: &mut Frame, thumbs: Option<&mut Thumbs>, entry: &Entry, row: Rect) {
+    let Some(thumbs) = thumbs.filter(|thumbs| thumbs.sharp()) else {
+        return;
+    };
+    // A row narrower than four cells has no glyph.
+    if entry.category() != Category::App || row.width < 4 {
+        return;
+    }
+    let slot = Rect::new(row.x + 1, row.y, 2, 1);
+    picture(frame, Some(thumbs), entry, slot, slot);
+}
+
+/// The rows of a list that are apps, for `app_icon` to draw over once the
+/// list is drawn.
+pub type AppRows = Vec<(Entry, Rect)>;
+
+/// Keeps a row for `app_icon` when its item is an app.
+pub fn note_app(apps: &mut AppRows, entry: &Entry, row: Rect) {
+    if entry.category() == Category::App {
+        apps.push((entry.clone(), row));
+    }
 }
 
 /// flea's captions for an empty folder, which take turns.

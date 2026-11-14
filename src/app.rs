@@ -4516,8 +4516,18 @@ pub mod testing {
 
     /// The fixture drawing real thumbnails: a fake thumbnailer shown through half blocks.
     pub fn pictures() -> (Fixture, Arc<FakeThumbnailer>) {
+        pictures_through(ratatui_image::picker::ProtocolType::Halfblocks)
+    }
+
+    /// The fixture drawing the fake thumbnailer's pictures the way a
+    /// terminal speaking `protocol` would.
+    pub fn pictures_through(
+        protocol: ratatui_image::picker::ProtocolType,
+    ) -> (Fixture, Arc<FakeThumbnailer>) {
         let thumbnailer = Arc::new(FakeThumbnailer::default());
-        let thumbs = Thumbs::new(crate::thumbs::testing::picker(), thumbnailer.clone());
+        let mut picker = crate::thumbs::testing::picker();
+        picker.set_protocol_type(protocol);
+        let thumbs = Thumbs::new(picker, thumbnailer.clone());
         (fixture_with(Some(thumbs)), thumbnailer)
     }
 
