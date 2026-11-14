@@ -1628,11 +1628,17 @@ impl App {
             pane.hold();
         }
         match mouse.kind {
-            MouseEventKind::ScrollDown => self.wheel(spot, true),
-            MouseEventKind::ScrollUp => self.wheel(spot, false),
+            // A click or a turn of the wheel is the user doing something
+            // else, and may move the cursor: a first `d` waits for no second.
+            MouseEventKind::ScrollDown => {
+                self.trash_armed = None;
+                self.wheel(spot, true);
+            }
+            MouseEventKind::ScrollUp => {
+                self.trash_armed = None;
+                self.wheel(spot, false);
+            }
             MouseEventKind::Down(button) => {
-                // A click is the user doing something else: a first `d`
-                // waits for no second.
                 self.trash_armed = None;
                 self.click(button, spot, mouse.modifiers);
             }
@@ -3264,6 +3270,7 @@ impl App {
     /// Takes in the file work that finished since the last turn.
     fn collect_work(&mut self) {
         let Some(work) = &self.work else { return };
+        let had_menu = self.menu.is_some();
         match work.results.try_recv() {
             Ok(report) => {
                 self.work = None;
@@ -3279,6 +3286,10 @@ impl App {
                 self.relist(&[], None);
                 self.fail("The file work stopped before it was done.".to_string());
             }
+        }
+        // Said last, so that what the work did doesn't hide it.
+        if had_menu && self.menu.is_none() {
+            self.fail("What the menu was for changed, so it closed.".to_string());
         }
     }
 
@@ -3314,15 +3325,36 @@ impl App {
         // The space left may have changed with the files.
         self.volumes.clear();
         let selected = self.selected().map(|entry| entry.path.clone());
+        // A menu acts on the selection when one of its lines is chosen, so
+        // while it is open the selection must stay what it was opened for.
+        let menu_for = self.menu.is_some().then(|| self.pane().position());
         if self.reload() {
-            let wanted = paths.iter().cloned().chain(selected).chain(neighbour);
-            self.pane_mut().want(wanted.collect());
+            match menu_for {
+                Some(was) => self.keep_menu_selection(was),
+                None => {
+                    let wanted = paths.iter().cloned().chain(selected).chain(neighbour);
+                    self.pane_mut().want(wanted.collect());
+                }
+            }
         }
         let active = self.active();
         for index in 0..self.panes().len() {
             if index != active {
                 self.relist_pane(index);
             }
+        }
+    }
+
+    /// After listing again under an open menu: the cursor and the marks back
+    /// on the items the menu was opened for, or, when one of them is gone,
+    /// the menu closed, so that no line can act on something else.
+    fn keep_menu_selection(&mut self, was: Position) {
+        let listed = |path: &PathBuf| self.pane().entries.iter().any(|entry| entry.path == *path);
+        let all_there = was.under_cursor.iter().all(listed) && was.selected.iter().all(listed);
+        if all_there {
+            self.pane_mut().put_back(was);
+        } else {
+            self.menu = None;
         }
     }
 
@@ -7587,6 +7619,53 @@ mod tests {
         app.menu.as_ref().expect("no menu is open").sub
     }
 
+    #[test]
+    fn a_menu_open_when_file_work_finishes_still_acts_on_what_it_was_opened_for() {
+        let mut f = fixture();
+        // Duplicate notes.txt on the worker, then open the menu on Documents
+        // before the work is taken in.
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Char('U')]);
+        assert!(f.app.working().is_some());
+        select(&mut f.app, "Pictures");
+        press(&mut f.app, &[KeyCode::Char('m')]);
+        finish_work(&mut f.app);
+        assert_eq!(read(f.home.join("notes copy.txt")), "hello");
+        // The duplicate landing must not move the menu onto it.
+        assert_eq!(
+            f.app.selected().map(|entry| entry.name.as_str()),
+            Some("Pictures")
+        );
+        let lines = menu(&f.app);
+        let row = lines
+            .iter()
+            .position(|line| *line == "Move to Trash")
+            .unwrap();
+        while menu_cursor(&f.app) != row {
+            press(&mut f.app, &[KeyCode::Down]);
+        }
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(on_disk(&f.trash), ["Pictures"]);
+        assert!(f.home.join("notes copy.txt").exists());
+    }
+
+    #[test]
+    fn a_menu_whose_item_is_gone_when_work_finishes_closes_and_says_so() {
+        let mut f = fixture();
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Char('U')]);
+        press(&mut f.app, &[KeyCode::Char('m')]);
+        // The item the menu is for disappears behind the app's back.
+        fs::remove_file(f.home.join("notes.txt")).unwrap();
+        finish_work(&mut f.app);
+        assert!(f.app.menu.is_none(), "the menu closes");
+        assert!(on_disk(&f.trash).is_empty());
+        assert_eq!(
+            said(&f.app).0,
+            "What the menu was for changed, so it closed."
+        );
+    }
+
     /// `m`, down to the line with this label, and Enter.
     fn pick(app: &mut App, label: &str) {
         pick_in(app, &[label]);
@@ -8759,6 +8838,27 @@ mod tests {
         // A right click too, whatever it lands on.
         f.app.handle_mouse(click(MouseButton::Right));
         assert!(f.app.trash_armed.is_none());
+    }
+
+    #[test]
+    fn a_turn_of_the_wheel_disarms_a_first_d_so_the_second_trashes_nothing() {
+        use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+        let mut f = fixture();
+        crate::ui::testing::buffer(&mut f.app, 120, 30);
+        select(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Char('d')]);
+        assert!(f.app.trash_armed.is_some());
+        // The wheel over the list moves the cursor off the armed row.
+        f.app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 30,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(f.app.trash_armed.is_none());
+        press(&mut f.app, &[KeyCode::Char('d')]);
+        assert!(on_disk(&f.trash).is_empty(), "the second d only arms again");
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
     }
 
     #[test]
