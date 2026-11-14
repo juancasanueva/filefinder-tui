@@ -119,8 +119,9 @@ fn query_picker() -> Picker {
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
-    // Whether every move of the mouse is reported: only while a menu or a
-    // card is open, as flea does.
+    // Whether every move of the mouse is reported: while a menu or a card
+    // is open, as flea does, and while the view buttons show, for their
+    // tooltips.
     let mut motion = false;
     while !app.should_quit {
         app.tick();
@@ -137,12 +138,22 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         terminal.draw(|frame| ui::draw(frame, app))?;
         // Short enough for thumbnails to show up as they are made.
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                _ => {}
+            take_in(app, event::read()?);
+            // A moving mouse sends many moves a frame: everything waiting is
+            // taken in before the next frame is drawn.
+            while event::poll(Duration::ZERO)? {
+                take_in(app, event::read()?);
             }
         }
     }
     Ok(())
+}
+
+/// Hands a key or the mouse to the app.
+fn take_in(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
+        Event::Mouse(mouse) => app.handle_mouse(mouse),
+        _ => {}
+    }
 }

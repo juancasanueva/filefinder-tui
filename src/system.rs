@@ -397,7 +397,7 @@ fn editor_of(editor: Option<String>) -> String {
 /// The mouse the way flea asks for it: presses, releases and drags
 /// (button-event tracking, 1002) in SGR form (1006), and every move as well
 /// (any-motion tracking, 1003) only while `motion` is asked for, for a menu
-/// or a card whose lines follow the pointer. crossterm's
+/// or a card whose lines follow the pointer, or the view buttons' tooltips. crossterm's
 /// `DisableMouseCapture` turns all of them off again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrackMouse {

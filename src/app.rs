@@ -1717,9 +1717,12 @@ impl App {
     }
 
     /// Whether moving the mouse is worth hearing about: while a menu or a
-    /// card with buttons is open, whose lines and buttons follow it.
+    /// card with buttons is open, whose lines and buttons follow it, and
+    /// while the header's view buttons show, which say what they do when the
+    /// pointer rests on them. Asked of the last frame drawn.
     pub fn wants_motion(&self) -> bool {
-        self.menu.is_some() || self.dialog.is_some()
+        let buttons = self.hits.rect_of(&Spot::View(ViewMode::List)).is_some();
+        self.menu.is_some() || self.dialog.is_some() || buttons
     }
 
     /// The mouse moved over a menu's line or a card's button: the keyboard
@@ -10438,7 +10441,9 @@ mod mouse_tests {
         click(&mut f.app, zip);
         assert!(f.app.menu.is_none());
         assert_eq!(f.app.working(), Some("Compressing notes.txt to .zip"));
-        assert!(!f.app.wants_motion());
+        assert!(f.app.menu.is_none());
+        // Moves are still heard, for the view buttons the header shows.
+        assert!(f.app.wants_motion());
     }
     #[test]
     fn a_click_on_a_menu_line_runs_it_and_one_outside_only_closes_the_menu() {

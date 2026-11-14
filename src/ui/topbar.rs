@@ -310,6 +310,22 @@ mod tests {
     use ratatui::style::Color;
 
     #[test]
+    fn the_terminal_is_asked_for_every_move_while_the_view_buttons_show() {
+        use crate::app::ViewMode;
+        use crate::icons;
+        let mut f = fixture();
+        // Without them a terminal tells only of presses and drags, and a
+        // pointer resting on a button would never be heard.
+        let drawn = buffer(&mut f.app, 120, 30);
+        assert!(find(&drawn, icons::view(ViewMode::Grid), 0..120).is_some());
+        assert!(f.app.wants_motion());
+        // A window too narrow for them has nothing to hover.
+        let drawn = buffer(&mut f.app, 24, 30);
+        assert!(find(&drawn, icons::view(ViewMode::Grid), 0..24).is_none());
+        assert!(!f.app.wants_motion());
+    }
+
+    #[test]
     fn a_view_button_says_what_it_does_while_the_pointer_rests_on_it() {
         use crate::app::ViewMode;
         use crate::icons;
