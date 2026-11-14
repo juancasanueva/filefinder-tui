@@ -189,11 +189,17 @@ fn taken_place(folder: &Path, name: &OsStr) -> Option<PathBuf> {
     let asked = folder.join(name);
     let meta = fs::symlink_metadata(&asked).ok()?;
     let listed = fs::read_dir(folder).ok().into_iter().flatten().flatten();
+    let folded = name.to_string_lossy().to_lowercase();
     let mut same_item = None;
     for entry in listed {
         let listed_name = entry.file_name();
         if listed_name == name {
             return Some(asked);
+        }
+        // Another spelling of the same name, not another hard link to the
+        // same file under an unrelated name.
+        if listed_name.to_string_lossy().to_lowercase() != folded {
+            continue;
         }
         let path = folder.join(&listed_name);
         let is_it = fs::symlink_metadata(&path)
@@ -3565,6 +3571,24 @@ mod tests {
         // A name nothing has is no clash, whatever the volume.
         let b = w.file("b.txt", "b");
         assert!(clashes(&[b], &into, false).is_empty());
+    }
+
+    #[test]
+    fn a_case_only_clash_is_never_named_after_another_hard_link() {
+        // `A.TXT` also has other names for the same file; whichever the
+        // folder lists first, the clash for `a.txt` is `A.TXT`.
+        let w = world();
+        let into = w.folder("Into");
+        let there = w.file("Into/A.TXT", "old");
+        for other in ["Z.txt", "B.txt", "m.txt", "_x.txt", "0.txt"] {
+            fs::hard_link(&there, w.path(&format!("Into/{other}"))).unwrap();
+        }
+        let a = w.file("a.txt", "new");
+        assert_eq!(clashes(std::slice::from_ref(&a), &into, false), ["A.TXT"]);
+        assert_eq!(
+            taken_place(&into, OsStr::new("a.txt")),
+            Some(into.join("A.TXT"))
+        );
     }
 
     #[test]
