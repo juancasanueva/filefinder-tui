@@ -180,7 +180,7 @@ fn summary(entry: &Entry, date_style: format::DateStyle) -> String {
 }
 
 /// A row of a folder's items or of a selection, in the metadata ink, with its size.
-fn quiet_row(entry: &Entry, width: usize) -> Line<'static> {
+pub(super) fn quiet_row(entry: &Entry, width: usize) -> Line<'static> {
     let look = Look {
         quiet: true,
         ..Look::default()
@@ -190,7 +190,12 @@ fn quiet_row(entry: &Entry, width: usize) -> Line<'static> {
 
 /// Rows from the preview's scroll on, as many as fit; the scroll is kept
 /// where the last row is still in sight.
-fn scrolled(frame: &mut Frame, rows: Vec<Line<'static>>, area: Rect, scroll: &mut usize) {
+pub(super) fn scrolled(
+    frame: &mut Frame,
+    rows: Vec<Line<'static>>,
+    area: Rect,
+    scroll: &mut usize,
+) {
     let height = area.height as usize;
     *scroll = (*scroll).min(rows.len().saturating_sub(height));
     let shown: Vec<Line> = rows.into_iter().skip(*scroll).take(height).collect();
@@ -199,7 +204,7 @@ fn scrolled(frame: &mut Frame, rows: Vec<Line<'static>>, area: Rect, scroll: &mu
 
 /// A text's lines under a right-aligned gutter of line numbers, long lines
 /// wrapped with the number on their first part only.
-fn text_rows(lines: &[String], width: usize) -> Vec<Line<'static>> {
+pub(super) fn text_rows(lines: &[String], width: usize) -> Vec<Line<'static>> {
     let gutter = lines.len().to_string().width();
     let room = width.saturating_sub(gutter + 1).max(1);
     let mut rows = Vec::new();

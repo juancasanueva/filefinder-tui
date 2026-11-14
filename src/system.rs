@@ -331,6 +331,28 @@ fn editor_of(editor: Option<String>) -> String {
         .unwrap_or_else(|| "vi".to_string())
 }
 
+/// The mouse the way flea asks for it: presses, releases and drags
+/// (button-event tracking, 1002) in SGR form (1006), and every move as well
+/// (any-motion tracking, 1003) only while `motion` is asked for, for a menu
+/// or a card whose lines follow the pointer. crossterm's
+/// `DisableMouseCapture` turns all of them off again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackMouse {
+    pub motion: bool,
+}
+
+impl ratatui::crossterm::Command for TrackMouse {
+    fn write_ansi(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        // Terminals keep one tracking mode: turning 1003 off after 1002 is
+        // on would turn the mouse off altogether, so it goes first.
+        out.write_str(if self.motion {
+            "\x1b[?1002h\x1b[?1006h\x1b[?1003h"
+        } else {
+            "\x1b[?1003l\x1b[?1002h\x1b[?1006h"
+        })
+    }
+}
+
 /// Gives the terminal to another program: the screen and keyboard as they
 /// were before this app, the mouse its own.
 fn hand_over(enhanced: bool) {
@@ -351,16 +373,14 @@ fn hand_over(enhanced: bool) {
 
 /// Takes the terminal back for this app, the way `main` first set it up.
 fn take_back(enhanced: bool) -> io::Result<()> {
-    use ratatui::crossterm::event::{
-        EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    };
+    use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
     use ratatui::crossterm::{cursor, execute, terminal};
     let mut out = io::stdout();
     terminal::enable_raw_mode()?;
     execute!(
         out,
         terminal::EnterAlternateScreen,
-        EnableMouseCapture,
+        TrackMouse { motion: false },
         cursor::SetCursorStyle::SteadyBar
     )?;
     if enhanced {
@@ -621,6 +641,26 @@ pub fn quiet(command: &mut Command) -> &mut Command {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn the_mouse_is_tracked_by_button_events_and_every_move_only_when_asked() {
+        use ratatui::crossterm::Command;
+        use ratatui::crossterm::event::DisableMouseCapture;
+        let ansi = |command: &dyn Fn(&mut String) -> std::fmt::Result| {
+            let mut out = String::new();
+            command(&mut out).unwrap();
+            out
+        };
+        let normal = ansi(&|out| TrackMouse { motion: false }.write_ansi(out));
+        assert_eq!(normal, "\x1b[?1003l\x1b[?1002h\x1b[?1006h");
+        let menu = ansi(&|out| TrackMouse { motion: true }.write_ansi(out));
+        assert_eq!(menu, "\x1b[?1002h\x1b[?1006h\x1b[?1003h");
+        // What gives the mouse back turns every one of them off.
+        let off = ansi(&|out| DisableMouseCapture.write_ansi(out));
+        for mode in ["1002l", "1003l", "1006l"] {
+            assert!(off.contains(mode), "{mode} in {off:?}");
+        }
+    }
 
     #[test]
     fn the_editor_is_editor_or_else_vi() {

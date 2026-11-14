@@ -384,6 +384,8 @@ pub struct Facts {
     pub dimensions: Option<(u32, u32)>,
     /// The first lines of a text file; none for anything else.
     pub opening: Vec<String>,
+    /// How many lines a text file has, for one small enough to count.
+    pub lines: Option<usize>,
     /// A folder's items, the first thousand of them, or why they couldn't
     /// be listed; `None` for anything but a folder.
     pub children: Option<Result<Vec<Entry>, String>>,
@@ -406,6 +408,9 @@ impl Facts {
             } else {
                 Vec::new()
             },
+            lines: (is_plain_text(entry) && entry.size <= COUNTED_BYTES)
+                .then(|| line_count(&entry.path))
+                .flatten(),
             children: entry
                 .is_dir
                 .then(|| children(&entry.path, show_hidden, sort)),
@@ -458,6 +463,17 @@ fn dimensions(path: &Path) -> Option<(u32, u32)> {
     } else {
         (width, height)
     })
+}
+
+/// The most a text file can hold for its lines to be counted.
+const COUNTED_BYTES: u64 = 8 << 20;
+
+/// How many lines a file has: its line ends, and a last line without one.
+fn line_count(path: &Path) -> Option<usize> {
+    let bytes = std::fs::read(path).ok()?;
+    let ends = bytes.iter().filter(|byte| **byte == b'\n').count();
+    let unended = bytes.last().is_some_and(|byte| *byte != b'\n');
+    Some(ends + usize::from(unended))
 }
 
 /// The first lines of a file that is text; nothing when it isn't UTF-8.
@@ -570,6 +586,20 @@ mod tests {
 
     fn entry(path: PathBuf) -> Entry {
         Entry::from_path(path).unwrap()
+    }
+
+    #[test]
+    fn a_text_s_lines_are_counted_with_a_last_one_without_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, lines) in [("a\nb\nc", 3), ("a\nb\n", 2), ("", 0), ("one", 1)] {
+            let path = dir.path().join("t.txt");
+            fs::write(&path, text).unwrap();
+            assert_eq!(read(&entry(path.clone())).lines, Some(lines), "{text:?}");
+        }
+        // Not text: nothing counted.
+        let path = dir.path().join("p.png");
+        fs::write(&path, "a\nb").unwrap();
+        assert_eq!(read(&entry(path.clone())).lines, None);
     }
 
     #[test]

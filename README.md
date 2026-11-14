@@ -5,7 +5,7 @@ A keyboard-first terminal file manager for macOS, written in Rust with [ratatui]
 Nothing runs in the background. Folders are read when you open them, and thumbnails are made when a tile needs one.
 
 - **The screen**: the parent folder's items on the left (the folder you are in lifted), the list in the middle with a glyph, the name and the size on each row, and the preview on the right. Links show in cyan with where they point, programs in green. Alt+P hides or shows the preview, and the choice is remembered.
-- **Preview pane**: the name, kind, size and date, then a folder's items, a text file's lines with line numbers, a picture with its pixel size, or what several selected items add up to. Tab moves the keyboard into it to scroll. Space opens Quick Look.
+- **Preview pane**: the name, kind, size and date, then a folder's items, a text file's lines with line numbers, a picture with its pixel size, or what several selected items add up to. Tab moves the keyboard into it to scroll. Space opens flea's Quick Look card over the window.
 - **Four views**: Ctrl+1 the list (the default); Ctrl+2 Miller columns from home down to the folder (three at usual widths), then the preview; Ctrl+3 a grid of real thumbnails with two-line names, beside the preview; Ctrl+4 two lists side by side, each under its own path. The view is remembered, two panes excepted.
 - **Tabs**: `t` opens one in the folder you are in, `O` the folder under the cursor; `[` / `]` go round them, `1`–`9` jump to one, `{` / `}` move it, `w` closes it (the last one quits). Each tab keeps its own folder, view, panes, marks and history; the strip in the header shows once there are two, at most nine.
 - **Colours**: truecolor when `COLORTERM` says so, the nearest of 256 colours otherwise, and none with `NO_COLOR` (the cursor row is then reverse video and marked rows underlined). `FILEFINDER_ICONS=plain` replaces the Nerd Font glyphs with plain marks.
@@ -16,7 +16,7 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 - **Compress and Extract**, in the menu (`m`). Compress writes zip, tar, tar.gz, tar.bz2 or tar.xz (and 7z when [7-Zip](https://www.7-zip.org/) is installed as `7zz` or `7z`), named after the item without its extension, or after the folder several are in. Extract unpacks a zip, tar, tar.gz/.tgz, tar.bz2, tar.xz (or 7z) into a new folder beside it named after it without its ending. A name in use is never written over: the next free copy name is taken (`pack copy.tar.gz`, `pack copy 2.tar.gz`, `pack copy`). An archive holding a name from the root, one with `..`, or a link that leads out of its folder is refused with nothing written; one that is damaged or needs a password says so and leaves nothing behind; Escape stops either. Undo moves what was made to the Trash.
 - **Two panes** with Ctrl+4, `|` or Alt+1 to move things between folders (`y`/`x` in one, `p` or `M` in the other); the same key goes back to the view you came from.
 - **Filter and Find**, both typed on the bottom row. The filter (`/`) narrows the folder you are looking at as you type: part of a name in any case, or a `*` / `?` pattern; close matches (a letter or two off, depending on how long the text is) show only when nothing matches exactly. Tab widens it to every folder below. Find (`f` or Ctrl+F) walks the folders below and ranks what it finds: the whole name, then its start, the start of a word, the letters in order, and typos last. Tab looks in this folder, home, or everywhere; Ctrl+G looks inside files instead, through [ripgrep](https://github.com/BurntSushi/ripgrep) when it is installed. Go to a path with `:`.
-- **Mouse friendly**: click, double-click, right-click for the menu, Shift+click for a range.
+- **Mouse friendly**, by flea's rules: click, double-click, right-click for the menu, Ctrl+click for one more, Shift+click for a range, the wheel to move.
 
 ## Requirements
 
@@ -80,7 +80,7 @@ flea's own terminal keys. Digits are never counts.
 | Ctrl+G | In Find's field: names or what files hold (needs `rg`) |
 | `tag:red` | In Find's field: only what carries that tag |
 | `o` | Show what Find found under the cursor in its own folder |
-| Space | Quick Look |
+| Space | Quick Look, in the terminal (see below) |
 | `.` | Show hidden files |
 | `s` / `S` | Next sort key (name, size, modified, kind) / reverse the sort |
 | `I` | Detail column: size, modified, mode (`drwx------`), owner |
@@ -96,12 +96,12 @@ flea's own terminal keys. Digits are never counts.
 | `r`, F2 | Rename; with several marked, all of them in `$EDITOR` |
 | `N`, Ctrl+Shift+N | New folder |
 | `dd`, Delete | Move to Trash |
-| Shift+Delete | Delete permanently (asks first) |
+| Shift+Delete | Delete permanently (a card asks first; Cancel is the default) |
 | `z`, Ctrl+Z | Undo |
 | Ctrl+Shift+Z, Ctrl+Y | Redo |
 | `E` | Edit the file in `$EDITOR` (`vi` without one) |
 | `Y`, Ctrl+Shift+C | Copy the folder's path, the item's path |
-| `m`, Menu, Shift+F10 | The menu |
+| `m`, Menu, Shift+F10 | The menu (see below) |
 | Ctrl+T | Open a terminal here |
 | Ctrl+1 / 2 / 3 | List, columns, grid |
 | Ctrl+4, `\|`, Alt+1 | Two panes, or back to the view before (on a Spanish Mac keyboard `\|` is Option+1) |
@@ -112,12 +112,38 @@ flea's own terminal keys. Digits are never counts.
 | `[` / `]` | Previous tab, next tab |
 | `{` / `}` | Move the tab left, right |
 | `1` … `9` | Go to that tab |
-| `?` | Every shortcut |
+| `?` | The keyboard shortcuts, in a card that scrolls with `j` / `k` and the page keys |
 | `q` | Quit |
 
 Rename, Folder name and Go to ask on the bottom row. A paste that meets names already taken asks there too: Enter or `b` keeps both (`name copy.ext`), `r` replaces (the one there goes to the Trash, and undo brings it back), `s` skips, Escape cancels.
 
-With the mouse on, select text in the terminal with its own modifier: Shift-drag in Ghostty, Option-drag in Terminal.
+### The menu
+
+`m` (or Menu, Shift+F10, a right click on an item) opens flea's menu under the item, at its name, or above it when there is no room below:
+
+- Open, Open With › (Default app, and Quick Look in macOS's own window)
+- Compress › (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, and `.7z` with 7-Zip installed), Extract (for an archive)
+- Tags › (the seven Finder tags, Remove All Tags), Copy Path
+- Rename (with several selected, all of them in `$EDITOR`), Duplicate
+- Move to Trash, Delete Permanently…
+- Show/Hide Hidden Files, Open Trash
+
+In the Trash it offers Restore, Delete Permanently… and Empty Trash…. `j` / `k` and the arrows move, `l`, → or ⏎ choose or open a submenu, `h` or ← go back out of one, Escape closes. Each row does exactly what its key does. What can't apply is left out or dimmed.
+
+### Quick Look
+
+Space opens a card over the window with the item's name, one fact (a picture's size, a text's lines) and the picture, the text with line numbers, or a folder's items. `j` / `k` and ↓ / ↑ move the list's cursor and the card follows; `+` / `-` zoom the picture and `0` fits it; PgDn / PgUp scroll the text; Escape or Space closes, and so does a click on its `×` or outside it. macOS's own Quick Look window is in the menu: Open With › Quick Look.
+
+### The mouse
+
+- A click puts the cursor on an item and clears the selection; a second click within 400 ms opens it (among what Find found, shows it in its folder, like `o`).
+- Ctrl-click (or Cmd-click where the terminal sends it) marks or unmarks one item; Shift-click selects the range from the cursor.
+- A right click opens the menu for the item, or for the selection when the item is in it.
+- The wheel moves the cursor a row; over the preview, the shortcuts or Quick Look it scrolls them.
+- A click on a tab's label shows that tab; one in the parent folder's column opens that folder.
+- A click outside the menu or a card closes it; a card's buttons can be clicked, and moving over the menu's rows or a card's buttons puts the keyboard there.
+
+The mouse is tracked as flea does: presses and drags, and every move only while a menu or a card is open. Select text in the terminal with its own modifier: Shift-drag in Ghostty, Option-drag in Terminal.
 
 ## Where it keeps things
 
@@ -130,7 +156,7 @@ With the mouse on, select text in the terminal with its own modifier: Shift-drag
 - Listing `~/.Trash` needs Full Disk Access for your terminal (System Settings → Privacy & Security). Moving things into it works without it.
 - On FAT-formatted drives macOS keeps file attributes in `._name` files. A file `name` and a file of your own called `._name` can't sit side by side there, so FileFinder refuses that operation instead of letting macOS replace your file.
 - Find stops after 500 matches. Everywhere means `/` on the system's volume and the home folder's, leaving out `/System`, `/private/var/vm`, `/Volumes`, `/dev` and `/cores`; links to folders are never followed. The filter's subfolders take in at most 20,000 items.
-- Not included: copying and pasting with other apps through the system clipboard, Open With, sharing, ejecting drives, drag and drop, and the mouse's back and forward buttons.
+- Not included: copying and pasting with other apps through the system clipboard, Open With other apps than the default one, sharing, ejecting drives, drag and drop, and the mouse's back and forward buttons.
 
 ## Development
 

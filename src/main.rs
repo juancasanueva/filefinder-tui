@@ -23,7 +23,7 @@ use std::time::Duration;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    self, DisableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
@@ -32,7 +32,7 @@ use ratatui_image::picker::Picker;
 
 use app::{App, Config};
 use format::DateStyle;
-use system::MacSystem;
+use system::{MacSystem, TrackMouse};
 use theme::Depth;
 use thumbs::{MacThumbnailer, Thumbs};
 
@@ -69,7 +69,7 @@ fn main() -> io::Result<()> {
     execute!(stdout(), SetCursorStyle::SteadyBar)?;
     // Clicks and the wheel come to the app; selecting text then takes the
     // terminal's own modifier (Shift-drag in Ghostty, Option-drag in Terminal).
-    execute!(stdout(), EnableMouseCapture)?;
+    execute!(stdout(), TrackMouse { motion: false })?;
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         give_back(enhanced);
@@ -113,11 +113,20 @@ fn query_picker() -> Picker {
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
+    // Whether every move of the mouse is reported: only while a menu or a
+    // card is open, as flea does.
+    let mut motion = false;
     while !app.should_quit {
         app.tick();
         if app.take_redraw() {
-            // Another program had the screen: nothing on it is ours.
+            // Another program had the screen: nothing on it is ours, and
+            // the mouse is as it was given back.
             terminal.clear()?;
+            execute!(stdout(), TrackMouse { motion })?;
+        }
+        if app.wants_motion() != motion {
+            motion = app.wants_motion();
+            execute!(stdout(), TrackMouse { motion })?;
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
         // Short enough for thumbnails to show up as they are made.

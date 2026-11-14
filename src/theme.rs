@@ -43,7 +43,6 @@ pub const UNAVAILABLE: Color = Color::Rgb(0x68, 0x42, 0x43);
 pub const SYMLINK: Color = Color::Rgb(0x94, 0xe2, 0xd5);
 pub const EXECUTABLE: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 /// Text behind a card.
-#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
 pub const DIMMED: Color = Color::Rgb(0x6d, 0x70, 0x70);
 /// Without a theme the accent is the foreground itself.
 pub const ACCENT: Color = FOREGROUND;
@@ -247,9 +246,44 @@ pub fn border() -> Style {
     fg(BORDER)
 }
 
-/// The frame and rules of a card or the menu.
+/// The rule inside a card and between the menu's groups.
 pub fn card_rule() -> Style {
     fg(CARD_RULE)
+}
+
+/// The frame of a card or of the menu.
+pub fn frame() -> Style {
+    fg(MUTED)
+}
+
+/// The ground a card dims the screen toward: flea's fallback background,
+/// since the terminal's own can't be asked.
+const GROUND: [u8; 3] = [0x10, 0x13, 0x15];
+
+/// A style as it shows behind a card: in truecolor each colour mixed
+/// halfway to the ground, so the foreground becomes the dimmed text; with
+/// fewer colours the text in the dimmed ink, fills as they were.
+pub fn dimmed(style: Style) -> Style {
+    let half = |color: Option<Color>| match (depth(), color) {
+        // flea's own figure for the foreground behind a card.
+        (Depth::Truecolor, Some(FOREGROUND)) => Some(DIMMED),
+        (Depth::Truecolor, Some(Color::Rgb(r, g, b))) => {
+            let mix = |c: u8, ground: u8| (u16::from(c) + u16::from(ground)).div_ceil(2) as u8;
+            Some(Color::Rgb(
+                mix(r, GROUND[0]),
+                mix(g, GROUND[1]),
+                mix(b, GROUND[2]),
+            ))
+        }
+        _ => None,
+    };
+    let fg = half(style.fg).unwrap_or(ink(DIMMED));
+    let bg = half(style.bg).or(style.bg);
+    Style {
+        fg: Some(fg),
+        bg,
+        ..style
+    }
 }
 
 pub fn error() -> Style {
@@ -261,30 +295,11 @@ pub fn field() -> Style {
     on(FOREGROUND, FIELD)
 }
 
-/// A line of the menu: the one the keyboard is on on the tab fill, and one
-/// that can't be used right now muted.
-pub fn menu_item(lit: bool, enabled: bool) -> Style {
-    let ink = if enabled { FOREGROUND } else { MUTED };
-    let style = if lit { on(ink, TAB) } else { fg(ink) };
-    style.add_modifier(cursor_modifier(lit))
-}
-
 /// A tab's label in the header: the tab showing on the tab fill in the
 /// foreground, the others muted.
 pub fn tab_label(current: bool) -> Style {
     if current {
         on(FOREGROUND, TAB).add_modifier(cursor_modifier(true))
-    } else {
-        muted()
-    }
-}
-
-/// A choice in a dialog: the lit one, which Enter takes, on the wash.
-pub fn choice(lit: bool) -> Style {
-    if lit {
-        on(FOREGROUND, WASH)
-            .add_modifier(Modifier::BOLD)
-            .add_modifier(cursor_modifier(true))
     } else {
         muted()
     }

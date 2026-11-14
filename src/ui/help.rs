@@ -1,217 +1,259 @@
-//! The `?` overlay: every shortcut that works. Whatever the size of the
-//! window, all of them can be reached: side by side in two columns when it is
-//! short and wide, and by scrolling when they still don't fit.
+//! The `?` sheet: the card "Keyboard Shortcuts" between the window's rules,
+//! with every key the app has in flea's four groups, each group whole, in
+//! up to three columns four cells apart. It scrolls when they don't fit.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use super::{fit, pad, pad_left};
+use super::card::{self, ESC};
+use super::{fit, pad, pad_left, words};
 use crate::app::{App, HitMap, Spot};
 use crate::theme;
 
-const SHORTCUTS: &[(&str, &str)] = &[
-    ("j / k  ↓ / ↑", "Move down / up"),
-    ("g / G  Home / End", "First / last item"),
-    ("Ctrl+D / Ctrl+U", "Page down / up (or PgDn / PgUp)"),
-    ("h / ←  Backspace", "Go to the parent folder"),
-    ("l / →", "Browse into the folder, or open the file"),
-    ("⏎", "Open"),
-    ("H / L", "Back / forward"),
-    ("Tab", "Move between the list and the preview, or the panes"),
-    (
-        "Escape",
-        "Close or go back: error, filter, find, file work, marks",
-    ),
-    (": / Ctrl+L", "Go to a place (Tab completes)"),
-    ("/", "Filter this folder (Tab: and its subfolders)"),
-    ("f / Ctrl+F", "Find below this folder (Tab: where)"),
-    ("Ctrl+G", "In Find: names or what files hold"),
-    ("tag:red", "In Find: only what has that tag"),
-    ("o", "Show what Find found in its folder"),
-    ("Space", "Quick Look the file"),
-    (".", "Show hidden files"),
-    ("s / S", "Next sort key / reverse the sort"),
-    ("I", "Detail column: size, modified, mode, owner"),
-    (
-        "T",
-        "Finder tags: 1–7 turn a tag on or off, Remove All Tags",
-    ),
-    ("Alt+P", "Show or hide the preview pane"),
-    ("Ctrl+R / F5", "Reload"),
-    ("v", "Mark or unmark the item"),
-    ("J / K  Shift+↓ / ↑", "Mark down / up"),
-    ("V / Ctrl+A", "Invert the marks / mark everything"),
-    ("y / x / p", "Copy, cut, paste (or Ctrl+C / X / V)"),
-    ("M", "Move here what was copied or cut"),
-    ("U", "Duplicate"),
-    (
-        "r / F2",
-        "Rename; with several marked, all of them in $EDITOR",
-    ),
-    ("N / Ctrl+Shift+N", "New folder"),
-    ("dd / Delete", "Move to Trash"),
-    ("Shift+Delete", "Delete permanently (asks first)"),
-    ("z / Ctrl+Z", "Undo"),
-    ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
-    ("E", "Edit the file in $EDITOR"),
-    (
-        "Y / Ctrl+Shift+C",
-        "Copy the folder's path / the item's path",
-    ),
-    ("m / Shift+F10", "Menu"),
-    ("Ctrl+T", "Open a terminal here"),
-    ("Ctrl+1 / 2 / 3", "List, columns, grid"),
-    ("Ctrl+4  |  Alt+1", "Two panes, or back to one"),
-    ("+ / -", "Bigger or smaller tiles"),
-    ("t", "New tab"),
-    ("O", "Open in new tab"),
-    ("w / Ctrl+W", "Close tab (closing the last one quits)"),
-    ("[ / ]", "Previous tab / next tab"),
-    ("{ / }", "Move tab left / right"),
-    ("1 … 9", "Select tab"),
-    ("?", "Show these shortcuts"),
-    ("q", "Quit"),
+pub const TITLE: &str = "Keyboard Shortcuts";
+
+/// The groups, as flea heads them.
+pub const GROUPS: [&str; 4] = ["MOVE", "LOOK", "FIND", "CHANGE"];
+
+/// Each key the app has: its group, the keys as flea's sheet spells them,
+/// and what they do in flea's words where flea has them.
+pub const ROWS: &[(usize, &str, &str)] = &[
+    (0, "j / down", "Cursor down"),
+    (0, "k / up", "Cursor up"),
+    (0, "g / home", "First item"),
+    (0, "G / end", "Last item"),
+    (0, "ctrl-d / pagedown", "Page down"),
+    (0, "ctrl-u / pageup", "Page up"),
+    (0, "enter", "Open"),
+    (0, "h / left / backspace", "Parent folder"),
+    (0, "l / right", "Browse in"),
+    (0, "H", "Back"),
+    (0, "L", "Forward"),
+    (0, "tab", "Focus the preview"),
+    (0, "t", "New tab"),
+    (0, "O", "Open in new tab"),
+    (0, "w / ctrl-w", "Close tab"),
+    (0, "]", "Next tab"),
+    (0, "[", "Previous tab"),
+    (0, "{", "Move tab left"),
+    (0, "}", "Move tab right"),
+    (0, "escape", "Close or go back"),
+    (0, "1–9", "Select tab"),
+    (0, "q", "Quit"),
+    (1, "?", "Keyboard Shortcuts"),
+    (1, "space", "Quick Look"),
+    (1, ".", "Hidden files"),
+    (1, "I", "Detail column"),
+    (1, "alt-p", "Preview column"),
+    (1, "ctrl-1", "List view"),
+    (1, "ctrl-2", "Columns view"),
+    (1, "ctrl-3", "Grid view"),
+    (1, "ctrl-4 / | / alt-1", "Dual pane"),
+    (1, "+", "Zoom in"),
+    (1, "-", "Zoom out"),
+    (2, "/", "Filter"),
+    (2, "f / ctrl-f", "Find"),
+    (2, "ctrl-g", "Search contents"),
+    (2, "o", "Reveal"),
+    (2, "s", "Sort"),
+    (2, "S", "Reverse sort"),
+    (2, ": / ctrl-l", "Go to folder"),
+    (2, "ctrl-r / f5", "Reload"),
+    (3, "y / ctrl-c", "Copy"),
+    (3, "x / ctrl-x", "Cut"),
+    (3, "p / ctrl-v", "Paste"),
+    (3, "M", "Move here"),
+    (3, "U", "Duplicate"),
+    (3, "r / f2", "Rename"),
+    (3, "dd / delete", "Move to Trash"),
+    (3, "shift-delete", "Delete permanently"),
+    (3, "z / ctrl-z", "Undo"),
+    (3, "ctrl-shift-z / ctrl-y", "Redo"),
+    (3, "ctrl-shift-n / N", "New folder"),
+    (3, "E", "Edit in $EDITOR"),
+    (3, "v", "Select"),
+    (3, "J / shift-down", "Extend down"),
+    (3, "K / shift-up", "Extend up"),
+    (3, "V", "Invert selection"),
+    (3, "ctrl-a", "Select all"),
+    (3, "T", "Tags"),
+    (3, "ctrl-shift-c", "Copy path"),
+    (3, "Y", "Copy folder path"),
+    (3, "m / menu", "Menu"),
+    (3, "ctrl-t", "Open terminal"),
 ];
 
-const KEY_WIDTH: usize = 26;
-/// The longest line: its keys, and the 56 cells of what they do.
-const LINE_WIDTH: usize = KEY_WIDTH + 56;
-/// Between two columns.
+/// At most three columns, four cells apart.
+const COLUMNS: usize = 3;
 const GAP: usize = 4;
-/// The border and the air left and right of the lines.
-const SIDES: usize = 8;
 
-const TITLE: &str = "Keyboard shortcuts";
+/// A line of the sheet: a group's heading, a key beside its words, or on a
+/// screen too narrow for that, a key or its words on a line of their own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Sheet {
+    Heading(&'static str),
+    Binding(&'static str, &'static str),
+    Key(String),
+    Words(String),
+}
 
-/// Under the shortcuts, whatever is scrolled: what the mouse does.
-const MOUSE: &str =
-    "Mouse: click, double-click, right-click; Shift+click a range, Alt+click marks one";
+fn groups() -> Vec<Vec<Sheet>> {
+    let group = |index: usize| {
+        let mut lines = vec![Sheet::Heading(GROUPS[index])];
+        let rows = ROWS.iter().filter(|(group, _, _)| *group == index);
+        lines.extend(rows.map(|(_, keys, does)| Sheet::Binding(keys, does)));
+        lines
+    };
+    (0..GROUPS.len()).map(group).collect()
+}
 
-/// One line of a column: the keys, or nothing where the line above goes on.
-type Row = (&'static str, String);
+/// Groups fill a column in order, and the next group starts a new column
+/// when it would not fit whole.
+fn pack(groups: &[Vec<Sheet>], capacity: usize) -> Vec<Vec<Sheet>> {
+    let mut columns: Vec<Vec<Sheet>> = Vec::new();
+    for group in groups {
+        let full =
+            |column: &Vec<Sheet>| !column.is_empty() && column.len() + group.len() > capacity;
+        if columns.last().is_none_or(full) {
+            columns.push(Vec::new());
+        }
+        if let Some(column) = columns.last_mut() {
+            column.extend(group.iter().cloned());
+        }
+    }
+    columns
+}
 
-/// Draws the overlay, which is a spot for the mouse wheel.
+/// A column's key width and words width.
+fn widths(column: &[Sheet]) -> (usize, usize) {
+    let key = column
+        .iter()
+        .map(|line| match line {
+            Sheet::Binding(keys, _) => keys.width(),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    let words = column
+        .iter()
+        .map(|line| match line {
+            Sheet::Binding(_, does) => does.width(),
+            Sheet::Heading(text) => text.width().saturating_sub(key + 2),
+            Sheet::Key(text) | Sheet::Words(text) => text.width().saturating_sub(key + 2),
+        })
+        .max()
+        .unwrap_or(0);
+    (key, words)
+}
+
+fn total(columns: &[Vec<Sheet>]) -> usize {
+    let each = columns.iter().map(|column| {
+        let (key, words) = widths(column);
+        key + 2 + words
+    });
+    each.sum::<usize>() + GAP * columns.len().saturating_sub(1)
+}
+
+/// The most columns, up to three, that fit `room` cells with the fewest
+/// rows, `rows` being what the card shows; a screen too narrow for one
+/// column of keys beside their words has each on lines of their own.
+fn sheet(rows: usize, room: usize) -> Vec<Vec<Sheet>> {
+    let groups = groups();
+    for count in (1..=COLUMNS).rev() {
+        let mut capacity = rows.max(1);
+        while pack(&groups, capacity).len() > count {
+            capacity += 1;
+        }
+        let columns = pack(&groups, capacity);
+        if total(&columns) <= room {
+            return columns;
+        }
+    }
+    let wrap = |text: &str| words(text, room);
+    let stacked = groups.iter().flatten().flat_map(|line| match line {
+        Sheet::Binding(keys, does) => {
+            let keys = wrap(keys).into_iter().map(Sheet::Key);
+            keys.chain(wrap(does).into_iter().map(Sheet::Words))
+                .collect()
+        }
+        other => vec![other.clone()],
+    });
+    vec![stacked.collect()]
+}
+
+/// Draws the sheet over `area`, the whole window, from the row under the
+/// top rule to the one over the bottom rule. Scrolling is kept in range.
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
-    let (area_width, area_height) = (area.width as usize, area.height as usize);
-    // With room to spare: a margin around the panel and air above and below
-    // the lines, which leaves this many rows for them.
-    let roomy_rows = area_height.saturating_sub(8);
-    let one_width = (LINE_WIDTH + SIDES).min(area_width.saturating_sub(4));
-    let one = column(SHORTCUTS, one_width.saturating_sub(SIDES));
-    // Two columns when one is too tall and both fit whole, side by side.
-    let two_width = 2 * LINE_WIDTH + GAP + SIDES;
-    let (columns, width) = if one.len() > roomy_rows && area_width >= two_width + 4 {
-        let (left, right) = SHORTCUTS.split_at(SHORTCUTS.len().div_ceil(2));
-        let columns = vec![column(left, LINE_WIDTH), column(right, LINE_WIDTH)];
-        (columns, two_width)
+    let outer_height = area.height.saturating_sub(4);
+    // Inside the frame: the title, the rule, the rows and a blank last row
+    // whenever there is room for one.
+    let inside = outer_height.saturating_sub(2) as usize;
+    let rows = if inside > 4 {
+        inside - 3
     } else {
-        (vec![one], one_width)
+        inside.saturating_sub(2)
     };
-
-    // A window still too short gives up the margin and the air, then scrolls.
-    // The line about the mouse takes the place of the air under the
-    // shortcuts, or a row of its own without it.
+    let room = card::room(area.width) as usize;
+    let columns = sheet(rows, room);
+    let heading = TITLE.width() + 2 + ESC.width();
+    let need = total(&columns).max(heading).min(room) as u16;
+    let air = card::air(area.width);
+    let width = need + 2 * air + 2;
+    let outer = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + 2,
+        width: width.min(area.width),
+        height: outer_height,
+    };
     let tallest = columns.iter().map(Vec::len).max().unwrap_or(0);
-    let (air, rows) = if tallest <= roomy_rows {
-        (1, roomy_rows)
-    } else {
-        (0, area_height.saturating_sub(5))
-    };
-    let showing = tallest.min(rows);
-    let last = tallest - showing;
-    app.help_scroll = app.help_scroll.min(last);
-    app.help_rows = showing;
-    let first = app.help_scroll;
+    let limit = tallest.saturating_sub(rows);
+    app.help_scroll = app.help_scroll.min(limit);
+    app.help_rows = rows;
+    let card = card::placed(outer, air, rows as u16, &[], app.help_scroll);
+    card::draw_frame(frame, &card, TITLE);
+    hits.add(card.outer, Spot::Help);
 
-    let height = (showing + 5 + air).min(area_height);
-    let overlay = Rect {
-        x: area.x + ((area_width - width) / 2) as u16,
-        y: area.y + ((area_height - height) / 2) as u16,
-        width: width as u16,
-        height: height as u16,
-    };
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .border_style(theme::card_rule())
-        .padding(Padding::new(3, 3, air as u16, 0))
-        .style(theme::base());
-
-    let inner_width = width.saturating_sub(SIDES);
-    let more = match (first > 0, first < last) {
-        (true, true) => "↑↓ more",
-        (true, false) => "↑ more",
-        (false, true) => "↓ more",
-        (false, false) => "",
-    };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(TITLE, theme::title()),
-            Span::styled(
-                pad_left(more, inner_width.saturating_sub(TITLE.len())),
-                theme::muted(),
-            ),
-        ]),
-        Line::default(),
-    ];
-    let column_width = match columns.len() {
-        1 => inner_width,
-        _ => LINE_WIDTH + GAP,
-    };
-    for row in first..first + showing {
-        let mut spans = Vec::new();
-        for column in &columns {
-            let (keys, does) = match column.get(row) {
-                Some((keys, does)) => (*keys, does.as_str()),
-                None => ("", ""),
-            };
-            spans.push(Span::styled(pad(keys, KEY_WIDTH), theme::base()));
-            spans.push(Span::styled(
-                pad(does, column_width.saturating_sub(KEY_WIDTH)),
-                theme::base(),
-            ));
+    let (mut x, end) = (card.body.x as usize, card.body.right() as usize);
+    for column in &columns {
+        let (key, does) = widths(column);
+        let width = (key + 2 + does).min(end.saturating_sub(x));
+        let lines: Vec<Line> = column
+            .iter()
+            .skip(card.top)
+            .take(rows)
+            .map(|line| sheet_line(line, key, does, width))
+            .collect();
+        let cells = Rect::new(x as u16, card.body.y, width as u16, card.body.height);
+        frame.render_widget(Paragraph::new(lines), cells);
+        x += key + 2 + does + GAP;
+        if x >= end {
+            break;
         }
-        lines.push(Line::from(spans));
     }
-    lines.push(Line::from(Span::styled(
-        fit(MOUSE, inner_width),
-        theme::muted(),
-    )));
-    frame.render_widget(Clear, overlay);
-    frame.render_widget(Paragraph::new(lines).block(block), overlay);
-    hits.add(overlay, Spot::Help);
 }
 
-/// The lines of a column `width` cells wide: what the keys do goes on under
-/// itself where it is too long for one line.
-fn column(shortcuts: &[(&'static str, &str)], width: usize) -> Vec<Row> {
-    let mut rows = Vec::new();
-    for (keys, does) in shortcuts {
-        let wrapped = wrap(does, width.saturating_sub(KEY_WIDTH));
-        let keys = std::iter::once(*keys).chain(std::iter::repeat(""));
-        rows.extend(keys.zip(wrapped));
-    }
-    rows
-}
-
-/// Breaks text between words into lines of at most `width` cells. A word
-/// longer than that has a line to itself.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split(' ') {
-        if !line.is_empty() && line.width() + 1 + word.width() > width {
-            lines.push(std::mem::take(&mut line));
+/// One line of a column: a heading in the metadata ink; keys right-aligned
+/// in it, two cells, then their words in the foreground.
+fn sheet_line(line: &Sheet, key: usize, does: usize, width: usize) -> Line<'static> {
+    match line {
+        Sheet::Heading(text) => Line::from(Span::styled(fit(text, width), theme::muted())),
+        Sheet::Key(text) => Line::from(Span::styled(fit(text, width), theme::muted())),
+        Sheet::Words(text) => Line::from(Span::styled(fit(text, width), theme::base())),
+        Sheet::Binding(keys, words) => {
+            let key = key.min(width);
+            Line::from(vec![
+                Span::styled(pad_left(keys, key), theme::muted()),
+                Span::raw("  "),
+                Span::styled(
+                    pad(words, does.min(width.saturating_sub(key + 2))),
+                    theme::base(),
+                ),
+            ])
         }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
     }
-    lines.push(line);
-    lines
 }
 
 #[cfg(test)]
@@ -219,222 +261,197 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::app::testing::{fixture, press};
-    use crate::ui::testing::screen;
+    use crate::ui::testing::{buffer, find, screen};
+    use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
+    use ratatui::style::{Color, Modifier};
 
     fn show(app: &mut App, width: u16, height: u16) -> String {
         screen(app, width, height).join("\n")
     }
 
-    /// Opens the shortcuts in a window of a size and reads them to the end,
-    /// one line down at a time: every screen that showed on the way.
-    fn read_through(app: &mut App, width: u16, height: u16) -> Vec<String> {
-        press(app, &[KeyCode::Char('?')]);
-        let mut screens = vec![show(app, width, height)];
-        loop {
-            press(app, &[KeyCode::Down]);
-            let next = show(app, width, height);
-            if screens.last() == Some(&next) {
-                return screens;
-            }
-            screens.push(next);
-        }
+    /// Where a heading starts.
+    fn heading(drawn: &Buffer, name: &str) -> (u16, u16) {
+        find(drawn, name, 0..drawn.area.width).unwrap_or_else(|| panic!("{name}"))
     }
 
     #[test]
-    fn at_24_rows_every_shortcut_can_be_reached() {
+    fn the_sheet_is_a_card_from_row_3_to_the_bottom_rule_with_flea_s_groups_in_columns() {
         let mut f = fixture();
-        let screens = read_through(&mut f.app, 120, 24);
-        for (keys, does) in SHORTCUTS {
-            let line = format!("{keys:<26}{does}");
-            assert!(screens.iter().any(|shown| shown.contains(&line)), "{line}");
-        }
-        // It doesn't all fit, and says so: more below at first, above at the end.
-        assert!(screens.len() > 2);
-        let (first, last) = (&screens[0], &screens[screens.len() - 1]);
-        assert!(first.contains("Keyboard shortcuts") && first.contains("↓ more"));
-        assert!(!first.contains("↑ more") && !first.contains("↑↓ more"));
-        assert!(screens[1].contains("↑↓ more"));
-        assert!(last.contains("↑ more") && !last.contains("↓ more"));
-        assert!(last.contains("Keyboard shortcuts"), "the title stays put");
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        let drawn = buffer(&mut f.app, 140, 40);
+        // From the row under the top rule to the one over the bottom rule.
+        let (x, y) = find(&drawn, "┌", 0..140).expect("the frame");
+        assert_eq!(y, 2);
+        assert_eq!(drawn[(x, 37)].symbol(), "└");
+        assert_eq!(drawn[(x, y)].fg, theme::MUTED);
+        let title = find(&drawn, TITLE, 0..140).expect("the title");
+        assert_eq!(title, (x + 3, 3));
+        assert!(drawn[title].modifier.contains(Modifier::BOLD));
+        assert_eq!(drawn[title].bg, Color::Reset);
+        assert!(find(&drawn, "esc", title.0..140).is_some());
+        assert_eq!(drawn[(title.0, 4)].fg, theme::CARD_RULE);
+
+        // Three columns at 140 across: Move; Look and Find; Change.
+        let (move_x, look_x, find_x, change_x) = (
+            heading(&drawn, "MOVE"),
+            heading(&drawn, "LOOK"),
+            heading(&drawn, "FIND"),
+            heading(&drawn, "CHANGE"),
+        );
+        assert_eq!(move_x, (title.0, 5));
+        assert_eq!(look_x.1, 5);
+        assert_eq!(find_x, (look_x.0, 5 + 12), "under Look's heading and keys");
+        assert_eq!(change_x.1, 5);
+        assert!(move_x.0 < look_x.0 && look_x.0 < change_x.0);
+        assert_eq!(
+            drawn[move_x].fg,
+            theme::MUTED,
+            "headings in the metadata ink"
+        );
+        // Four cells between columns: Move's widest is its keys, 20 cells,
+        // two of space and its widest words, 17.
+        assert_eq!(look_x.0, move_x.0 + 20 + 2 + 17 + 4);
+        // Keys right-aligned in the metadata ink, words in the foreground.
+        let quit = find(&drawn, "Quit", 0..140).expect("Quit");
+        assert_eq!(drawn[(quit.0 - 3, quit.1)].symbol(), "q");
+        assert_eq!(drawn[(quit.0 - 3, quit.1)].fg, theme::MUTED);
+        assert_eq!(drawn[quit].fg, theme::FOREGROUND);
+        let parent = find(&drawn, "Parent folder", 0..140).expect("Parent folder");
+        assert_eq!(parent.0, quit.0);
+        assert_eq!(
+            find(&drawn, "h / left / backspace", 0..140),
+            Some((move_x.0, parent.1))
+        );
+        // Behind it, everything dimmed.
+        assert_eq!(drawn[(1, 0)].fg, theme::DIMMED);
     }
 
     #[test]
-    fn in_a_narrow_window_what_the_keys_do_wraps_and_every_shortcut_can_be_reached() {
+    fn every_key_the_app_has_is_on_the_sheet_once() {
+        let keys: Vec<&str> = ROWS.iter().map(|(_, keys, _)| *keys).collect();
+        for wanted in [
+            "j / down",
+            "space",
+            "/",
+            "f / ctrl-f",
+            "ctrl-g",
+            "o",
+            "T",
+            "I",
+            "alt-p",
+            "ctrl-4 / | / alt-1",
+            "t",
+            "w / ctrl-w",
+            "1–9",
+            "dd / delete",
+            "shift-delete",
+            "m / menu",
+            "ctrl-shift-c",
+            "Y",
+            "E",
+            "M",
+            "U",
+        ] {
+            assert_eq!(
+                keys.iter().filter(|keys| **keys == wanted).count(),
+                1,
+                "{wanted}"
+            );
+        }
+        assert_eq!(keys.len(), ROWS.len());
+        let words: Vec<&str> = ROWS.iter().map(|(_, _, does)| *does).collect();
+        for flea in [
+            "Close or go back",
+            "Quick Look",
+            "Go to folder",
+            "Delete permanently",
+        ] {
+            assert!(words.contains(&flea), "{flea}");
+        }
+    }
+
+    #[test]
+    fn narrower_windows_get_two_columns_then_one_then_keys_over_their_words() {
         let mut f = fixture();
-        let screens = read_through(&mut f.app, 80, 24);
-        assert!(screens.len() > 2);
-        for (keys, does) in SHORTCUTS {
-            let mut words = does.split(' ');
-            let start = format!("{keys:<26}{}", words.next().unwrap());
-            let whole = |shown: &&String| {
-                shown.contains(&start) && does.split(' ').all(|word| shown.contains(word))
-            };
-            assert!(screens.iter().any(|shown| whole(&shown)), "{keys}: {does}");
-        }
-        assert!(screens[0].contains("↓ more"));
-        // Too long for one line here, it goes on under itself.
-        let wrapped = screens.iter().any(|shown| {
-            shown.contains("Close or go back: error, filter, find,")
-                && !shown.contains("find, file")
-                && shown.contains("file work, marks")
-        });
-        assert!(wrapped);
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        let two = buffer(&mut f.app, 120, 40);
+        assert_eq!(heading(&two, "LOOK").0, heading(&two, "MOVE").0);
+        assert_eq!(heading(&two, "FIND").1, 5);
+        assert_eq!(heading(&two, "CHANGE").0, heading(&two, "FIND").0);
+        let one = buffer(&mut f.app, 50, 40);
+        let move_x = heading(&one, "MOVE");
+        assert_eq!(move_x.1, 5);
+        assert_eq!(heading(&one, "LOOK"), (move_x.0, 5 + 23), "under Move");
+        assert!(find(&one, "CHANGE", 0..50).is_none(), "further down");
+        let narrow = show(&mut f.app, 24, 40);
+        assert!(narrow.contains("j / down"));
+        assert!(!narrow.contains("j / down  Cursor down"));
+        assert!(narrow.contains("Cursor down"));
     }
 
     #[test]
-    fn the_filter_and_find_keys_are_among_the_shortcuts() {
-        let does = |keys: &str| SHORTCUTS.iter().find(|(k, _)| *k == keys).map(|(_, d)| *d);
-        assert_eq!(
-            does("/"),
-            Some("Filter this folder (Tab: and its subfolders)")
-        );
-        assert_eq!(
-            does("f / Ctrl+F"),
-            Some("Find below this folder (Tab: where)")
-        );
-        assert_eq!(does("Ctrl+G"), Some("In Find: names or what files hold"));
-        assert_eq!(does("o"), Some("Show what Find found in its folder"));
-        let escape = does("Escape").unwrap();
-        assert_eq!(
-            escape,
-            "Close or go back: error, filter, find, file work, marks"
-        );
-    }
-
-    #[test]
-    fn tags_and_bulk_rename_are_among_the_shortcuts() {
-        let does = |keys: &str| SHORTCUTS.iter().find(|(k, _)| *k == keys).map(|(_, d)| *d);
-        assert_eq!(
-            does("T"),
-            Some("Finder tags: 1–7 turn a tag on or off, Remove All Tags")
-        );
-        assert_eq!(
-            does("r / F2"),
-            Some("Rename; with several marked, all of them in $EDITOR")
-        );
-        assert_eq!(
-            does("f / Ctrl+F"),
-            Some("Find below this folder (Tab: where)")
-        );
-        assert_eq!(does("tag:red"), Some("In Find: only what has that tag"));
-    }
-
-    #[test]
-    fn a_window_tall_enough_shows_them_all_at_once_as_before() {
-        let mut f = fixture();
-        let screens = read_through(&mut f.app, 120, 55);
-        assert_eq!(screens.len(), 1, "nothing to scroll");
-        assert!(!screens[0].contains("more"));
-        for (keys, does) in SHORTCUTS {
-            let line = format!("{keys:<26}{does}");
-            assert!(screens[0].contains(&line), "{line}");
-        }
-    }
-
-    #[test]
-    fn a_short_window_that_is_wide_enough_shows_two_columns() {
-        let mut f = fixture();
-        let screens = read_through(&mut f.app, 200, 31);
-        assert_eq!(screens.len(), 1, "it all fits side by side");
-        assert!(!screens[0].contains("more"));
-        for (keys, does) in SHORTCUTS {
-            let line = format!("{keys:<26}{does}");
-            assert!(screens[0].contains(&line), "{line}");
-        }
-        // The second half starts next to the first shortcut.
-        let (first, half) = (SHORTCUTS[0], SHORTCUTS[SHORTCUTS.len().div_ceil(2)]);
-        let row = |shown: &str, keys: &str| {
-            let wanted = format!("{keys:<26}");
-            shown.lines().position(|line| line.contains(&wanted))
-        };
-        assert!(row(&screens[0], first.0).is_some());
-        assert_eq!(row(&screens[0], first.0), row(&screens[0], half.0));
-        // With room for one column, it is one column.
-        let tall = show(&mut f.app, 200, 60);
-        assert_ne!(row(&tall, first.0), row(&tall, half.0));
-    }
-
-    #[test]
-    fn the_overlay_scrolls_by_lines_and_pages_and_keeps_every_key_to_itself() {
+    fn the_sheet_scrolls_and_keeps_every_key_to_itself_until_it_closes() {
         let mut f = fixture();
         let at = f.app.pane().cursor;
-        let (first, second) = (SHORTCUTS[0], SHORTCUTS[1]);
-        let last = SHORTCUTS[SHORTCUTS.len() - 1];
-        let has =
-            |shown: &str, (keys, does): (&str, &str)| shown.contains(&format!("{keys:<26}{does}"));
         press(&mut f.app, &[KeyCode::Char('?')]);
-        let top = show(&mut f.app, 120, 34);
-        assert!(has(&top, first) && !has(&top, last));
-
-        press(&mut f.app, &[KeyCode::Down]);
-        let one_down = show(&mut f.app, 120, 34);
-        assert!(!has(&one_down, first) && has(&one_down, second));
-        press(&mut f.app, &[KeyCode::Up]);
-        assert_eq!(show(&mut f.app, 120, 34), top);
+        let top = show(&mut f.app, 60, 16);
+        // Seven rows a page: the frame, the title, the rule and a blank
+        // last row aside.
+        assert_eq!(f.app.help_rows, 7);
+        press(&mut f.app, &[KeyCode::Char('j')]);
+        assert_eq!(f.app.help_scroll, 1);
+        let one_down = show(&mut f.app, 60, 16);
+        assert_ne!(one_down, top);
+        press(&mut f.app, &[KeyCode::Char('k')]);
+        assert_eq!(show(&mut f.app, 60, 16), top);
         press(&mut f.app, &[KeyCode::Up, KeyCode::PageUp]);
         assert_eq!(
-            show(&mut f.app, 120, 34),
+            show(&mut f.app, 60, 16),
             top,
             "the top is as far as it goes"
         );
-
-        press(&mut f.app, &[KeyCode::PageDown]);
-        let end = show(&mut f.app, 120, 34);
-        assert!(
-            has(&end, last) && !has(&end, second),
-            "a page reaches further"
-        );
         press(&mut f.app, &[KeyCode::PageDown, KeyCode::Down]);
+        show(&mut f.app, 60, 16);
+        assert_eq!(f.app.help_scroll, 8);
+        // Paged to the end: the last of Change's keys shows.
+        for _ in 0..20 {
+            press(&mut f.app, &[KeyCode::PageDown]);
+        }
+        let end = show(&mut f.app, 60, 16);
+        assert!(end.contains("Open terminal"));
+        press(&mut f.app, &[KeyCode::Down]);
         assert_eq!(
-            show(&mut f.app, 120, 34),
+            show(&mut f.app, 60, 16),
             end,
             "the end is as far as it goes"
         );
-        press(&mut f.app, &[KeyCode::PageUp]);
-        assert_eq!(show(&mut f.app, 120, 34), top);
 
-        // None of that reached the files underneath, and nothing else does.
+        // Nothing reaches the files underneath.
         press(
             &mut f.app,
-            &[KeyCode::Enter, KeyCode::Char('q'), KeyCode::End],
+            &[KeyCode::End, KeyCode::Char('d'), KeyCode::Char(' ')],
         );
         assert_eq!(f.app.pane().cursor, at);
-        assert_eq!(f.app.pane().cwd, f.home);
-        assert!(f.app.help_visible && !f.app.should_quit);
-
-        // Escape closes it, and so does `?`; opened again it starts at the top.
-        press(&mut f.app, &[KeyCode::Down, KeyCode::Esc]);
+        assert!(f.app.help_visible && f.app.look.is_none());
+        // Escape, Enter, `q` and `?` close it, and `q` quits nothing.
+        press(&mut f.app, &[KeyCode::Esc]);
         assert!(!f.app.help_visible);
-        press(&mut f.app, &[KeyCode::Char('?')]);
-        assert_eq!(show(&mut f.app, 120, 34), top);
-        press(&mut f.app, &[KeyCode::Char('?')]);
-        assert!(!f.app.help_visible);
-    }
-
-    #[test]
-    fn the_overlay_says_what_the_mouse_does_under_the_shortcuts() {
-        let mouse =
-            "Mouse: click, double-click, right-click; Shift+click a range, Alt+click marks one";
-        for (width, height) in [(120, 50), (120, 24), (200, 24)] {
-            let mut f = fixture();
-            let screens = read_through(&mut f.app, width, height);
-            for shown in &screens {
-                let line = shown.lines().position(|line| line.contains(mouse));
-                let last = shown.lines().position(|line| line.contains("Quit"));
-                assert!(line.is_some(), "{width}x{height}:\n{shown}");
-                if let Some(last) = last {
-                    assert!(line > Some(last), "under the shortcuts");
-                }
-            }
+        for close in [KeyCode::Enter, KeyCode::Char('q'), KeyCode::Char('?')] {
+            press(&mut f.app, &[KeyCode::Char('?')]);
+            assert_eq!(show(&mut f.app, 60, 16), top, "opened again at the top");
+            press(&mut f.app, &[close]);
+            assert!(!f.app.help_visible, "{close:?}");
         }
+        assert!(!f.app.should_quit);
+        assert_eq!(f.app.pane().cwd, f.home);
     }
 
     #[test]
     fn a_window_too_small_for_anything_is_still_drawn() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Char('?')]);
-        for (width, height) in [(3, 2), (20, 5), (40, 10), (179, 12)] {
+        for (width, height) in [(3, 2), (20, 5), (12, 6), (40, 7), (179, 12)] {
             show(&mut f.app, width, height);
         }
     }

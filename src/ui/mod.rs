@@ -1,13 +1,14 @@
 //! Drawing: flea's frame of a header, a rule, the body, a rule and the
 //! footer, with one function per region.
 
+mod card;
 mod columns;
-mod dialog;
 mod dual;
 mod footer;
 mod grid;
 mod help;
 mod list;
+mod look;
 mod menu;
 mod preview;
 mod prompt;
@@ -64,7 +65,8 @@ pub fn pane_widths(columns: u16, preview: bool) -> (u16, u16, u16) {
 fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
     let area = frame.area();
     if let Some(thumbs) = &mut app.thumbs {
-        thumbs.cover(app.help_visible || app.dialog.is_some() || app.menu.is_some());
+        let covered = app.help_visible || app.dialog.is_some() || app.menu.is_some();
+        thumbs.cover(covered || app.look.is_some());
     }
     if area.width < MIN_COLUMNS || area.height < MIN_ROWS {
         too_small(frame, area);
@@ -137,19 +139,21 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
     }
 
     if let Some(menu) = &app.menu {
-        // It opens where it was right-clicked open, or else next to the
-        // item under the cursor.
-        let anchor = match menu.at {
-            Some(at) => Rect::new(at.x, at.y, 0, 1),
-            None => item,
-        };
-        menu::draw(frame, menu, anchor, area, hits);
+        // Under the item it is about, at its name.
+        menu::draw(frame, menu, item, body, hits);
+    }
+    // A card is the one lit thing: everything behind it is dimmed.
+    if app.help_visible || app.look.is_some() || app.dialog.is_some() {
+        card::dim(frame.buffer_mut(), area);
     }
     if app.help_visible {
         help::draw(frame, app, area, hits);
     }
+    if app.look.is_some() {
+        look::draw(frame, app, area, hits);
+    }
     if let Some(dialog) = &app.dialog {
-        dialog::draw(frame, dialog, area, hits);
+        card::draw_dialog(frame, dialog, area, hits);
     }
 }
 
@@ -940,82 +944,6 @@ mod tests {
     }
 
     #[test]
-    fn the_help_overlay_lists_the_shortcuts() {
-        let mut f = fixture();
-        press(&mut f.app, &[KeyCode::Char('?')]);
-        let all = screen(&mut f.app, 120, 55).join("\n");
-        assert!(all.contains("Keyboard shortcuts"));
-        assert!(all.contains("Go to the parent folder"));
-        for (keys, does) in [
-            ("j / k  ↓ / ↑", "Move down / up"),
-            ("h / ←  Backspace", "Go to the parent folder"),
-            ("l / →", "Browse into the folder, or open the file"),
-            ("H / L", "Back / forward"),
-            (": / Ctrl+L", "Go to a place (Tab completes)"),
-            (".", "Show hidden files"),
-            ("s / S", "Next sort key / reverse the sort"),
-            ("I", "Detail column: size, modified, mode, owner"),
-            ("v", "Mark or unmark the item"),
-            ("J / K  Shift+↓ / ↑", "Mark down / up"),
-            ("V / Ctrl+A", "Invert the marks / mark everything"),
-            ("y / x / p", "Copy, cut, paste (or Ctrl+C / X / V)"),
-            ("M", "Move here what was copied or cut"),
-            ("U", "Duplicate"),
-            (
-                "r / F2",
-                "Rename; with several marked, all of them in $EDITOR",
-            ),
-            (
-                "T",
-                "Finder tags: 1–7 turn a tag on or off, Remove All Tags",
-            ),
-            ("N / Ctrl+Shift+N", "New folder"),
-            ("dd / Delete", "Move to Trash"),
-            ("Shift+Delete", "Delete permanently (asks first)"),
-            ("z / Ctrl+Z", "Undo"),
-            ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
-            ("E", "Edit the file in $EDITOR"),
-            ("m / Shift+F10", "Menu"),
-            ("Ctrl+1 / 2 / 3", "List, columns, grid"),
-            ("Ctrl+4  |  Alt+1", "Two panes, or back to one"),
-            ("Tab", "Move between the list and the preview, or the panes"),
-            ("t", "New tab"),
-            ("O", "Open in new tab"),
-            ("w / Ctrl+W", "Close tab (closing the last one quits)"),
-            ("[ / ]", "Previous tab / next tab"),
-            ("{ / }", "Move tab left / right"),
-            ("1 … 9", "Select tab"),
-            ("q", "Quit"),
-        ] {
-            let line = format!("{keys:<26}{does}");
-            assert!(all.contains(&line), "{line} is missing from\n{all}");
-        }
-        for gone in [
-            "Ctrl+P",
-            "Ctrl+I",
-            "Ctrl+H",
-            "Alt+⏎",
-            "Ctrl+Alt+N",
-            "Ctrl+Shift+D",
-            "Alt+Home",
-            "Ctrl+=",
-            "sidebar",
-            "details pane",
-            "q / w",
-        ] {
-            assert!(!all.contains(gone), "{gone}");
-        }
-        assert!(all.contains("Quit"), "the last one fits:\n{all}");
-        // Framed in the card's rule, on the terminal's own background.
-        let drawn = buffer(&mut f.app, 120, 50);
-        let (x, y) = find(&drawn, "┌", 0..120).unwrap();
-        assert_eq!(drawn[(x, y)].fg, theme::CARD_RULE);
-        let (x, y) = find(&drawn, "Keyboard shortcuts", 0..120).unwrap();
-        assert!(drawn[(x, y)].modifier.contains(Modifier::BOLD));
-        assert_eq!(drawn[(x, y)].bg, Color::Reset);
-    }
-
-    #[test]
     fn a_picture_that_arrives_under_a_dialog_waits_for_it_to_go() {
         use crate::app::testing::{pictures, settle};
         use crate::thumbs::testing::painted;
@@ -1025,14 +953,14 @@ mod tests {
         buffer(&mut f.app, 120, 30);
         f.app.handle_key(shift(KeyCode::Delete));
         settle(&mut f.app);
-        // The dialog ends at column 95; the preview's picture is under its
-        // head, from row 5, and goes on past the dialog.
+        // The card ends left of column 96; the preview's picture is under
+        // its head, from row 5, and goes on past the card.
         let preview = |drawn: &Buffer| {
             let cells = (96..120).flat_map(|x| (5..28).map(move |y| (x, y)));
             cells.filter(|at| painted(&drawn[*at])).count()
         };
         let covered = buffer(&mut f.app, 120, 30);
-        assert!(find(&covered, "Delete for good?", 0..120).is_some());
+        assert!(find(&covered, "Delete 1 item permanently?", 0..120).is_some());
         assert_eq!(preview(&covered), 0);
         press(&mut f.app, &[KeyCode::Esc]);
         let clear = buffer(&mut f.app, 120, 30);
