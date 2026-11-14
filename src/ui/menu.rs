@@ -74,7 +74,7 @@ fn place(anchor: Rect, width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::testing::{alt, ctrl, fixture, grid_fixture, press, several};
+    use crate::app::testing::{ctrl, fixture, grid_fixture, key, press, several};
     use crate::theme;
     use crate::ui::testing::{buffer, find};
     use ratatui::crossterm::event::KeyCode;
@@ -85,7 +85,7 @@ mod tests {
     fn the_menu_opens_under_the_selected_item_in_the_look_of_the_dialogs() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::End]);
-        f.app.handle_key(alt(KeyCode::Enter));
+        f.app.handle_key(key(KeyCode::Char('m')));
         let drawn = buffer(&mut f.app, 120, 30);
         let (name_x, name_y) = find(&drawn, "notes.txt", 26..73).expect("the item");
         // A frame in the card's rule starting under the name, on the
@@ -132,7 +132,7 @@ mod tests {
         let mut f = fixture();
         // A folder, with nothing copied to paste into it.
         press(&mut f.app, &[KeyCode::Down]);
-        f.app.handle_key(alt(KeyCode::Enter));
+        f.app.handle_key(key(KeyCode::Char('m')));
         let drawn = buffer(&mut f.app, 120, 30);
         let paste = find(&drawn, "Paste Into Folder", 26..73).expect("the line");
         assert_eq!(drawn[paste].fg, theme::MUTED);
@@ -150,11 +150,11 @@ mod tests {
     #[test]
     fn in_the_grid_and_in_columns_the_menu_opens_at_the_selected_item() {
         let mut f = grid_fixture();
-        f.app.handle_key(alt(KeyCode::Enter));
+        f.app.handle_key(key(KeyCode::Char('m')));
         let first = buffer(&mut f.app, 62, 26);
         let at_first = find(&first, "Open Folder", 0..62).expect("the menu");
         press(&mut f.app, &[KeyCode::Esc, KeyCode::Right]);
-        f.app.handle_key(alt(KeyCode::Enter));
+        f.app.handle_key(key(KeyCode::Char('m')));
         let second = buffer(&mut f.app, 62, 26);
         let at_second = find(&second, "Open Folder", 0..62).expect("the menu");
         // One tile further right, and so is the menu.
@@ -163,10 +163,10 @@ mod tests {
         press(&mut f.app, &[KeyCode::Esc]);
 
         // In columns it is in the column of the folder that is showing.
-        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(&mut f.app, &[KeyCode::Enter]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-        f.app.handle_key(alt(KeyCode::Enter));
+        f.app.handle_key(key(KeyCode::Char('m')));
         let columns = buffer(&mut f.app, 120, 30);
         let (name_x, name_y) = find(&columns, "Trip", 0..120).expect("the item");
         assert!(name_x > 27, "in the second column");
@@ -181,7 +181,7 @@ mod tests {
             fs::write(f.home.join(format!("{n}.txt")), "").unwrap();
         }
         press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
-        f.app.handle_key(alt(KeyCode::Enter));
+        f.app.handle_key(key(KeyCode::Char('m')));
         let drawn = buffer(&mut f.app, 120, 40);
         let (name_x, name_y) = find(&drawn, "notes.txt", 26..73).expect("the item");
         assert!(name_y > 30, "near the bottom");
@@ -200,7 +200,7 @@ mod tests {
         // as it fits, and every line is there.
         let mut f = several();
         press(&mut f.app, &[KeyCode::End]);
-        f.app.handle_key(alt(KeyCode::Enter));
+        f.app.handle_key(key(KeyCode::Char('m')));
         let drawn = buffer(&mut f.app, 120, 24);
         assert!(find(&drawn, "Open", 26..73).is_some());
         assert_eq!(find(&drawn, "Delete…", 26..73).map(|at| at.1), Some(22));

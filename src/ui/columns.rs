@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn columns_run_from_home_down_to_the_folder_with_the_way_there_on_the_selected_fill() {
         let mut f = fixture();
-        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(&mut f.app, &[KeyCode::Down, KeyCode::Right]);
         let lit = buffer(&mut f.app, 72, 26);
 
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn the_rightmost_columns_stay_when_they_do_not_all_fit() {
         let mut f = fixture();
-        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(&mut f.app, &[KeyCode::Down, KeyCode::Right, KeyCode::Right]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
 
@@ -219,7 +219,7 @@ mod tests {
             std::fs::create_dir(f.home.join(format!("Folder {n}"))).unwrap();
         }
         std::fs::write(f.home.join("Folder 30").join("inside.txt"), "").unwrap();
-        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(&mut f.app, &[KeyCode::F(5), KeyCode::Down]);
         // Documents, Folder 1 ... Folder 30, Pictures: go into Folder 30.
         for _ in 0..29 {

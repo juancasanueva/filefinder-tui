@@ -13,51 +13,50 @@ use crate::app::{App, HitMap, Spot};
 use crate::theme;
 
 const SHORTCUTS: &[(&str, &str)] = &[
-    ("← ↑ → ↓", "Move the selection"),
-    ("Shift+arrows", "Select a range"),
-    ("Ctrl+A", "Select everything"),
-    ("→ / ←", "In list and columns: into a folder / back out"),
-    (
-        "| or Ctrl+Alt+N / Ctrl+W",
-        "Split into two panes / close the right one (or Alt+1)",
-    ),
-    (
-        "Tab / Shift+Tab",
-        "Move between the list and the preview, or the panes",
-    ),
+    ("j / k  ↓ / ↑", "Move down / up"),
+    ("g / G  Home / End", "First / last item"),
+    ("Ctrl+D / Ctrl+U", "Page down / up (or PgDn / PgUp)"),
+    ("h / ←  Backspace", "Go to the parent folder"),
+    ("l / →", "Browse into the folder, or open the file"),
     ("⏎", "Open"),
-    ("Space", "Preview the selected file"),
-    ("Alt+⏎", "Everything else, for what is selected"),
-    ("Backspace", "Go to the parent folder"),
-    ("Alt+← / Alt+→", "Back / forward"),
-    ("Alt+Home", "Go home"),
-    ("Ctrl+L", "Type a path (Tab completes)"),
-    ("/", "Search this folder and below"),
-    ("Ctrl+C / X / V", "Copy, cut, paste"),
-    ("Ctrl+Shift+C", "Copy the path as text"),
-    ("F2 / Ctrl+Shift+D", "Rename / duplicate"),
-    ("Ctrl+Shift+N", "New folder"),
-    ("Delete (fn+⌫) / ⌘⌫", "Move to the trash"),
-    ("Shift+Delete", "Delete permanently (asks first)"),
-    (
-        "Ctrl+Z / Ctrl+Shift+Z",
-        "Undo / redo the last change to files (or Ctrl+Y)",
-    ),
+    ("H / L", "Back / forward"),
+    ("Tab", "Move between the list and the preview, or the panes"),
     (
         "Escape",
-        "Stop the file work under way, or dismiss what went wrong",
+        "Close or go back: error, search, file work, marks",
     ),
-    ("Ctrl+1 / 2 / 3", "Switch the view: grid, list, columns"),
-    (
-        "Ctrl+= / Ctrl+- / Ctrl+0",
-        "Bigger, smaller or normal tiles",
-    ),
+    (": / Ctrl+L", "Go to a place (Tab completes)"),
+    ("/ or f", "Search this folder and below"),
+    ("Space", "Quick Look the file"),
+    (".", "Show hidden files"),
+    ("s / S", "Next sort key / reverse the sort"),
+    ("I", "Detail column: size, modified, mode, owner"),
     ("Alt+P", "Show or hide the preview pane"),
-    ("S / Shift+S", "Sort: name, kind, newest, oldest, size"),
-    ("Ctrl+H", "Show hidden files"),
-    ("F5", "Reload"),
+    ("Ctrl+R / F5", "Reload"),
+    ("v", "Mark or unmark the item"),
+    ("J / K  Shift+↓ / ↑", "Mark down / up"),
+    ("V / Ctrl+A", "Invert the marks / mark everything"),
+    ("y / x / p", "Copy, cut, paste (or Ctrl+C / X / V)"),
+    ("M", "Move here what was copied or cut"),
+    ("U", "Duplicate"),
+    ("r / F2", "Rename"),
+    ("N / Ctrl+Shift+N", "New folder"),
+    ("dd / Delete", "Move to Trash"),
+    ("Shift+Delete", "Delete permanently (asks first)"),
+    ("z / Ctrl+Z", "Undo"),
+    ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
+    ("E", "Edit the file in $EDITOR"),
+    (
+        "Y / Ctrl+Shift+C",
+        "Copy the folder's path / the item's path",
+    ),
+    ("m / Shift+F10", "Menu"),
+    ("Ctrl+T", "Open a terminal here"),
+    ("Ctrl+1 / 2 / 3", "List, columns, grid"),
+    ("Ctrl+4  |  Alt+1", "Two panes, or back to one"),
+    ("+ / -", "Bigger or smaller tiles"),
     ("?", "Show these shortcuts"),
-    ("Q", "Close the window"),
+    ("q / w", "Quit"),
 ];
 
 const KEY_WIDTH: usize = 26;
@@ -72,7 +71,7 @@ const TITLE: &str = "Keyboard shortcuts";
 
 /// Under the shortcuts, whatever is scrolled: what the mouse does.
 const MOUSE: &str =
-    "Mouse: click, double-click, right-click; Shift+click a range, Alt+click one by one";
+    "Mouse: click, double-click, right-click; Shift+click a range, Alt+click marks one";
 
 /// One line of a column: the keys, or nothing where the line above goes on.
 type Row = (&'static str, String);
@@ -259,9 +258,9 @@ mod tests {
         assert!(screens[0].contains("↓ more"));
         // Too long for one line here, it goes on under itself.
         let wrapped = screens.iter().any(|shown| {
-            shown.contains("Stop the file work under way, or dismiss")
-                && !shown.contains("dismiss what went wrong")
-                && shown.contains("what went wrong")
+            shown.contains("Close or go back: error, search, file")
+                && !shown.contains("file work,")
+                && shown.contains("work, marks")
         });
         assert!(wrapped);
     }
@@ -269,7 +268,7 @@ mod tests {
     #[test]
     fn a_window_tall_enough_shows_them_all_at_once_as_before() {
         let mut f = fixture();
-        let screens = read_through(&mut f.app, 120, 40);
+        let screens = read_through(&mut f.app, 120, 50);
         assert_eq!(screens.len(), 1, "nothing to scroll");
         assert!(!screens[0].contains("more"));
         for (keys, does) in SHORTCUTS {
@@ -361,15 +360,13 @@ mod tests {
     #[test]
     fn the_overlay_says_what_the_mouse_does_under_the_shortcuts() {
         let mouse =
-            "Mouse: click, double-click, right-click; Shift+click a range, Alt+click one by one";
-        for (width, height) in [(120, 40), (120, 24), (200, 24)] {
+            "Mouse: click, double-click, right-click; Shift+click a range, Alt+click marks one";
+        for (width, height) in [(120, 50), (120, 24), (200, 24)] {
             let mut f = fixture();
             let screens = read_through(&mut f.app, width, height);
             for shown in &screens {
                 let line = shown.lines().position(|line| line.contains(mouse));
-                let last = shown
-                    .lines()
-                    .position(|line| line.contains("Close the window"));
+                let last = shown.lines().position(|line| line.contains("Quit"));
                 assert!(line.is_some(), "{width}x{height}:\n{shown}");
                 if let Some(last) = last {
                     assert!(line > Some(last), "under the shortcuts");

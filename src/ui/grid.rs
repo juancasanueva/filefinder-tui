@@ -248,7 +248,7 @@ fn details(entry: &Entry, now: SystemTime, date_style: DateStyle, width: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::testing::{ctrl, fixture, grid_fixture, pictures, press, settle, split};
+    use crate::app::testing::{ctrl, fixture, grid_fixture, key, pictures, press, settle, split};
     use crate::icons;
     use crate::thumbs::testing::painted;
     use crate::ui::testing::{buffer, find, screen};
@@ -290,7 +290,7 @@ mod tests {
         let mut f = fixture();
         // A 24-hour time is never wider than five cells, so the line fits at any hour.
         f.app.date_style = crate::format::DateStyle::DayFirst;
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         let buffer = buffer(&mut f.app, 62, 26);
         let lines = screen(&mut f.app, 62, 26);
 
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn folders_are_cards_with_a_tab_and_files_a_box_with_their_kind() {
         let mut f = fixture();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         let buffer = buffer(&mut f.app, 62, 26);
 
         // Documents: the tab on the top left, the card under it.
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn the_selected_tile_wears_the_color_itself() {
         let mut f = fixture();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         let lit = buffer(&mut f.app, 62, 26);
         // A frame in the accent around the thumbnail and the name bold.
         assert_eq!(lit[(2, 2)].symbol(), "┌");
@@ -360,7 +360,7 @@ mod tests {
     fn a_name_too_long_for_its_tile_ends_in_an_ellipsis() {
         let mut f = fixture();
         fs::write(f.home.join("a-very-long-file-name-indeed.txt"), "").unwrap();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         press(&mut f.app, &[KeyCode::F(5)]);
         let all = screen(&mut f.app, 62, 26).join("\n");
         assert!(all.contains("a-very-long-file-…"), "{all}");
@@ -395,7 +395,7 @@ mod tests {
         let mut f = grid_fixture();
         screen(&mut f.app, 72, 32);
         assert_eq!(f.app.pane().grid_columns, 3);
-        f.app.handle_key(ctrl(KeyCode::Char('=')));
+        f.app.handle_key(key(KeyCode::Char('+')));
         let big = buffer(&mut f.app, 72, 32);
         assert_eq!(f.app.pane().grid_columns, 2);
         // A 26-cell tile: the frame's corners are that far apart, around a 9-row thumbnail.
@@ -403,8 +403,8 @@ mod tests {
         assert_eq!(big[(x + 25, y)].symbol(), "┐");
         assert_eq!(big[(x, y + 10)].symbol(), "└");
 
-        f.app.handle_key(ctrl(KeyCode::Char('-')));
-        f.app.handle_key(ctrl(KeyCode::Char('-')));
+        f.app.handle_key(key(KeyCode::Char('-')));
+        f.app.handle_key(key(KeyCode::Char('-')));
         let small = buffer(&mut f.app, 72, 32);
         assert_eq!(f.app.pane().grid_columns, 4);
         let (x, y) = find(&small, "┌", 0..72).unwrap();
@@ -416,7 +416,7 @@ mod tests {
     fn a_file_with_a_picture_shows_it_in_the_middle_of_its_thumbnail() {
         let (mut f, thumbnailer) = pictures();
         fs::write(f.home.join("tall.jpg"), "tall").unwrap();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         press(&mut f.app, &[KeyCode::F(5)]);
 
         // Drawing only asks: until the picture has been made the stand-in shows.
@@ -462,9 +462,9 @@ mod tests {
         for name in ["a", "b", "c", "d", "e", "f", "g"] {
             fs::write(f.home.join(format!("{name}.txt")), name).unwrap();
         }
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
-        // What sorting says goes in the footer, under the rule.
-        press(&mut f.app, &[KeyCode::Char('s'), KeyCode::Char('S')]);
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        // What the detail column says goes in the footer, under the rule.
+        press(&mut f.app, &[KeyCode::F(5), KeyCode::Char('I')]);
         buffer(&mut f.app, 62, 27);
         settle(&mut f.app);
         let cut = buffer(&mut f.app, 62, 27);
@@ -483,14 +483,14 @@ mod tests {
             assert_eq!(cut[(x, 25)].symbol(), "─");
             assert_eq!(cut[(x, 25)].fg, theme::BORDER);
         }
-        assert!(find(&cut, "Sorted by name", 0..62).is_some_and(|(_, y)| y == 26));
+        assert!(find(&cut, "Detail column · Modified", 0..62).is_some_and(|(_, y)| y == 26));
     }
 
     #[test]
     fn a_file_that_cannot_be_drawn_keeps_its_stand_in_until_it_changes() {
         let (mut f, thumbnailer) = pictures();
         fs::write(f.home.join("notes.txt"), "broken").unwrap();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         press(&mut f.app, &[KeyCode::F(5)]);
         for _ in 0..3 {
             buffer(&mut f.app, 62, 26);
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn bigger_tiles_show_the_same_thumbnail_bigger() {
         let (mut f, thumbnailer) = pictures();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         buffer(&mut f.app, 72, 32);
         settle(&mut f.app);
         let normal = buffer(&mut f.app, 72, 32);
@@ -526,7 +526,7 @@ mod tests {
         assert!(painted(&normal[(thumb.x, thumb.y)]));
         assert!(painted(&normal[(thumb.right() - 1, thumb.bottom() - 1)]));
 
-        f.app.handle_key(ctrl(KeyCode::Char('=')));
+        f.app.handle_key(key(KeyCode::Char('+')));
         buffer(&mut f.app, 72, 32);
         settle(&mut f.app);
         let large = buffer(&mut f.app, 72, 32);
@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn an_empty_folder_says_so_in_the_grid() {
         let mut f = fixture();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         press(&mut f.app, &[KeyCode::Enter]);
         let all = screen(&mut f.app, 100, 20).join("\n");
         assert!(all.contains("No items"), "{all}");
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn each_pane_draws_the_thumbnails_of_its_own_folder() {
         let (mut f, thumbnailer) = pictures();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         split(&mut f.app);
         press(&mut f.app, &[KeyCode::Right, KeyCode::Enter]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));

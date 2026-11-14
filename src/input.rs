@@ -1,5 +1,6 @@
-//! A line of text being typed, with its cursor. Everything counts characters,
-//! never bytes, so accents and other scripts edit like plain letters.
+//! A line of text being typed, with its cursor and what is selected.
+//! Everything counts characters, never bytes, so accents and other scripts
+//! edit like plain letters.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
@@ -9,6 +10,8 @@ pub struct Input {
     chars: Vec<char>,
     /// How many characters are before the cursor.
     cursor: usize,
+    /// Where a selection starts; it runs to the cursor.
+    anchor: Option<usize>,
 }
 
 impl Input {
@@ -18,6 +21,7 @@ impl Input {
         Self {
             cursor: chars.len(),
             chars,
+            anchor: None,
         }
     }
 
@@ -35,56 +39,89 @@ impl Input {
 
     /// Puts the cursor before the character at `at`; past the end is the end.
     pub fn set_cursor(&mut self, at: usize) {
+        self.anchor = None;
         self.cursor = at.min(self.chars.len());
     }
 
+    /// Selects the characters from `start` to `end`, the cursor at `end`.
+    pub fn select(&mut self, start: usize, end: usize) {
+        self.set_cursor(end);
+        self.anchor = Some(start.min(self.chars.len()));
+    }
+
+    pub fn select_all(&mut self) {
+        self.select(0, self.chars.len());
+    }
+
+    /// Where the selection starts and ends, when something is selected.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor.filter(|anchor| *anchor != self.cursor)?;
+        Some((anchor.min(self.cursor), anchor.max(self.cursor)))
+    }
+
+    /// Removes what is selected. False when nothing was.
+    fn take_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.chars.drain(start..end);
+        self.set_cursor(start);
+        true
+    }
+
+    /// Types a character, in place of what is selected.
     pub fn insert(&mut self, c: char) {
+        self.take_selection();
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
     }
 
-    /// Removes the character before the cursor.
+    /// Removes what is selected, or else the character before the cursor.
     pub fn backspace(&mut self) {
-        if self.cursor > 0 {
+        if !self.take_selection() && self.cursor > 0 {
             self.cursor -= 1;
             self.chars.remove(self.cursor);
         }
     }
 
-    /// Removes the character at the cursor.
+    /// Removes what is selected, or else the character at the cursor.
     pub fn delete(&mut self) {
-        if self.cursor < self.chars.len() {
+        if !self.take_selection() && self.cursor < self.chars.len() {
             self.chars.remove(self.cursor);
         }
     }
 
+    /// One character left; a selection is left at its start.
     pub fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        match self.selection() {
+            Some((start, _)) => self.set_cursor(start),
+            None => self.set_cursor(self.cursor.saturating_sub(1)),
+        }
     }
 
+    /// One character right; a selection is left at its end.
     pub fn right(&mut self) {
-        self.set_cursor(self.cursor + 1);
+        match self.selection() {
+            Some((_, end)) => self.set_cursor(end),
+            None => self.set_cursor(self.cursor + 1),
+        }
     }
 
     pub fn home(&mut self) {
-        self.cursor = 0;
+        self.set_cursor(0);
     }
 
     pub fn end(&mut self) {
-        self.cursor = self.chars.len();
+        self.set_cursor(self.chars.len());
     }
 
     /// The part of the text that fits in `width` cells with the cursor in
     /// sight, and the cell the cursor is on.
     pub fn window(&self, width: usize) -> (String, u16) {
         let cells = |c: &char| c.width().unwrap_or(0);
-        let mut before: usize = self.chars[..self.cursor].iter().map(cells).sum();
-        // Start late enough for the cursor's own cell to be inside.
-        let mut start = 0;
-        while before >= width && start < self.cursor {
-            before -= cells(&self.chars[start]);
-            start += 1;
-        }
+        let start = self.first_shown(width);
+        let before: usize = self.chars[start..self.cursor].iter().map(cells).sum();
         let mut text = String::new();
         let mut used = 0;
         for c in &self.chars[start..] {
@@ -95,6 +132,19 @@ impl Input {
             text.push(*c);
         }
         (text, before as u16)
+    }
+
+    /// The first character shown in `width` cells, late enough for the
+    /// cursor's own cell to be inside.
+    pub fn first_shown(&self, width: usize) -> usize {
+        let cells = |c: &char| c.width().unwrap_or(0);
+        let mut before: usize = self.chars[..self.cursor].iter().map(cells).sum();
+        let mut start = 0;
+        while before >= width && start < self.cursor {
+            before -= cells(&self.chars[start]);
+            start += 1;
+        }
+        start
     }
 
     /// Applies a key that edits the text. False for any other key, which is
@@ -207,6 +257,38 @@ mod tests {
             assert!(!input.handle_key(other), "{other:?}");
         }
         assert_eq!(input.text(), "qQ!");
+    }
+
+    #[test]
+    fn a_selection_is_replaced_by_typing_and_removed_by_backspace() {
+        let mut input = Input::new("report.txt");
+        input.select(0, 6);
+        assert_eq!(input.selection(), Some((0, 6)));
+        assert_eq!(input.cursor(), 6);
+        input.insert('n');
+        assert_eq!((input.text().as_str(), input.cursor()), ("n.txt", 1));
+        assert_eq!(input.selection(), None);
+
+        input.select_all();
+        assert_eq!(input.selection(), Some((0, 5)));
+        input.backspace();
+        assert_eq!((input.text().as_str(), input.cursor()), ("", 0));
+
+        let mut input = Input::new("abcdef");
+        input.select(1, 4);
+        input.delete();
+        assert_eq!(input.text(), "aef");
+        // Left and Right leave a selection at its start or its end.
+        let mut input = Input::new("abcdef");
+        input.select(1, 4);
+        input.left();
+        assert_eq!((input.cursor(), input.selection()), (1, None));
+        input.select(1, 4);
+        input.right();
+        assert_eq!((input.cursor(), input.selection()), (4, None));
+        input.select(1, 4);
+        input.home();
+        assert_eq!((input.cursor(), input.selection()), (0, None));
     }
 
     #[test]

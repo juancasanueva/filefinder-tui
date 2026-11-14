@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -55,13 +56,15 @@ fn main() -> io::Result<()> {
         date_style: DateStyle::from_env(),
         depth: Depth::detect(),
     };
-    let mut app = App::new(config, Box::new(MacSystem::new()));
-    // Tells Ctrl+I from Tab and Ctrl+Shift+N from Ctrl+N, where the terminal can.
+    // Tells Ctrl+Shift+N from Ctrl+N, where the terminal can.
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     if enhanced {
         let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
         execute!(stdout(), PushKeyboardEnhancementFlags(flags))?;
     }
+    let mut app = App::new(config, Box::new(MacSystem::new(enhanced)));
+    // The caret of a prompt is the terminal's own bar cursor.
+    execute!(stdout(), SetCursorStyle::SteadyBar)?;
     // Clicks and the wheel come to the app; selecting text then takes the
     // terminal's own modifier (Shift-drag in Ghostty, Option-drag in Terminal).
     execute!(stdout(), EnableMouseCapture)?;
@@ -78,7 +81,11 @@ fn main() -> io::Result<()> {
 
 /// Hands the mouse back to the terminal, and the keyboard as it was.
 fn give_back(enhanced: bool) {
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        SetCursorStyle::DefaultUserShape
+    );
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
@@ -106,6 +113,10 @@ fn query_picker() -> Picker {
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     while !app.should_quit {
         app.tick();
+        if app.take_redraw() {
+            // Another program had the screen: nothing on it is ours.
+            terminal.clear()?;
+        }
         terminal.draw(|frame| ui::draw(frame, app))?;
         // Short enough for thumbnails to show up as they are made.
         if event::poll(Duration::from_millis(100))? {

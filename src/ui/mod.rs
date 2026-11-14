@@ -9,6 +9,7 @@ mod help;
 mod list;
 mod menu;
 mod preview;
+mod prompt;
 mod topbar;
 
 use ratatui::Frame;
@@ -103,7 +104,14 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
     } else {
         draw_files(frame, app, body, hits)
     };
-    footer::draw(frame, app, footer);
+    // The bottom row asks while a paste waits or a prompt is open.
+    if let Some(question) = &app.question {
+        prompt::question(frame, question, footer);
+    } else if let Some(open) = &app.prompt {
+        prompt::draw(frame, open, footer);
+    } else {
+        footer::draw(frame, app, footer);
+    }
 
     if let Some(menu) = &app.menu {
         // It opens where it was right-clicked open, or else next to the
@@ -431,7 +439,8 @@ mod tests {
     use super::testing::{buffer, find, screen};
     use super::*;
     use crate::app::testing::{
-        ctrl, finish_search, finish_work, fixture, manual_clock, press, shift, split, type_text,
+        ctrl, finish_search, finish_work, fixture, key, manual_clock, press, shift, split,
+        type_text,
     };
     use crate::icons;
     use crate::theme::Depth;
@@ -794,8 +803,10 @@ mod tests {
         assert_eq!(after[(x, 29)].fg, theme::FOREGROUND);
         assert_eq!(after[(x + 14, 29)].fg, theme::MUTED, "the hint");
 
-        // An error in the error colour, gone after eight seconds.
+        // An error in the error colour, gone after eight seconds. The name is
+        // taken now: the paste asks, and `b` keeps both.
         f.app.handle_key(ctrl(KeyCode::Char('v')));
+        press(&mut f.app, &[KeyCode::Char('b')]);
         finish_work(&mut f.app);
         f.app.navigate(&f.home.join("missing"));
         let failed = buffer(&mut f.app, 120, 30);
@@ -862,7 +873,7 @@ mod tests {
                 "view {view}"
             );
         }
-        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
         let drawn = buffer(&mut f.app, 120, 30);
         let (_, y) = find(&drawn, "NOTHING MATCHES zebra", 26..73).unwrap();
         assert_eq!(cells(&drawn, y - 1, 26..73).trim(), icons::SEARCH);
@@ -876,59 +887,56 @@ mod tests {
     fn the_help_overlay_lists_the_shortcuts() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Char('?')]);
-        let all = screen(&mut f.app, 120, 40).join("\n");
+        let all = screen(&mut f.app, 120, 50).join("\n");
         assert!(all.contains("Keyboard shortcuts"));
         assert!(all.contains("Go to the parent folder"));
         for (keys, does) in [
-            ("Ctrl+1 / 2 / 3", "Switch the view: grid, list, columns"),
-            ("→ / ←", "In list and columns: into a folder / back out"),
-            (
-                "Ctrl+= / Ctrl+- / Ctrl+0",
-                "Bigger, smaller or normal tiles",
-            ),
-            ("Alt+P", "Show or hide the preview pane"),
-            ("Ctrl+H", "Show hidden files"),
-            ("Space", "Preview the selected file"),
-            ("Alt+⏎", "Everything else, for what is selected"),
-            ("Ctrl+C / X / V", "Copy, cut, paste"),
-            ("Ctrl+Shift+C", "Copy the path as text"),
-            ("F2 / Ctrl+Shift+D", "Rename / duplicate"),
-            ("Ctrl+Shift+N", "New folder"),
-            ("Delete (fn+⌫) / ⌘⌫", "Move to the trash"),
+            ("j / k  ↓ / ↑", "Move down / up"),
+            ("h / ←  Backspace", "Go to the parent folder"),
+            ("l / →", "Browse into the folder, or open the file"),
+            ("H / L", "Back / forward"),
+            (": / Ctrl+L", "Go to a place (Tab completes)"),
+            (".", "Show hidden files"),
+            ("s / S", "Next sort key / reverse the sort"),
+            ("I", "Detail column: size, modified, mode, owner"),
+            ("v", "Mark or unmark the item"),
+            ("J / K  Shift+↓ / ↑", "Mark down / up"),
+            ("V / Ctrl+A", "Invert the marks / mark everything"),
+            ("y / x / p", "Copy, cut, paste (or Ctrl+C / X / V)"),
+            ("M", "Move here what was copied or cut"),
+            ("U", "Duplicate"),
+            ("r / F2", "Rename"),
+            ("N / Ctrl+Shift+N", "New folder"),
+            ("dd / Delete", "Move to Trash"),
             ("Shift+Delete", "Delete permanently (asks first)"),
-            (
-                "Ctrl+Z / Ctrl+Shift+Z",
-                "Undo / redo the last change to files (or Ctrl+Y)",
-            ),
-            (
-                "Escape",
-                "Stop the file work under way, or dismiss what went wrong",
-            ),
-            ("Ctrl+L", "Type a path (Tab completes)"),
-            ("/", "Search this folder and below"),
-            (
-                "| or Ctrl+Alt+N / Ctrl+W",
-                "Split into two panes / close the right one (or Alt+1)",
-            ),
-            (
-                "Tab / Shift+Tab",
-                "Move between the list and the preview, or the panes",
-            ),
-            ("Shift+arrows", "Select a range"),
-            ("Ctrl+A", "Select everything"),
+            ("z / Ctrl+Z", "Undo"),
+            ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
+            ("E", "Edit the file in $EDITOR"),
+            ("m / Shift+F10", "Menu"),
+            ("Ctrl+1 / 2 / 3", "List, columns, grid"),
+            ("Ctrl+4  |  Alt+1", "Two panes, or back to one"),
+            ("Tab", "Move between the list and the preview, or the panes"),
         ] {
             let line = format!("{keys:<26}{does}");
             assert!(all.contains(&line), "{line} is missing from\n{all}");
         }
-        for gone in ["Ctrl+P", "Ctrl+I", "sidebar", "details pane"] {
+        for gone in [
+            "Ctrl+P",
+            "Ctrl+I",
+            "Ctrl+H",
+            "Alt+⏎",
+            "Ctrl+Alt+N",
+            "Ctrl+Shift+D",
+            "Alt+Home",
+            "Ctrl+=",
+            "sidebar",
+            "details pane",
+        ] {
             assert!(!all.contains(gone), "{gone}");
         }
-        assert!(
-            all.contains("Close the window"),
-            "the last one fits:\n{all}"
-        );
+        assert!(all.contains("Quit"), "the last one fits:\n{all}");
         // Framed in the card's rule, on the terminal's own background.
-        let drawn = buffer(&mut f.app, 120, 40);
+        let drawn = buffer(&mut f.app, 120, 50);
         let (x, y) = find(&drawn, "┌", 0..120).unwrap();
         assert_eq!(drawn[(x, y)].fg, theme::CARD_RULE);
         let (x, y) = find(&drawn, "Keyboard shortcuts", 0..120).unwrap();
@@ -944,7 +952,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::End]);
         f.app.tick();
         buffer(&mut f.app, 120, 30);
-        press(&mut f.app, &[KeyCode::F(2)]);
+        f.app.handle_key(shift(KeyCode::Delete));
         settle(&mut f.app);
         // The dialog ends at column 95; the preview's picture is under its
         // head, from row 5, and goes on past the dialog.
@@ -953,7 +961,7 @@ mod tests {
             cells.filter(|at| painted(&drawn[*at])).count()
         };
         let covered = buffer(&mut f.app, 120, 30);
-        assert!(find(&covered, "Rename", 0..120).is_some());
+        assert!(find(&covered, "Delete for good?", 0..120).is_some());
         assert_eq!(preview(&covered), 0);
         press(&mut f.app, &[KeyCode::Esc]);
         let clear = buffer(&mut f.app, 120, 30);
@@ -965,19 +973,19 @@ mod tests {
     #[test]
     fn ctrl_1_2_3_draw_the_grid_the_list_and_the_columns() {
         let mut f = fixture();
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         let grid = buffer(&mut f.app, 120, 30);
         // Five tiles across the whole body, the names under the pictures.
         assert_eq!(find(&grid, "notes.txt", 0..120), Some((56, 10)));
         assert_eq!(grid[(25, 10)].symbol(), " ", "no parent column");
 
-        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
         let list = buffer(&mut f.app, 120, 30);
         assert_eq!(find(&list, "notes.txt", 26..73), Some((29, 4)));
         assert_eq!(find(&list, "5 B", 26..73).map(|(_, y)| y), Some(4));
         assert_eq!(list[(25, 10)].symbol(), "│");
 
-        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
         let columns = buffer(&mut f.app, 120, 30);
         assert_eq!(find(&columns, "notes.txt", 0..120), Some((3, 5)));
         assert_eq!(find(&columns, "5 B", 0..120), None);
@@ -989,7 +997,7 @@ mod tests {
         let mut f = fixture();
         let trip = f.home.join("Pictures").join("Trip");
         fs::write(trip.join("day.jpg"), "").unwrap();
-        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(
             &mut f.app,
             &[KeyCode::Down, KeyCode::Right, KeyCode::Char('/')],
@@ -1005,20 +1013,20 @@ mod tests {
         assert_eq!(find(&columns, "notes.txt", 0..130), None);
         assert_eq!(columns[(0, 3)].bg, theme::CURSOR, "the cursor");
 
-        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
         let list = buffer(&mut f.app, 130, 30);
         let (x, y) = find(&list, "a.jpg", 0..130).unwrap();
         assert_eq!(find(&list, "day.jpg", 0..130), Some((x, y + 1)));
         assert!(find(&list, "3 B", 0..130).is_some(), "with its size");
 
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         let grid = buffer(&mut f.app, 130, 30);
         let (a, day) = (find(&grid, "a.jpg", 0..130), find(&grid, "day.jpg", 0..130));
         let ((ax, ay), (dx, dy)) = (a.expect("the first"), day.expect("the second"));
         assert!(ay == dy && ax < dx, "side by side, in the order found");
 
         // Left, the folder is back with the ones above it.
-        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(&mut f.app, &[KeyCode::Esc]);
         let columns = buffer(&mut f.app, 130, 30);
         assert_eq!(find(&columns, "notes.txt", 0..130), Some((3, 5)));
@@ -1075,7 +1083,7 @@ mod tests {
         assert_eq!(cells(&left, 0, 0..60).trim(), "~");
 
         // Closed, the window is what it was before.
-        f.app.handle_key(ctrl(KeyCode::Char('w')));
+        f.app.handle_key(key(KeyCode::Char('|')));
         f.app.tick();
         assert_eq!(screen(&mut f.app, 120, 30), single);
     }
@@ -1087,7 +1095,7 @@ mod tests {
         let colors = |drawn: &Buffer, x, y| (drawn[(x, y)].fg, drawn[(x, y)].bg);
 
         // Documents and Pictures, not notes.txt: rows in the list and the columns.
-        for (view, x, top) in [('2', 29, 2), ('3', 3, 3)] {
+        for (view, x, top) in [('1', 29, 2), ('2', 3, 3)] {
             f.app.handle_key(ctrl(KeyCode::Char(view)));
             let drawn = buffer(&mut f.app, 120, 30);
             assert_eq!(
@@ -1107,7 +1115,7 @@ mod tests {
             );
         }
         // Tiles in the grid: a frame around each, and the name bold.
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
         let grid = buffer(&mut f.app, 120, 30);
         let frames: Vec<(u16, u16)> = (0..120)
             .filter(|x| grid[(*x, 2)].symbol() == "┌")

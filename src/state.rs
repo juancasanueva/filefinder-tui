@@ -1,12 +1,14 @@
 //! What is remembered between launches: the view, the size of the tiles,
-//! whether the preview pane shows, and where what is in the trash came from.
+//! whether the preview pane shows, the sort, the list's detail column, and
+//! where what is in the trash came from.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::app::{TileSize, ViewMode};
+use crate::app::{Detail, TileSize, ViewMode};
+use crate::model::{SortKey, SortMode};
 
 const FILE: &str = "state";
 const TRASHED: &str = "trashed";
@@ -17,6 +19,9 @@ pub struct Saved {
     pub tile: TileSize,
     /// Whether the preview pane shows beside the list.
     pub preview: bool,
+    pub sort: SortMode,
+    /// What the list's right-hand column shows.
+    pub detail: Detail,
 }
 
 impl Default for Saved {
@@ -25,6 +30,8 @@ impl Default for Saved {
             view: ViewMode::List,
             tile: TileSize::Normal,
             preview: true,
+            sort: SortMode::Name,
+            detail: Detail::Size,
         }
     }
 }
@@ -47,6 +54,16 @@ pub fn load(dir: &Path) -> Saved {
             ("tiles", "large") => saved.tile = TileSize::Large,
             ("preview", "on") => saved.preview = true,
             ("preview", "off") => saved.preview = false,
+            ("sort", "name") => saved.sort.key = SortKey::Name,
+            ("sort", "size") => saved.sort.key = SortKey::Size,
+            ("sort", "modified") => saved.sort.key = SortKey::Modified,
+            ("sort", "kind") => saved.sort.key = SortKey::Kind,
+            ("reverse", "on") => saved.sort.reversed = true,
+            ("reverse", "off") => saved.sort.reversed = false,
+            ("detail", "size") => saved.detail = Detail::Size,
+            ("detail", "modified") => saved.detail = Detail::Modified,
+            ("detail", "mode") => saved.detail = Detail::Mode,
+            ("detail", "owner") => saved.detail = Detail::Owner,
             _ => {}
         }
     }
@@ -66,10 +83,15 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
         TileSize::Large => "large",
     };
     let preview = if saved.preview { "on" } else { "off" };
+    let sort = saved.sort.key.label().to_lowercase();
+    let reverse = if saved.sort.reversed { "on" } else { "off" };
+    let detail = saved.detail.label().to_lowercase();
     fs::create_dir_all(dir)?;
     fs::write(
         dir.join(FILE),
-        format!("view={view}\ntiles={tiles}\npreview={preview}\n"),
+        format!(
+            "view={view}\ntiles={tiles}\npreview={preview}\nsort={sort}\nreverse={reverse}\ndetail={detail}\n"
+        ),
     )
 }
 
@@ -156,6 +178,8 @@ mod tests {
                 view: ViewMode::List,
                 tile: TileSize::Normal,
                 preview: true,
+                sort: SortMode::Name,
+                detail: Detail::Size,
             }
         );
     }
@@ -169,11 +193,16 @@ mod tests {
             view: ViewMode::Columns,
             tile: TileSize::Small,
             preview: false,
+            sort: SortMode {
+                key: SortKey::Modified,
+                reversed: true,
+            },
+            detail: Detail::Mode,
         };
         save(&folder, saved).unwrap();
         assert_eq!(
             fs::read_to_string(folder.join("state")).unwrap(),
-            "view=columns\ntiles=small\npreview=off\n"
+            "view=columns\ntiles=small\npreview=off\nsort=modified\nreverse=on\ndetail=mode\n"
         );
         assert_eq!(load(&folder), saved);
         let shown = Saved {
@@ -189,7 +218,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("state"),
-            "nonsense\nview=sideways\ntiles = large \npreview=maybe\nlater=thing\n",
+            "nonsense\nview=sideways\ntiles = large \npreview=maybe\nlater=thing\nsort=colour\ndetail=x\n",
         )
         .unwrap();
         assert_eq!(
@@ -198,6 +227,8 @@ mod tests {
                 view: ViewMode::List,
                 tile: TileSize::Large,
                 preview: true,
+                sort: SortMode::Name,
+                detail: Detail::Size,
             }
         );
     }

@@ -1,6 +1,6 @@
 //! The header: where the pane is on the left, the parent part muted and the
 //! folder itself in the foreground, and the sort order on the right. The
-//! path field (Ctrl+L) takes the path's place, and the search field follows it.
+//! search field follows the path.
 
 use std::path::Path;
 
@@ -20,16 +20,11 @@ use crate::theme;
 /// The widest the search field gets, and the room the path leaves it.
 const SEARCH_WIDTH: u16 = 30;
 
-/// The sort order as the header says it: the column, then `▴` ascending or
+/// The sort order as the header says it: the key, then `▴` ascending or
 /// `▾` reversed.
-pub fn sort_label(sort: SortMode) -> &'static str {
-    match sort {
-        SortMode::Name => "Name ▴",
-        SortMode::Kind => "Kind ▴",
-        SortMode::Newest => "Modified ▾",
-        SortMode::Oldest => "Modified ▴",
-        SortMode::Size => "Size ▾",
-    }
+pub fn sort_label(sort: SortMode) -> String {
+    let arrow = if sort.reversed { "▾" } else { "▴" };
+    format!("{} {arrow}", sort.key.label())
 }
 
 /// Draws the header row; each folder of the path and each field is a spot
@@ -38,16 +33,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // One blank cell on each side.
     let inner = (area.width as usize).saturating_sub(2);
     let sort = sort_label(app.sort);
+    let sort = sort.as_str();
     let sort_width = sort.width().min(inner);
     let room = inner - sort_width;
     let gap = room.min(2);
     let path_width = room - gap;
     let left = Rect::new(area.x + 1, area.y, path_width as u16, 1);
 
-    if let Some(Field::Path(input)) = &app.field {
-        field(frame, left, "", input, true);
-        hits.add(left, Spot::PathField);
-    } else if let Some(search) = app.pane().search() {
+    if let Some(search) = app.pane().search() {
         // A search keeps room for its field: the path gives way first.
         let kept = (SEARCH_WIDTH + 2) as usize;
         let crumbs_width = path_width.saturating_sub(kept);
@@ -183,8 +176,8 @@ fn field(frame: &mut Frame, area: Rect, lead: &str, input: &Input, typing: bool)
 
 #[cfg(test)]
 mod tests {
-    use crate::app::testing::{ctrl, finish_search, fixture, press, type_text};
-    use crate::model::SortMode;
+    use crate::app::testing::{finish_search, fixture, press, type_text};
+    use crate::model::{SortKey, SortMode};
     use crate::theme;
     use crate::ui::testing::{buffer, cursor, find, screen};
     use ratatui::crossterm::event::KeyCode;
@@ -230,12 +223,13 @@ mod tests {
     #[test]
     fn the_sort_label_sits_on_the_right_in_the_metadata_ink() {
         let mut f = fixture();
+        let sorted = |key, reversed| SortMode { key, reversed };
         for (sort, label) in [
-            (SortMode::Name, "Name ▴"),
-            (SortMode::Kind, "Kind ▴"),
-            (SortMode::Newest, "Modified ▾"),
-            (SortMode::Oldest, "Modified ▴"),
-            (SortMode::Size, "Size ▾"),
+            (sorted(SortKey::Name, false), "Name ▴"),
+            (sorted(SortKey::Kind, false), "Kind ▴"),
+            (sorted(SortKey::Modified, true), "Modified ▾"),
+            (sorted(SortKey::Modified, false), "Modified ▴"),
+            (sorted(SortKey::Size, true), "Size ▾"),
         ] {
             f.app.sort = sort;
             let drawn = buffer(&mut f.app, 80, 24);
@@ -244,51 +238,6 @@ mod tests {
             assert_eq!(drawn[(x, 0)].fg, theme::MUTED);
             assert_eq!(drawn[(79, 0)].symbol(), " ");
         }
-    }
-
-    #[test]
-    fn ctrl_l_turns_the_path_into_a_field_holding_it() {
-        let mut f = fixture();
-        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
-        f.app.handle_key(ctrl(KeyCode::Char('l')));
-        let drawn = buffer(&mut f.app, 120, 24);
-        assert_eq!(find(&drawn, "~/Pictures ", 0..120), Some((1, 0)));
-        // On the field's fill, as far as the gap before the sort label.
-        for x in [1, 10, 11, 60, 110] {
-            assert_eq!(drawn[(x, 0)].fg, theme::FOREGROUND, "{x}");
-            assert_eq!(drawn[(x, 0)].bg, theme::FIELD, "{x}");
-        }
-        assert_eq!(drawn[(111, 0)].bg, ratatui::style::Color::Reset);
-        assert_eq!(find(&drawn, "Name ▴", 0..120), Some((113, 0)));
-        assert_eq!(cursor(&mut f.app, 120, 24), (11, 0), "after the path");
-
-        // What is typed shows where the cursor is, and the cursor moves along.
-        type_text(&mut f.app, "/Tr");
-        let drawn = buffer(&mut f.app, 120, 24);
-        assert_eq!(find(&drawn, "~/Pictures/Tr ", 0..120), Some((1, 0)));
-        assert_eq!(cursor(&mut f.app, 120, 24), (14, 0));
-
-        // Closed, the path is back.
-        press(&mut f.app, &[KeyCode::Esc]);
-        let drawn = buffer(&mut f.app, 120, 24);
-        assert_eq!(find(&drawn, "~/Pictures", 0..120), Some((1, 0)));
-        assert_eq!(drawn[(1, 0)].bg, ratatui::style::Color::Reset);
-    }
-
-    #[test]
-    fn a_path_longer_than_the_field_scrolls_to_keep_the_cursor_in_sight() {
-        let mut f = fixture();
-        f.app.handle_key(ctrl(KeyCode::Char('l')));
-        type_text(&mut f.app, &"/abcdefghi".repeat(6));
-        // 30 cells: 28 inside, the sort label and its gap take 8, a field of
-        // 20, the last of them for the cursor.
-        let lines = screen(&mut f.app, 30, 10);
-        assert!(
-            lines[0].starts_with(" abcdefghi/abcdefghi   Name"),
-            "{}",
-            lines[0]
-        );
-        assert_eq!(cursor(&mut f.app, 30, 10), (20, 0));
     }
 
     #[test]

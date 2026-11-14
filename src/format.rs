@@ -92,6 +92,40 @@ pub fn short_date(time: SystemTime, now: SystemTime, style: DateStyle) -> String
     }
 }
 
+/// The type and permission bits of a Unix mode the way `ls -l` writes them,
+/// like `drwx------` or `-rwsr-xr-x`.
+pub fn permissions(mode: u32) -> String {
+    let kind = match mode & 0o170000 {
+        0o040000 => 'd',
+        0o120000 => 'l',
+        0o010000 => 'p',
+        0o140000 => 's',
+        0o020000 => 'c',
+        0o060000 => 'b',
+        _ => '-',
+    };
+    // Read, write, execute for owner, group, others; the execute place also
+    // carries setuid, setgid and sticky: lower case with execute, upper without.
+    let triplets = [
+        (0o400, 0o200, 0o100, 0o4000, 's'),
+        (0o040, 0o020, 0o010, 0o2000, 's'),
+        (0o004, 0o002, 0o001, 0o1000, 't'),
+    ];
+    let mut text = String::with_capacity(10);
+    text.push(kind);
+    for (read, write, execute, special, mark) in triplets {
+        text.push(if mode & read != 0 { 'r' } else { '-' });
+        text.push(if mode & write != 0 { 'w' } else { '-' });
+        text.push(match (mode & execute != 0, mode & special != 0) {
+            (true, true) => mark,
+            (false, true) => mark.to_ascii_uppercase(),
+            (true, false) => 'x',
+            (false, false) => '-',
+        });
+    }
+    text
+}
+
 /// Case-insensitive ordering where runs of digits compare as numbers,
 /// so `photo 9` sorts before `photo 10`.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
@@ -203,5 +237,26 @@ mod tests {
         let style = DateStyle::MonthFirst;
         assert_eq!(short_date(at(2026, 11, 10, 18, 10), now, style), "6:10 PM");
         assert_eq!(short_date(at(2026, 11, 9, 18, 10), now, style), "11/9/26");
+    }
+
+    #[test]
+    fn permissions_read_like_ls() {
+        assert_eq!(permissions(0o040700), "drwx------");
+        assert_eq!(permissions(0o100644), "-rw-r--r--");
+        assert_eq!(permissions(0o120755), "lrwxr-xr-x");
+        assert_eq!(permissions(0o010600), "prw-------");
+        assert_eq!(permissions(0o140755), "srwxr-xr-x");
+        assert_eq!(permissions(0o020620), "crw--w----");
+        assert_eq!(permissions(0o060640), "brw-r-----");
+    }
+
+    #[test]
+    fn permissions_show_setuid_setgid_and_sticky_bits() {
+        assert_eq!(permissions(0o104755), "-rwsr-xr-x");
+        assert_eq!(permissions(0o104644), "-rwSr--r--");
+        assert_eq!(permissions(0o102755), "-rwxr-sr-x");
+        assert_eq!(permissions(0o102745), "-rwxr-Sr-x");
+        assert_eq!(permissions(0o041777), "drwxrwxrwt");
+        assert_eq!(permissions(0o041776), "drwxrwxrwT");
     }
 }

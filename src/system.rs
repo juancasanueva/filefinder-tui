@@ -1,5 +1,5 @@
 //! The port to everything outside the folder tree: launching apps, previews,
-//! terminals, the program that zips, and the volume a folder is on.
+//! terminals, the editor, the program that zips, and the volume a folder is on.
 
 use std::cell::RefCell;
 use std::fs;
@@ -34,6 +34,10 @@ pub trait System {
 
     /// The volume a folder is on; `None` when that can't be told.
     fn volume(&self, folder: &Path) -> Option<Volume>;
+
+    /// Edits a file in `$EDITOR` (`vi` without one) in this terminal, and
+    /// waits for it: the window is handed over meanwhile and taken back after.
+    fn edit(&self, path: &Path) -> io::Result<()>;
 }
 
 /// A volume as the footer names it: its file-system type and the space left.
@@ -48,11 +52,17 @@ pub struct Volume {
 #[derive(Default)]
 pub struct MacSystem {
     preview: Preview,
+    /// Whether the keyboard was set up to tell more keys apart, which the
+    /// editor has to get back as it was.
+    enhanced: bool,
 }
 
 impl MacSystem {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(enhanced: bool) -> Self {
+        Self {
+            enhanced,
+            ..Self::default()
+        }
     }
 }
 
@@ -95,6 +105,74 @@ impl System for MacSystem {
     fn volume(&self, folder: &Path) -> Option<Volume> {
         volume_of(folder)
     }
+
+    fn edit(&self, path: &Path) -> io::Result<()> {
+        let editor = editor_of(std::env::var("EDITOR").ok());
+        let mut command = Command::new("/bin/sh");
+        // The editor is written the way a shell reads it, like `code -w`;
+        // the file goes after it as it is, whatever its name holds.
+        command
+            .arg("-c")
+            .arg(format!("{editor} \"$1\""))
+            .arg("sh")
+            .arg(path);
+        hand_over(self.enhanced);
+        let status = command.status();
+        let taken_back = take_back(self.enhanced);
+        let status = status?;
+        taken_back?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("the editor failed"))
+        }
+    }
+}
+
+/// The editor to run: `$EDITOR`, or `vi` when it says nothing.
+fn editor_of(editor: Option<String>) -> String {
+    editor
+        .filter(|editor| !editor.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_string())
+}
+
+/// Gives the terminal to another program: the screen and keyboard as they
+/// were before this app, the mouse its own.
+fn hand_over(enhanced: bool) {
+    use ratatui::crossterm::event::{DisableMouseCapture, PopKeyboardEnhancementFlags};
+    use ratatui::crossterm::{cursor, execute, terminal};
+    let mut out = io::stdout();
+    let _ = execute!(
+        out,
+        DisableMouseCapture,
+        cursor::SetCursorStyle::DefaultUserShape
+    );
+    if enhanced {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(out, terminal::LeaveAlternateScreen, cursor::Show);
+    let _ = terminal::disable_raw_mode();
+}
+
+/// Takes the terminal back for this app, the way `main` first set it up.
+fn take_back(enhanced: bool) -> io::Result<()> {
+    use ratatui::crossterm::event::{
+        EnableMouseCapture, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
+    use ratatui::crossterm::{cursor, execute, terminal};
+    let mut out = io::stdout();
+    terminal::enable_raw_mode()?;
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        EnableMouseCapture,
+        cursor::SetCursorStyle::SteadyBar
+    )?;
+    if enhanced {
+        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+        execute!(out, PushKeyboardEnhancementFlags(flags))?;
+    }
+    Ok(())
 }
 
 /// Asks the system about the volume a folder is on.
@@ -265,6 +343,14 @@ pub fn quiet(command: &mut Command) -> &mut Command {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn the_editor_is_editor_or_else_vi() {
+        assert_eq!(editor_of(Some("nvim".to_string())), "nvim");
+        assert_eq!(editor_of(Some("code -w".to_string())), "code -w");
+        assert_eq!(editor_of(Some("  ".to_string())), "vi");
+        assert_eq!(editor_of(None), "vi");
+    }
 
     #[test]
     fn a_preview_opens_without_waiting_and_asking_again_closes_it() {

@@ -1,5 +1,5 @@
-//! The list: flea's rows, an edge, a glyph, the name and the size, and the
-//! parent folder's column on its left.
+//! The list: flea's rows, an edge, a glyph, the name and the detail column
+//! (`I`), and the parent folder's column on its left.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -9,10 +9,11 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::{centered, empty_text, fit, scroll};
-use crate::app::{App, HitMap, Pane, Spot};
+use crate::app::{App, Detail, HitMap, Pane, Spot};
 use crate::format;
+use crate::format::DateStyle;
 use crate::icons;
-use crate::model::Entry;
+use crate::model::{self, Entry};
 use crate::theme;
 
 /// What a row is, which decides its colours.
@@ -150,6 +151,8 @@ pub fn draw(
     hits: &mut HitMap,
 ) {
     let caption = app.caption;
+    let (detail, style) = (app.detail, app.date_style);
+    let now = std::time::SystemTime::now();
     let pane = &mut app.panes[index];
     let rows = area.height as usize;
     pane.page_rows = rows.max(1);
@@ -187,11 +190,11 @@ pub fn draw(
             .and_then(|parent| parent.strip_prefix(&pane.cwd).ok())
             .map(|folder| folder.display().to_string())
             .filter(|folder| !folder.is_empty());
-        let size = size_text(entry);
+        let value = detail_text(entry, detail, now, style);
         lines.push(row(
             entry,
             width,
-            Some(&size),
+            Some(&value),
             look,
             &query,
             folder.as_deref(),
@@ -220,6 +223,25 @@ pub fn draw_parent(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) 
         lines.push(row(entry, area.width as usize, None, look, "", None));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// What the detail column says about an item: its size, when it was
+/// changed, its mode the way `ls -l` writes it, or who owns it.
+pub fn detail_text(
+    entry: &Entry,
+    detail: Detail,
+    now: std::time::SystemTime,
+    style: DateStyle,
+) -> String {
+    match detail {
+        Detail::Size => size_text(entry),
+        Detail::Modified => entry
+            .modified
+            .map(|time| format::short_date(time, now, style))
+            .unwrap_or_default(),
+        Detail::Mode => format::permissions(entry.mode),
+        Detail::Owner => model::owner(entry.uid),
+    }
 }
 
 /// A file's size, or how many things a folder holds.

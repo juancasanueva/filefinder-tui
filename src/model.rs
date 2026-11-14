@@ -22,39 +22,63 @@ pub enum Category {
     Other,
 }
 
+/// What a folder is sorted by: flea's four keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortMode {
+pub enum SortKey {
     Name,
-    Kind,
-    Newest,
-    Oldest,
     Size,
+    Modified,
+    Kind,
+}
+
+impl SortKey {
+    /// The key's name, as the header and the notices say it.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Name => "Name",
+            SortKey::Size => "Size",
+            SortKey::Modified => "Modified",
+            SortKey::Kind => "Kind",
+        }
+    }
+}
+
+/// How a folder is sorted: a key, ascending (A to Z, smallest or oldest
+/// first) or reversed. Folders always come first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SortMode {
+    pub key: SortKey,
+    pub reversed: bool,
 }
 
 impl SortMode {
-    pub const ALL: [SortMode; 5] = [
-        SortMode::Name,
-        SortMode::Kind,
-        SortMode::Newest,
-        SortMode::Oldest,
-        SortMode::Size,
-    ];
+    /// The order a folder starts in: by name, A to Z.
+    #[allow(non_upper_case_globals)]
+    pub const Name: SortMode = SortMode {
+        key: SortKey::Name,
+        reversed: false,
+    };
 
-    /// What the status line says after switching to this order.
-    pub fn tip(self) -> &'static str {
-        match self {
-            SortMode::Name => "Sorted by name",
-            SortMode::Kind => "Sorted by kind",
-            SortMode::Newest => "Newest first",
-            SortMode::Oldest => "Oldest first",
-            SortMode::Size => "Biggest first",
+    /// `s`: the next key, Name → Size → Modified → Kind → Name, ascending.
+    pub fn next(self) -> Self {
+        let key = match self.key {
+            SortKey::Name => SortKey::Size,
+            SortKey::Size => SortKey::Modified,
+            SortKey::Modified => SortKey::Kind,
+            SortKey::Kind => SortKey::Name,
+        };
+        SortMode {
+            key,
+            reversed: false,
         }
     }
 
-    pub fn step(self, delta: isize) -> Self {
-        let count = Self::ALL.len() as isize;
-        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0) as isize;
-        Self::ALL[(index + delta).rem_euclid(count) as usize]
+    /// `S`: the same key the other way round.
+    pub fn reverse(self) -> Self {
+        SortMode {
+            reversed: !self.reversed,
+            ..self
+        }
     }
 }
 
@@ -68,6 +92,8 @@ pub struct Entry {
     /// The item's own type and permission bits (`st_mode`); for a link,
     /// the link's, the way `ls -l` shows it.
     pub mode: u32,
+    /// Who owns it: the user's number.
+    pub uid: u32,
     /// Where a symbolic link points, as it is written; `None` for anything else.
     pub link: Option<PathBuf>,
     items: OnceCell<Option<usize>>,
@@ -77,6 +103,7 @@ impl Entry {
     pub fn from_path(path: PathBuf) -> io::Result<Self> {
         let link = fs::symlink_metadata(&path)?;
         let mode = std::os::unix::fs::MetadataExt::mode(&link);
+        let uid = std::os::unix::fs::MetadataExt::uid(&link);
         let is_symlink = link.file_type().is_symlink();
         // A symlink reads as what it points at; a broken one as itself.
         let meta = if is_symlink {
@@ -94,6 +121,7 @@ impl Entry {
             size: meta.len(),
             modified: meta.modified().ok(),
             mode,
+            uid,
             link: is_symlink.then(|| fs::read_link(&path).ok()).flatten(),
             items: OnceCell::new(),
             name,
@@ -253,17 +281,60 @@ pub fn sort_entries(entries: &mut [Entry], sort: SortMode) {
     entries.sort_by(|a, b| {
         b.is_dir.cmp(&a.is_dir).then_with(|| {
             let by_name = || natural_cmp(&a.name, &b.name);
-            match sort {
-                SortMode::Name => by_name(),
-                SortMode::Kind => a.kind().cmp(&b.kind()).then_with(by_name),
-                SortMode::Newest => b.modified.cmp(&a.modified).then_with(by_name),
-                SortMode::Oldest => a.modified.cmp(&b.modified).then_with(by_name),
-                // Folders have no size of their own, so they stay by name.
-                SortMode::Size if a.is_dir => by_name(),
-                SortMode::Size => b.size.cmp(&a.size).then_with(by_name),
+            let ascending = match sort.key {
+                SortKey::Name => by_name(),
+                SortKey::Kind => a.kind().cmp(&b.kind()).then_with(by_name),
+                SortKey::Modified => a.modified.cmp(&b.modified).then_with(by_name),
+                // Folders have no size of their own, so they go by name.
+                SortKey::Size if a.is_dir => by_name(),
+                SortKey::Size => a.size.cmp(&b.size).then_with(by_name),
+            };
+            if sort.reversed {
+                ascending.reverse()
+            } else {
+                ascending
             }
         })
     });
+}
+
+/// The name of the user with this number, or the number when the system
+/// has no name for it. Asked once per user.
+pub fn owner(uid: u32) -> String {
+    thread_local! {
+        static NAMES: std::cell::RefCell<std::collections::HashMap<u32, String>> =
+            Default::default();
+    }
+    NAMES.with(|names| {
+        names
+            .borrow_mut()
+            .entry(uid)
+            .or_insert_with(|| user_name(uid).unwrap_or_else(|| uid.to_string()))
+            .clone()
+    })
+}
+
+fn user_name(uid: u32) -> Option<String> {
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut buffer = vec![0 as libc::c_char; 4096];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is to memory that lives until the call returns,
+    // and `buffer` is as long as the length given.
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() {
+        return None;
+    }
+    // SAFETY: the call filled the entry in, and its name points into `buffer`.
+    let name = unsafe { std::ffi::CStr::from_ptr((*found).pw_name) };
+    Some(name.to_string_lossy().into_owned()).filter(|name| !name.is_empty())
 }
 
 #[cfg(test)]
@@ -313,20 +384,57 @@ mod tests {
     }
 
     #[test]
-    fn sorts_by_each_order_keeping_folders_first() {
+    fn sorts_by_each_key_both_ways_keeping_folders_first() {
         let dir = sample();
-        let list = |sort| {
-            let entries = list_dir(dir.path(), false, sort).unwrap();
-            names(&entries)[2..]
+        let list = |key, reversed| {
+            let entries = list_dir(dir.path(), false, SortMode { key, reversed }).unwrap();
+            names(&entries)
                 .iter()
                 .map(|name| name.to_string())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(list(SortMode::Newest), ["a.jpg", "c.pdf", "b.txt"]);
-        assert_eq!(list(SortMode::Oldest), ["b.txt", "c.pdf", "a.jpg"]);
-        assert_eq!(list(SortMode::Size), ["b.txt", "c.pdf", "a.jpg"]);
+        use SortKey::*;
+        // Ascending: A to Z, smallest first, oldest first; folders lead by name.
+        assert_eq!(
+            list(Name, false),
+            ["Alpha", "zeta", "a.jpg", "b.txt", "c.pdf"]
+        );
+        assert_eq!(
+            list(Size, false),
+            ["Alpha", "zeta", "a.jpg", "c.pdf", "b.txt"]
+        );
+        // The folders were made a moment apart: only the files are compared.
+        assert_eq!(list(Modified, false)[2..], ["b.txt", "c.pdf", "a.jpg"]);
         // JPEG image, PDF document, Plain text
-        assert_eq!(list(SortMode::Kind), ["a.jpg", "c.pdf", "b.txt"]);
+        assert_eq!(
+            list(Kind, false),
+            ["Alpha", "zeta", "a.jpg", "c.pdf", "b.txt"]
+        );
+        // Reversed: the exact reverse inside each block, folders still first.
+        assert_eq!(
+            list(Name, true),
+            ["zeta", "Alpha", "c.pdf", "b.txt", "a.jpg"]
+        );
+        assert_eq!(
+            list(Size, true),
+            ["zeta", "Alpha", "b.txt", "c.pdf", "a.jpg"]
+        );
+        assert_eq!(list(Modified, true)[2..], ["a.jpg", "c.pdf", "b.txt"]);
+        assert_eq!(
+            list(Kind, true),
+            ["zeta", "Alpha", "b.txt", "c.pdf", "a.jpg"]
+        );
+    }
+
+    #[test]
+    fn entries_know_their_owner() {
+        let dir = sample();
+        let entry = Entry::from_path(dir.path().join("a.jpg")).unwrap();
+        let uid = std::os::unix::fs::MetadataExt::uid(&fs::metadata(dir.path()).unwrap());
+        assert_eq!(entry.uid, uid);
+        // The name the system has for the user, or the number without one.
+        assert!(!owner(uid).is_empty());
+        assert_eq!(owner(4_000_000_000), "4000000000");
     }
 
     #[test]
@@ -382,10 +490,31 @@ mod tests {
     }
 
     #[test]
-    fn sort_modes_cycle_both_ways() {
-        assert_eq!(SortMode::Name.step(1), SortMode::Kind);
-        assert_eq!(SortMode::Name.step(-1), SortMode::Size);
-        assert_eq!(SortMode::Size.step(1), SortMode::Name);
+    fn s_goes_round_the_keys_ascending_and_s_reverses() {
+        let name = SortMode::Name;
+        assert_eq!(
+            name,
+            SortMode {
+                key: SortKey::Name,
+                reversed: false
+            }
+        );
+        let size = name.next();
+        assert_eq!(
+            size,
+            SortMode {
+                key: SortKey::Size,
+                reversed: false
+            }
+        );
+        assert_eq!(size.next().key, SortKey::Modified);
+        assert_eq!(size.next().next().key, SortKey::Kind);
+        // Reversed or not, the next key starts ascending.
+        let reversed = size.next().next().reverse();
+        assert!(reversed.reversed);
+        assert_eq!(reversed.next(), SortMode::Name);
+        assert!(!reversed.reverse().reversed);
+        assert_eq!(SortKey::Modified.label(), "Modified");
     }
 
     #[test]

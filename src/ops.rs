@@ -123,6 +123,9 @@ pub struct Report {
     pub done: usize,
     /// How many were left alone because they already were where they were going.
     pub skipped: usize,
+    /// How many were left out because their name was taken and the paste
+    /// was told to skip those.
+    pub declined: usize,
     /// Whether it was cancelled before the end.
     pub stopped: bool,
     pub error: Option<Error>,
@@ -153,7 +156,207 @@ pub fn split_name(name: &str, is_dir: bool) -> (&str, &str) {
     }
 }
 
+/// What a paste does with an item whose name is already taken in the folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collide {
+    /// The item goes in under the next free " copy" name.
+    KeepBoth,
+    /// The item already there is moved to the trash first, so that undo can
+    /// bring it back, and the new one takes its name.
+    Replace,
+    /// The item stays where it is.
+    Skip,
+}
+
+/// The names a paste of these items into `folder` would meet there, in the
+/// order of the items. An item a move would leave where it is meets none.
+pub fn clashes(items: &[PathBuf], folder: &Path, moving: bool) -> Vec<String> {
+    let stays = |item: &&PathBuf| moving && in_folder(item, folder);
+    let taken = |item: &PathBuf| {
+        let name = item.file_name()?;
+        exists(&folder.join(name)).then(|| name.to_string_lossy().into_owned())
+    };
+    items
+        .iter()
+        .filter(|item| !stays(item))
+        .filter_map(taken)
+        .collect()
+}
+
+/// Copies or moves files and folders into a folder, treating the names
+/// already taken there as `collide` says. Nothing is written over.
+pub fn transfer(
+    items: &[PathBuf],
+    folder: &Path,
+    moving: bool,
+    collide: Collide,
+    trash_dir: &Path,
+    cancel: &dyn Cancel,
+) -> Report {
+    transfer_with(
+        items,
+        folder,
+        moving,
+        collide,
+        trash_dir,
+        cancel,
+        &rename_new,
+    )
+}
+
+fn transfer_with(
+    items: &[PathBuf],
+    folder: &Path,
+    moving: bool,
+    collide: Collide,
+    trash_dir: &Path,
+    cancel: &dyn Cancel,
+    rename: Rename,
+) -> Report {
+    let kind = if moving { Kind::Move } else { Kind::Copy };
+    each(kind, items, cancel, |item| {
+        let taken = item
+            .file_name()
+            .map(|name| folder.join(name))
+            .filter(|place| exists(place));
+        let keeps_both = |item: &Path| {
+            if moving {
+                move_one(item, folder, cancel, rename)
+            } else {
+                copy_one(item, folder, 0, cancel)
+            }
+        };
+        match (collide, taken) {
+            // A move leaves what is already in the folder where it is.
+            _ if moving && in_folder(item, folder) => keeps_both(item),
+            (Collide::KeepBoth, _) | (_, None) => keeps_both(item),
+            (Collide::Skip, Some(_)) => Turn {
+                steps: Vec::new(),
+                end: End::Declined,
+            },
+            (Collide::Replace, Some(place)) => {
+                replace_one(item, &place, moving, trash_dir, cancel, rename)
+            }
+        }
+    })
+}
+
+/// Puts `item` at `place`, whose name is taken: the item there goes to the
+/// trash first, whole, by a move; then `item` takes the name, only if it is
+/// free. When `item` can't be put there the one that was is put back; when
+/// that can't be done either it stays in the trash, on record for undo.
+fn replace_one(
+    item: &Path,
+    place: &Path,
+    moving: bool,
+    trash_dir: &Path,
+    cancel: &dyn Cancel,
+    rename: Rename,
+) -> Turn {
+    let name = shown(item);
+    let folder = place.parent().unwrap_or(place);
+    if inside(folder, item) {
+        return Turn::failed(format!("Can't put {name} inside itself."));
+    }
+    // Replacing an item with itself would change nothing.
+    let same = match (fs::symlink_metadata(item), fs::symlink_metadata(place)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    };
+    if same {
+        return Turn {
+            steps: Vec::new(),
+            end: End::Declined,
+        };
+    }
+    // The one there can't go while it holds the item that replaces it.
+    if inside(item, place) {
+        return Turn::failed(format!("Can't replace {}: it holds {name}.", shown(place)));
+    }
+    // A name this disk can't give the item stops it before anything moves.
+    if let Some(error) = clash(place, Some(item)) {
+        let verb = if moving { "move" } else { "copy" };
+        return Turn::failed(format!("Couldn't {verb} {name}{}", because(&error)));
+    }
+    let parked = match trash_item(place, trash_dir, rename, &volume_trash) {
+        Ok(parked) => parked,
+        Err(error) => {
+            return Turn {
+                steps: Vec::new(),
+                end: End::Failed(error),
+            };
+        }
+    };
+    let away = Step::Trashed {
+        from: place.to_path_buf(),
+        to: parked.clone(),
+    };
+    let placed = if moving {
+        move_new(item, place, cancel, rename)
+    } else {
+        copy_new(item, place, cancel).map(|()| Landed::Moved)
+    };
+    let arrived = match (moving, &placed) {
+        (true, Ok(Landed::Moved)) => Step::Moved {
+            from: item.to_path_buf(),
+            to: place.to_path_buf(),
+        },
+        _ => created(place.to_path_buf()),
+    };
+    let unfinished = match placed {
+        Ok(Landed::Moved) => {
+            return Turn {
+                steps: vec![away, arrived],
+                end: End::Done,
+            };
+        }
+        // There are two of it now, so what undo takes away is the copy.
+        Ok(Landed::Copied) => {
+            let why = format!("Copied {name}, but couldn't remove the original.");
+            return Turn {
+                steps: vec![away, arrived],
+                end: End::Failed(Error(why)),
+            };
+        }
+        Err(unfinished) => unfinished,
+    };
+    let end = match unfinished.why {
+        Halt::Cancelled => End::Stopped,
+        Halt::Taken => End::Failed(Error(format!(
+            "{} already exists in {}.",
+            shown(place),
+            folder_name(place)
+        ))),
+        Halt::Failed(error) if moving => End::Failed(Error(format!(
+            "Couldn't move {name}: {}",
+            why_failed(&error)
+        ))),
+        Halt::Failed(error) => {
+            End::Failed(Error(format!("Couldn't copy {name}{}", because(&error))))
+        }
+    };
+    if unfinished.left {
+        // Part of a folder got there: it is this paste's own. Undo takes it
+        // away and brings the one that was there back.
+        return Turn {
+            steps: vec![away, arrived],
+            end,
+        };
+    }
+    match put_with(&parked, place, trash_dir, rename) {
+        Ok(()) => Turn {
+            steps: Vec::new(),
+            end,
+        },
+        Err(_) => Turn {
+            steps: vec![away],
+            end,
+        },
+    }
+}
+
 /// Copies files and folders into a folder. A taken name keeps both.
+#[cfg(test)]
 pub fn copy_into(items: &[PathBuf], folder: &Path, cancel: &dyn Cancel) -> Report {
     each(Kind::Copy, items, cancel, |item| {
         copy_one(item, folder, 0, cancel)
@@ -169,6 +372,7 @@ pub fn duplicate(items: &[PathBuf], cancel: &dyn Cancel) -> Report {
 }
 
 /// Moves files and folders into a folder. A taken name keeps both.
+#[cfg(test)]
 pub fn move_into(items: &[PathBuf], folder: &Path, cancel: &dyn Cancel) -> Report {
     move_with(items, folder, cancel, &rename_new)
 }
@@ -223,6 +427,7 @@ pub fn compress(
         asked: items.len(),
         done: 0,
         skipped: 0,
+        declined: 0,
         stopped: false,
         error: None,
     };
@@ -317,7 +522,7 @@ fn restore_one(item: &Path, place: Option<&Path>, trash_dir: &Path) -> Turn {
             to: place.to_path_buf(),
         }),
         Err(error) => Turn {
-            step: None,
+            steps: Vec::new(),
             end: End::Failed(error),
         },
     }
@@ -394,8 +599,12 @@ pub fn new_folder(folder: &Path, name: &str) -> Result<Option<Change>, Error> {
 }
 
 fn check_name(name: &str) -> Result<(), Error> {
-    if name.contains('/') {
-        Err(Error("A name can't contain \"/\".".to_string()))
+    if matches!(name, "." | "..") {
+        Err(Error(
+            "A name cannot be a single dot or a double dot.".to_string(),
+        ))
+    } else if name.contains('/') {
+        Err(Error("A name cannot contain /.".to_string()))
     } else {
         Ok(())
     }
@@ -422,7 +631,7 @@ impl History {
         let Some(mut change) = self.done.pop() else {
             return Ok(None);
         };
-        if let Some(why) = change.steps.iter().find_map(|step| step.blocked(Way::Undo)) {
+        if let Some(why) = blocked(&change.steps, Way::Undo) {
             self.done.push(change);
             return Err(Error(format!("Can't undo that: {why}")));
         }
@@ -447,7 +656,7 @@ impl History {
         let Some(mut change) = self.undone.pop() else {
             return Ok(None);
         };
-        if let Some(why) = change.steps.iter().find_map(|step| step.blocked(Way::Redo)) {
+        if let Some(why) = blocked(&change.steps, Way::Redo) {
             self.undone.push(change);
             return Err(Error(format!("Can't redo that: {why}")));
         }
@@ -474,9 +683,36 @@ enum Way {
     Redo,
 }
 
+/// Why a change can't be taken back, or done again, as the world is now.
+/// Undo takes the steps last to first and redo first to last, so a place a
+/// step needs free may be taken now by what a step before it in that order
+/// moves away: a Replace, whose new item has the name of the one it sent to
+/// the trash.
+fn blocked(steps: &[Step], way: Way) -> Option<String> {
+    steps.iter().enumerate().find_map(|(index, step)| {
+        let before = match way {
+            Way::Undo => &steps[index + 1..],
+            Way::Redo => &steps[..index],
+        };
+        let freed: Vec<&Path> = before.iter().filter_map(|step| step.frees(way)).collect();
+        step.blocked(way, &freed)
+    })
+}
+
 impl Step {
-    /// Why this step can't be taken back, or done again, as the world is now.
-    fn blocked(&self, way: Way) -> Option<String> {
+    /// The place this step leaves free when it is taken back, or done again.
+    fn frees(&self, way: Way) -> Option<&Path> {
+        match (self, way) {
+            (Step::Moved { to, .. }, Way::Undo) => Some(to),
+            (Step::Created { at, .. }, Way::Undo) => Some(at),
+            (Step::Moved { from, .. } | Step::Trashed { from, .. }, Way::Redo) => Some(from),
+            (Step::Trashed { .. }, Way::Undo) | (Step::Created { .. }, Way::Redo) => None,
+        }
+    }
+
+    /// Why this step can't be taken back, or done again, as the world is
+    /// now, once the places in `freed` are free.
+    fn blocked(&self, way: Way, freed: &[&Path]) -> Option<String> {
         // What has to be there, the place that has to be free, and the item's name.
         let (source, free, item) = match (self, way) {
             (Step::Moved { from, to }, Way::Undo) => (Some(to), Some(from), to),
@@ -489,7 +725,9 @@ impl Step {
         let Some(source) = source.filter(|path| exists(path)) else {
             return Some(format!("{} isn't where it was left.", shown(item)));
         };
-        let taken = free.filter(|place| exists(place) && !only_case_differs(source, place))?;
+        let taken = free.filter(|place| {
+            exists(place) && !only_case_differs(source, place) && !freed.contains(&place.as_path())
+        })?;
         Some(format!(
             "{} already exists in {}.",
             shown(taken),
@@ -563,29 +801,31 @@ fn clear_away(part: &Path, trash_dir: &Path, rename: Rename) -> bool {
 
 /// What one item's turn left behind and how it ended.
 struct Turn {
-    step: Option<Step>,
+    steps: Vec<Step>,
     end: End,
 }
 
 enum End {
     Done,
+    /// It already was where it was going.
     Skipped,
+    /// Its name was taken, and the paste skips those.
+    Declined,
     Stopped,
     Failed(Error),
 }
 
 impl Turn {
     fn done(step: Step) -> Self {
-        let step = Some(step);
         Self {
-            step,
+            steps: vec![step],
             end: End::Done,
         }
     }
 
     fn failed(message: String) -> Self {
         Self {
-            step: None,
+            steps: Vec::new(),
             end: End::Failed(Error(message)),
         }
     }
@@ -606,6 +846,7 @@ fn each(
         asked: items.len(),
         done: 0,
         skipped: 0,
+        declined: 0,
         stopped: false,
         error: None,
     };
@@ -614,11 +855,12 @@ fn each(
             report.stopped = true;
             break;
         }
-        let Turn { step, end } = turn(item);
-        report.change.steps.extend(step);
+        let Turn { steps, end } = turn(item);
+        report.change.steps.extend(steps);
         match end {
             End::Done => report.done += 1,
             End::Skipped => report.skipped += 1,
+            End::Declined => report.declined += 1,
             End::Stopped => {
                 report.stopped = true;
                 break;
@@ -695,7 +937,8 @@ fn copy_one(item: &Path, folder: &Path, first: usize, cancel: &dyn Cancel) -> Tu
                     Halt::Failed(error) => failed(&because(&error)).end,
                     _ => End::Stopped,
                 };
-                return Turn { step, end };
+                let steps = step.into_iter().collect();
+                return Turn { steps, end };
             }
         }
     }
@@ -991,6 +1234,7 @@ fn has_own_attributes(_path: &Path) -> Option<bool> {
 type Rename<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
 type VolumeTrash<'a> = &'a dyn Fn(&Path) -> io::Result<PathBuf>;
 
+#[cfg(test)]
 fn move_with(items: &[PathBuf], folder: &Path, cancel: &dyn Cancel, rename: Rename) -> Report {
     each(Kind::Move, items, cancel, |item| {
         move_one(item, folder, cancel, rename)
@@ -1010,7 +1254,7 @@ fn move_one(item: &Path, folder: &Path, cancel: &dyn Cancel, rename: Rename) -> 
         .is_some_and(|parent| same_folder(parent, folder))
     {
         return Turn {
-            step: None,
+            steps: Vec::new(),
             end: End::Skipped,
         };
     }
@@ -1046,7 +1290,8 @@ fn move_one(item: &Path, folder: &Path, cancel: &dyn Cancel, rename: Rename) -> 
                 (left.then(|| created(to)), end)
             }
         };
-        return Turn { step, end };
+        let steps = step.into_iter().collect();
+        return Turn { steps, end };
     }
     Turn::failed(format!("Couldn't move {name}."))
 }
@@ -1087,7 +1332,7 @@ fn trash_with(items: &[PathBuf], trash_dir: &Path, rename: Rename, volume: Volum
                 to,
             }),
             Err(error) => Turn {
-                step: None,
+                steps: Vec::new(),
                 end: End::Failed(error),
             },
         }
@@ -1262,8 +1507,8 @@ fn rename_held(from: &Path, to: &Path) -> io::Result<()> {
     })
 }
 
-/// folio's "keep both" names: the name itself, then `name (copy).ext`,
-/// `name (copy 2).ext` and so on.
+/// flea's "keep both" names: the name itself, then `name copy.ext`,
+/// `name copy 2.ext` and so on.
 fn candidates(name: &OsStr, is_dir: bool) -> impl Iterator<Item = OsString> {
     let plain = name.to_os_string();
     let text = name.to_string_lossy().into_owned();
@@ -1271,8 +1516,8 @@ fn candidates(name: &OsStr, is_dir: bool) -> impl Iterator<Item = OsString> {
         let (stem, extension) = split_name(&text, is_dir);
         match n {
             0 => plain.clone(),
-            1 => format!("{stem} (copy){extension}").into(),
-            n => format!("{stem} (copy {n}){extension}").into(),
+            1 => format!("{stem} copy{extension}").into(),
+            n => format!("{stem} copy {n}{extension}").into(),
         }
     })
 }
@@ -1295,6 +1540,12 @@ fn inside(folder: &Path, item: &Path) -> bool {
         (Ok(folder), Ok(item)) => folder.starts_with(item),
         _ => folder.starts_with(item),
     }
+}
+
+/// Whether an item is directly in a folder.
+fn in_folder(item: &Path, folder: &Path) -> bool {
+    item.parent()
+        .is_some_and(|parent| same_folder(parent, folder))
 }
 
 fn same_folder(a: &Path, b: &Path) -> bool {
@@ -1504,16 +1755,16 @@ mod tests {
         }
         assert_eq!(w.names("Into/My.Stuff"), ["kept.txt"]);
         for (copy, text) in [
-            ("a (copy).txt", "new"),
-            ("a (copy 2).txt", "new"),
-            ("a (copy 3).txt", "new"),
-            (".env (copy)", "new env"),
-            (".env (copy 3)", "new env"),
-            ("README (copy)", "new readme"),
-            ("README (copy 2)", "new readme"),
+            ("a copy.txt", "new"),
+            ("a copy 2.txt", "new"),
+            ("a copy 3.txt", "new"),
+            (".env copy", "new env"),
+            (".env copy 3", "new env"),
+            ("README copy", "new readme"),
+            ("README copy 2", "new readme"),
             // A folder has no extension to keep at the end.
-            ("My.Stuff (copy)/inside.txt", "new inside"),
-            ("My.Stuff (copy 3)/inside.txt", "new inside"),
+            ("My.Stuff copy/inside.txt", "new inside"),
+            ("My.Stuff copy 3/inside.txt", "new inside"),
         ] {
             assert_eq!(w.read(&format!("Into/{copy}")), text, "{copy}");
         }
@@ -1624,14 +1875,14 @@ mod tests {
             report.change.steps[0],
             Step::Moved {
                 from: a,
-                to: into.join("a (copy).txt")
+                to: into.join("a copy.txt")
             }
         );
         assert_eq!(w.read("Into/a.txt"), "old");
-        assert_eq!(w.read("Into/a (copy).txt"), "new");
+        assert_eq!(w.read("Into/a copy.txt"), "new");
         assert_eq!(w.names("Into/Dir"), ["x.txt"]);
         assert_eq!(w.read("Into/Dir/x.txt"), "old");
-        assert_eq!(w.read("Into/Dir (copy)/y.txt"), "new");
+        assert_eq!(w.read("Into/Dir copy/y.txt"), "new");
         assert!(!w.has("a.txt") && !w.has("Dir"));
     }
 
@@ -1665,7 +1916,7 @@ mod tests {
             [
                 Step::Moved {
                     from: a,
-                    to: usb.join("a (copy).txt")
+                    to: usb.join("a copy.txt")
                 },
                 Step::Moved {
                     from: w.path("Dir"),
@@ -1674,7 +1925,7 @@ mod tests {
             ]
         );
         assert_eq!(w.read("USB/a.txt"), "already there");
-        assert_eq!(w.read("USB/a (copy).txt"), "alpha");
+        assert_eq!(w.read("USB/a copy.txt"), "alpha");
         assert_eq!(w.read("USB/Dir/b.txt"), "beta");
         assert!(!w.has("a.txt") && !w.has("Dir"));
     }
@@ -1731,16 +1982,13 @@ mod tests {
         assert_eq!(report.change.kind, Kind::Duplicate);
         assert_eq!(
             report.change.steps,
-            [
-                created(w.path("a (copy).txt")),
-                created(w.path("Dir (copy)"))
-            ]
+            [created(w.path("a copy.txt")), created(w.path("Dir copy"))]
         );
-        assert_eq!(w.read("a (copy).txt"), "alpha");
-        assert_eq!(w.read("Dir (copy)/in.txt"), "inside");
+        assert_eq!(w.read("a copy.txt"), "alpha");
+        assert_eq!(w.read("Dir copy/in.txt"), "inside");
         duplicate(&items, &go());
-        assert_eq!(w.read("a (copy 2).txt"), "alpha");
-        assert_eq!(w.read("Dir (copy 2)/in.txt"), "inside");
+        assert_eq!(w.read("a copy 2.txt"), "alpha");
+        assert_eq!(w.read("Dir copy 2/in.txt"), "inside");
         assert_eq!(w.read("a.txt"), "alpha");
         assert_eq!(w.names("Dir"), ["in.txt"]);
     }
@@ -1947,11 +2195,11 @@ mod tests {
         }
 
         // The same through a whole command, in the order the folder really lists.
-        let report = duplicate(&[w.path("Album")], &Fat::at(w.path("Album (copy)")));
+        let report = duplicate(&[w.path("Album")], &Fat::at(w.path("Album copy")));
         assert_eq!((report.done, said(&report)), (1, None));
-        assert_eq!(w.names("Album (copy)"), w.names("Album"));
-        assert_eq!(w.read("Album (copy)/one.txt"), "first");
-        assert_eq!(w.read("Album (copy)/two.txt"), "second");
+        assert_eq!(w.names("Album copy"), w.names("Album"));
+        assert_eq!(w.read("Album copy/one.txt"), "first");
+        assert_eq!(w.read("Album copy/two.txt"), "second");
         assert_eq!(w.names("Album").len(), 6, "the original is as it was");
     }
 
@@ -2031,7 +2279,7 @@ mod tests {
             said(&report),
             side_by_side("Moved only part of", "Box", "x.txt")
         );
-        assert_eq!(report.change.steps, [created(usb.join("Box (copy)"))]);
+        assert_eq!(report.change.steps, [created(usb.join("Box copy"))]);
         assert_eq!(w.names("Other/Box"), ["._x.txt", "x.txt"]);
         assert!(notes(w.path("Other/Box/._x.txt")));
         assert_eq!(w.read("Other/Box/x.txt"), "x");
@@ -2166,7 +2414,7 @@ mod tests {
         assert_eq!(w.names("USB/Dir"), ["a.txt", "b.txt"]);
         assert_eq!(w.read("USB/Dir/b.txt"), "b");
         // Taken away to the trash, next to the one from before.
-        assert_eq!(w.names(".Trash"), ["Dir", "Dir (copy)"]);
+        assert_eq!(w.names(".Trash"), ["Dir", "Dir copy"]);
     }
 
     #[test]
@@ -2229,7 +2477,7 @@ mod tests {
         w.file("b.txt", "beta");
         w.file("Dir/c.txt", "gamma");
         let slash = rename(&a, "Dir/a.txt").unwrap_err();
-        assert_eq!(slash.to_string(), "A name can't contain \"/\".");
+        assert_eq!(slash.to_string(), "A name cannot contain /.");
         for taken in ["b.txt", "Dir"] {
             let error = rename(&a, taken).unwrap_err();
             assert_eq!(error.to_string(), format!("{taken} already exists here."));
@@ -2267,7 +2515,7 @@ mod tests {
             assert_eq!(error.to_string(), format!("{taken} already exists here."));
         }
         let slash = new_folder(&w.root, "a/b").unwrap_err();
-        assert_eq!(slash.to_string(), "A name can't contain \"/\".");
+        assert_eq!(slash.to_string(), "A name cannot contain /.");
         assert_eq!(new_folder(&w.root, "  "), Ok(None));
         assert_eq!(w.names(""), [".Trash", "Plans", "taken.txt"]);
         assert_eq!(w.read("Plans/kept.txt"), "kept");
@@ -2310,11 +2558,11 @@ mod tests {
             report.change.steps,
             [Step::Trashed {
                 from: a,
-                to: w.trash.join("a (copy).txt")
+                to: w.trash.join("a copy.txt")
             }]
         );
         assert_eq!(w.read(".Trash/a.txt"), "thrown away earlier");
-        assert_eq!(w.read(".Trash/a (copy).txt"), "today");
+        assert_eq!(w.read(".Trash/a copy.txt"), "today");
     }
 
     #[test]
@@ -2467,9 +2715,9 @@ mod tests {
         history.record(duplicate(&[a], &go()).change);
         history.undo(&w.trash).unwrap().unwrap();
         assert_eq!(w.names(""), [".Trash", "a.txt"]);
-        assert_eq!(w.read(".Trash/a (copy).txt"), "alpha");
+        assert_eq!(w.read(".Trash/a copy.txt"), "alpha");
         history.redo(&w.trash).unwrap().unwrap();
-        assert_eq!(w.read("a (copy).txt"), "alpha");
+        assert_eq!(w.read("a copy.txt"), "alpha");
     }
 
     #[test]
@@ -2540,7 +2788,7 @@ mod tests {
         assert_eq!(redone.kind, Kind::Trash);
         assert!(!w.has("a.txt"));
         assert_eq!(w.read(".Trash/a.txt"), "another one");
-        assert_eq!(w.read(".Trash/a (copy).txt"), "alpha");
+        assert_eq!(w.read(".Trash/a copy.txt"), "alpha");
         history.undo(&w.trash).unwrap().unwrap();
         assert_eq!(w.read("a.txt"), "alpha");
         assert_eq!(w.names(".Trash"), ["a.txt"]);
@@ -2666,11 +2914,11 @@ mod tests {
         let mut copies = History::default();
         copies.record(duplicate(&[w.path("gone.txt")], &go()).change);
         copies.undo(&w.trash).unwrap().unwrap();
-        fs::remove_file(w.path(".Trash/gone (copy).txt")).unwrap();
+        fs::remove_file(w.path(".Trash/gone copy.txt")).unwrap();
         let emptied = copies.redo(&w.trash).unwrap_err();
         assert_eq!(
             emptied.to_string(),
-            "Can't redo that: gone (copy).txt isn't where it was left."
+            "Can't redo that: gone copy.txt isn't where it was left."
         );
     }
 
@@ -2778,34 +3026,31 @@ mod tests {
         let notes = w.file("notes.txt", "hello");
         w.file("notes.txt.zip", "old archive");
         let items = [notes];
-        assert_eq!(archive_name(&items).unwrap(), "notes.txt (copy).zip");
+        assert_eq!(archive_name(&items).unwrap(), "notes.txt copy.zip");
         let report = compress(&items, &go(), |archive| fs::write(archive, "second"));
         assert_eq!(said(&report), None);
-        assert_eq!(
-            report.change.steps,
-            [created(w.path("notes.txt (copy).zip"))]
-        );
+        assert_eq!(report.change.steps, [created(w.path("notes.txt copy.zip"))]);
         assert_eq!(w.read("notes.txt.zip"), "old archive");
-        assert_eq!(w.read("notes.txt (copy).zip"), "second");
+        assert_eq!(w.read("notes.txt copy.zip"), "second");
 
         // A file that takes the name while the archive is being written is
         // not written over either.
-        let late = w.path("notes.txt (copy 2).zip");
+        let late = w.path("notes.txt copy 2.zip");
         let report = compress(&items, &go(), |archive| {
             fs::write(&late, "appeared meanwhile")?;
             fs::write(archive, "third")
         });
         assert_eq!(said(&report), None);
-        assert_eq!(w.read("notes.txt (copy 2).zip"), "appeared meanwhile");
-        assert_eq!(w.read("notes.txt (copy 3).zip"), "third");
+        assert_eq!(w.read("notes.txt copy 2.zip"), "appeared meanwhile");
+        assert_eq!(w.read("notes.txt copy 3.zip"), "third");
         assert_eq!(
             w.names(""),
             [
                 ".Trash",
                 "notes.txt",
-                "notes.txt (copy 2).zip",
-                "notes.txt (copy 3).zip",
-                "notes.txt (copy).zip",
+                "notes.txt copy 2.zip",
+                "notes.txt copy 3.zip",
+                "notes.txt copy.zip",
                 "notes.txt.zip",
             ],
             "and nothing else is left behind"
@@ -2987,5 +3232,261 @@ mod tests {
         let link = w.path("Linked Trash");
         symlink(elsewhere.parent().unwrap(), &link).unwrap();
         assert!(trash_items(&link).is_err());
+    }
+
+    // Paste conflicts: what a paste does with the names it meets.
+
+    fn inode(path: &Path) -> u64 {
+        fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn clashes_are_the_names_a_paste_would_meet_in_the_order_given() {
+        let w = world();
+        let (a, b, c) = (w.file("a.txt", "a"), w.file("b.txt", "b"), w.file("c", "c"));
+        let into = w.folder("Into");
+        w.file("Into/c", "c there");
+        w.file("Into/a.txt", "a there");
+        assert_eq!(clashes(&[a.clone(), b, c], &into, false), ["a.txt", "c"]);
+        // A copy into its own folder meets itself; a move there stays put.
+        assert_eq!(clashes(std::slice::from_ref(&a), &w.root, false), ["a.txt"]);
+        assert!(clashes(&[a], &w.root, true).is_empty());
+    }
+
+    #[test]
+    fn keep_both_names_the_newcomer_like_flea_never_touching_the_one_there() {
+        let w = world();
+        let a = w.file("a.txt", "new");
+        let into = w.folder("Into");
+        let there = w.file("Into/a.txt", "old");
+        let before = inode(&there);
+        for _ in 0..2 {
+            let report = transfer(
+                std::slice::from_ref(&a),
+                &into,
+                false,
+                Collide::KeepBoth,
+                &w.trash,
+                &go(),
+            );
+            assert_eq!((said(&report), report.done), (None, 1));
+        }
+        assert_eq!(w.names("Into"), ["a copy 2.txt", "a copy.txt", "a.txt"]);
+        assert_eq!(
+            (w.read("Into/a.txt"), inode(&there)),
+            ("old".to_string(), before)
+        );
+        assert_eq!(w.read("Into/a copy 2.txt"), "new");
+        assert!(w.names(".Trash").is_empty());
+    }
+
+    #[test]
+    fn replace_sends_the_one_there_to_the_trash_first_and_undo_brings_it_back_whole() {
+        let w = world();
+        let a = w.file("a.txt", "new");
+        let into = w.folder("Into");
+        let there = w.file("Into/a.txt", "old");
+        let original = inode(&there);
+        let report = transfer(
+            std::slice::from_ref(&a),
+            &into,
+            false,
+            Collide::Replace,
+            &w.trash,
+            &go(),
+        );
+        assert_eq!((said(&report), report.done), (None, 1));
+        assert_eq!(w.read("Into/a.txt"), "new");
+        assert_eq!(w.read("a.txt"), "new", "a copy leaves the original");
+        // Moved there whole, never written over in place.
+        assert_eq!(w.names(".Trash"), ["a.txt"]);
+        assert_eq!(w.read(".Trash/a.txt"), "old");
+        assert_eq!(inode(&w.path(".Trash/a.txt")), original);
+        assert_ne!(inode(&there), original);
+        let parked = w.path(".Trash/a.txt");
+        assert_eq!(
+            report.change.steps,
+            [
+                Step::Trashed {
+                    from: there.clone(),
+                    to: parked.clone()
+                },
+                created(there.clone())
+            ]
+        );
+
+        // One undo step: the original back where it was, the copy to the trash.
+        let mut history = History::default();
+        history.record(report.change);
+        history.undo(&w.trash).unwrap().unwrap();
+        assert_eq!(w.read("Into/a.txt"), "old");
+        assert_eq!(inode(&there), original);
+        assert_eq!(w.names("Into"), ["a.txt"]);
+        // The copy goes first, while the original still has its name there.
+        assert_eq!(w.names(".Trash"), ["a copy.txt"]);
+        assert_eq!(
+            w.read(".Trash/a copy.txt"),
+            "new",
+            "the copy waits there for redo"
+        );
+        // Redo replaces again; undo takes it back again.
+        history.redo(&w.trash).unwrap().unwrap();
+        assert_eq!(w.read("Into/a.txt"), "new");
+        assert_eq!(w.names(".Trash"), ["a.txt"]);
+        assert_eq!(inode(&w.path(".Trash/a.txt")), original);
+        history.undo(&w.trash).unwrap().unwrap();
+        assert_eq!(
+            (w.read("Into/a.txt"), inode(&there)),
+            ("old".to_string(), original)
+        );
+        assert_eq!(w.read(".Trash/a copy.txt"), "new");
+    }
+
+    #[test]
+    fn replace_while_moving_puts_the_item_there_and_undo_puts_both_back() {
+        let w = world();
+        let a = w.file("From/a.txt", "new");
+        let moving = inode(&a);
+        let into = w.folder("Into");
+        let there = w.file("Into/a.txt", "old");
+        let original = inode(&there);
+        let report = transfer(
+            std::slice::from_ref(&a),
+            &into,
+            true,
+            Collide::Replace,
+            &w.trash,
+            &go(),
+        );
+        assert_eq!((said(&report), report.done), (None, 1));
+        assert!(w.names("From").is_empty());
+        assert_eq!(
+            (w.read("Into/a.txt"), inode(&there)),
+            ("new".to_string(), moving)
+        );
+        assert_eq!(inode(&w.path(".Trash/a.txt")), original);
+
+        let mut history = History::default();
+        history.record(report.change);
+        history.undo(&w.trash).unwrap().unwrap();
+        assert_eq!(
+            (w.read("From/a.txt"), inode(&a)),
+            ("new".to_string(), moving)
+        );
+        assert_eq!(
+            (w.read("Into/a.txt"), inode(&there)),
+            ("old".to_string(), original)
+        );
+        assert!(w.names(".Trash").is_empty());
+        history.redo(&w.trash).unwrap().unwrap();
+        assert_eq!(inode(&there), moving);
+        assert_eq!(inode(&w.path(".Trash/a.txt")), original);
+    }
+
+    #[test]
+    fn replace_takes_a_whole_folder_to_the_trash_with_all_it_holds() {
+        let w = world();
+        let a = w.file("Box", "a file now");
+        let into = w.folder("Into");
+        w.file("Into/Box/kept.txt", "kept");
+        let report = transfer(&[a], &into, false, Collide::Replace, &w.trash, &go());
+        assert_eq!(said(&report), None);
+        assert_eq!(w.read("Into/Box"), "a file now");
+        assert_eq!(w.read(".Trash/Box/kept.txt"), "kept");
+    }
+
+    #[test]
+    fn skip_leaves_each_item_whose_name_is_taken_and_counts_it() {
+        let w = world();
+        let (a, b) = (w.file("a.txt", "new a"), w.file("b.txt", "new b"));
+        let into = w.folder("Into");
+        w.file("Into/a.txt", "old a");
+        let report = transfer(&[a, b], &into, true, Collide::Skip, &w.trash, &go());
+        assert_eq!(said(&report), None);
+        assert_eq!((report.done, report.declined, report.skipped), (1, 1, 0));
+        assert_eq!(w.read("Into/a.txt"), "old a");
+        assert_eq!(w.read("Into/b.txt"), "new b");
+        assert_eq!(
+            w.read("a.txt"),
+            "new a",
+            "the skipped one stays where it was"
+        );
+        assert!(!w.has("b.txt"));
+        assert!(w.names(".Trash").is_empty());
+    }
+
+    #[test]
+    fn replace_never_loses_the_one_there_when_the_new_one_cannot_go_in() {
+        let w = world();
+        let into = w.folder("Into");
+        let there = w.file("Into/a.txt", "old");
+        let original = inode(&there);
+
+        // An item that can't be read: the one there is put back as it was.
+        let locked = w.file("a.txt", "new");
+        fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+        let report = transfer(
+            std::slice::from_ref(&locked),
+            &into,
+            false,
+            Collide::Replace,
+            &w.trash,
+            &go(),
+        );
+        fs::set_permissions(&locked, Permissions::from_mode(0o644)).unwrap();
+        assert!(said(&report).is_some_and(|said| said.starts_with("Couldn't copy a.txt")));
+        assert_eq!(
+            (w.read("Into/a.txt"), inode(&there)),
+            ("old".to_string(), original)
+        );
+        assert!(w.names(".Trash").is_empty());
+        assert!(report.change.steps.is_empty());
+
+        // Replacing an item with itself changes nothing.
+        let report = transfer(
+            std::slice::from_ref(&there),
+            &into,
+            false,
+            Collide::Replace,
+            &w.trash,
+            &go(),
+        );
+        assert_eq!((said(&report), report.done, report.declined), (None, 0, 1));
+        assert_eq!(
+            (w.read("Into/a.txt"), inode(&there)),
+            ("old".to_string(), original)
+        );
+
+        // Nor can the one there go when it holds what replaces it.
+        let inner = w.file("Docs/Docs", "inside");
+        let docs = w.path("Docs");
+        let report = transfer(&[inner], &w.root, false, Collide::Replace, &w.trash, &go());
+        assert_eq!(
+            said(&report).as_deref(),
+            Some("Can't replace Docs: it holds Docs.")
+        );
+        assert_eq!(w.read("Docs/Docs"), "inside");
+        assert!(docs.is_dir());
+        assert!(w.names(".Trash").is_empty());
+    }
+
+    #[test]
+    fn replace_on_a_fat_disk_is_refused_before_anything_moves() {
+        let w = world();
+        let usb = w.folder("USB");
+        let _fat = Fat::at(usb.clone());
+        let there = w.file("USB/x.txt", "old");
+        w.file("USB/._x.txt", "my own notes");
+        let a = w.file("x.txt", "new");
+        let report = transfer(&[a], &usb, false, Collide::Replace, &w.trash, &go());
+        assert_eq!(
+            said(&report),
+            side_by_side("Couldn't copy", "x.txt", "x.txt")
+        );
+        assert_eq!(w.read("USB/x.txt"), "old");
+        assert_eq!(w.read("USB/._x.txt"), "my own notes");
+        assert!(there.exists());
+        assert!(w.names(".Trash").is_empty());
+        assert!(report.change.steps.is_empty());
     }
 }
