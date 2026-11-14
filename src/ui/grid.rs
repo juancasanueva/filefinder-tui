@@ -114,10 +114,7 @@ pub fn draw(
         return;
     }
     pane.offset = scroll(pane.offset, pane.cursor / columns, rows);
-    let query = pane
-        .results()
-        .map(|search| search.input.text())
-        .unwrap_or_default();
+    let query = pane.matching();
 
     let first = pane.offset * columns;
     for (index, entry) in pane.entries.iter().enumerate().skip(first) {

@@ -1,56 +1,174 @@
-//! Looking for items by name at and below a folder, on a thread of its own.
-//! No terminal types in here.
+//! Looking for items at and below a folder, on a thread of its own: by
+//! name for Find, by contents through `grep`, or every item below for the
+//! filter's subfolders. No terminal types in here.
 
 use std::collections::VecDeque;
 use std::fs::{self, Metadata};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 use crate::format::natural_cmp;
+use crate::matcher::{self, Query, Score, Tier};
 use crate::model::{self, Entry};
+pub use crate::system::Grep;
 
-/// How many matches a search lists before it stops looking.
+/// How many matches a search hands over before it stops looking; as many
+/// again of mere typos.
 pub const LIMIT: usize = 500;
+/// How many items the filter's subfolders take in at most.
+pub const BELOW_LIMIT: usize = 20_000;
+
+/// What a walk looks for.
+pub enum Looking {
+    /// Names that match, scored the way Find ranks them.
+    Names(Query),
+    /// Every item in the folders under the root, not the root's own.
+    Below,
+    /// Files whose contents hold the text, as the program that greps finds them.
+    Contents(Grep),
+}
+
+/// Something a walk found: the item, how well it matched, and its path
+/// below the folder looked in.
+pub struct Hit {
+    pub entry: Entry,
+    pub score: Score,
+    pub path: String,
+}
+
+/// Where a walk goes: the folder it starts in, the volumes it may enter
+/// and the folders it leaves out.
+#[derive(Clone, Debug)]
+pub struct Reach {
+    pub root: PathBuf,
+    devices: Vec<u64>,
+    skip: Vec<PathBuf>,
+}
+
+/// What a walk of everywhere leaves out: the system, the swap files and
+/// the other volumes.
+const NOWHERE: [&str; 5] = ["/System", "/private/var/vm", "/Volumes", "/dev", "/cores"];
+
+impl Reach {
+    /// A folder and the folders below it on its own volume.
+    pub fn volume(root: PathBuf) -> Self {
+        let devices = fs::metadata(&root)
+            .map(|meta| meta.dev())
+            .into_iter()
+            .collect();
+        Self {
+            root,
+            devices,
+            skip: Vec::new(),
+        }
+    }
+
+    /// Everything from `/` down on the system's volume and the home
+    /// folder's, leaving out the system itself, the swap files and other
+    /// volumes.
+    pub fn everywhere(home: &Path) -> Self {
+        let devices = [Path::new("/"), home]
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.dev()))
+            .collect();
+        Self {
+            root: PathBuf::from("/"),
+            devices,
+            skip: NOWHERE.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    /// Whether a walk goes into an item: a real folder, not a link to one,
+    /// on a volume it may enter and not left out.
+    pub fn enters(&self, path: &Path, meta: &Metadata) -> bool {
+        meta.is_dir()
+            && self.devices.contains(&meta.dev())
+            && !self.skip.iter().any(|skipped| skipped == path)
+    }
+
+    /// Where the program that greps starts, staying on one volume from
+    /// each: the root, or for everywhere each folder in it the walk enters.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        if self.skip.is_empty() {
+            return vec![self.root.clone()];
+        }
+        list(&self.root)
+            .into_iter()
+            .filter(|(_, path, meta)| self.enters(path, meta))
+            .map(|(_, path, _)| path)
+            .collect()
+    }
+}
 
 /// A search under way. Dropping it stops the walk.
 pub struct Walk {
     cancel: Arc<AtomicBool>,
-    found: Receiver<Entry>,
+    scanned: Arc<AtomicUsize>,
+    found: Receiver<Hit>,
 }
 
 impl Walk {
-    /// Starts looking at and below `root` for names that contain `text`.
-    pub fn start(root: PathBuf, text: &str, show_hidden: bool) -> Self {
+    /// Starts looking through `reach` for what `looking` asks.
+    pub fn start(reach: Reach, looking: Looking, show_hidden: bool) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
+        let scanned = Arc::new(AtomicUsize::new(0));
         let (sender, found) = mpsc::channel();
-        let flag = cancel.clone();
-        let text = text.to_string();
+        let (flag, count) = (cancel.clone(), scanned.clone());
         // Without its thread the walk is over at once, having found nothing.
         let _ = thread::Builder::new()
             .name("search".to_string())
             .spawn(move || {
                 // Nobody listening any more means the search was left.
-                let mut hand_over = |entry| sender.send(entry).is_ok();
-                walk(&root, &text, show_hidden, &flag, &mut hand_over);
+                let mut hand_over = |hit| sender.send(hit).is_ok();
+                match looking {
+                    Looking::Contents(grep) => {
+                        let root = reach.root.clone();
+                        let mut found = |path: PathBuf| match Entry::from_path(path) {
+                            // One that went since it was found is simply not found.
+                            Err(_) => true,
+                            Ok(entry) => {
+                                count.fetch_add(1, Ordering::Relaxed);
+                                let path = shown_below(&root, &entry.path);
+                                let score = Score {
+                                    tier: Tier::Exact,
+                                    bonus: 0,
+                                };
+                                hand_over(Hit { entry, score, path })
+                            }
+                        };
+                        // What failed found nothing more.
+                        let _ = grep(&mut found, &flag);
+                    }
+                    looking => walk(&reach, &looking, show_hidden, &flag, &count, &mut hand_over),
+                }
             });
-        Self { cancel, found }
+        Self {
+            cancel,
+            scanned,
+            found,
+        }
     }
 
     /// What was found since the last time, nearest first, and whether the
     /// walk is over.
-    pub fn collect(&mut self) -> (Vec<Entry>, bool) {
-        let mut entries = Vec::new();
+    pub fn collect(&mut self) -> (Vec<Hit>, bool) {
+        let mut hits = Vec::new();
         loop {
             match self.found.try_recv() {
-                Ok(entry) => entries.push(entry),
-                Err(TryRecvError::Empty) => return (entries, false),
-                Err(TryRecvError::Disconnected) => return (entries, true),
+                Ok(hit) => hits.push(hit),
+                Err(TryRecvError::Empty) => return (hits, false),
+                Err(TryRecvError::Disconnected) => return (hits, true),
             }
         }
+    }
+
+    /// How many items the walk has looked at so far.
+    pub fn scanned(&self) -> usize {
+        self.scanned.load(Ordering::Relaxed)
     }
 }
 
@@ -61,24 +179,33 @@ impl Drop for Walk {
     }
 }
 
-/// Goes through `root` one level at a time, so that nearer items come
-/// first, and hands over every item whose name contains `text`, whatever
-/// the case. It ends after [`LIMIT`] matches, when `cancel` is set or when
-/// `found` says nobody is listening.
+/// A path below the root, the way a result names it.
+fn shown_below(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// Goes through the reach one level at a time, so that nearer items come
+/// first, counting every item it looks at in `scanned`, and hands over
+/// what `looking` asks for. It ends after its limit, when `cancel` is set
+/// or when `found` says nobody is listening.
 fn walk(
-    root: &Path,
-    text: &str,
+    reach: &Reach,
+    looking: &Looking,
     show_hidden: bool,
     cancel: &AtomicBool,
-    found: &mut dyn FnMut(Entry) -> bool,
+    scanned: &AtomicUsize,
+    found: &mut dyn FnMut(Hit) -> bool,
 ) {
-    let Ok(device) = fs::metadata(root).map(|meta| meta.dev()) else {
-        return;
+    let mut folders = VecDeque::from([(reach.root.clone(), 0usize)]);
+    let (mut matches, mut typos) = (0, 0);
+    let anything = Score {
+        tier: Tier::Exact,
+        bonus: 0,
     };
-    let text = text.to_lowercase();
-    let mut folders = VecDeque::from([root.to_path_buf()]);
-    let mut matches = 0;
-    while let Some(folder) = folders.pop_front() {
+    while let Some((folder, depth)) = folders.pop_front() {
         for (name, path, meta) in list(&folder) {
             if cancel.load(Ordering::Relaxed) {
                 return;
@@ -87,17 +214,43 @@ fn walk(
             if !show_hidden && model::is_hidden(&name, &meta) {
                 continue;
             }
+            scanned.fetch_add(1, Ordering::Relaxed);
+            let below = shown_below(&reach.root, &path);
+            let score = match looking {
+                Looking::Names(query) => matcher::score(query, &name, &below),
+                _ if depth > 0 => Some(anything),
+                _ => None,
+            };
             // One that went since the folder was listed is simply not found.
-            if name.to_lowercase().contains(&text)
+            if let Some(score) = score
                 && let Ok(entry) = Entry::from_path(path.clone())
             {
-                matches += 1;
-                if !found(entry) || matches == LIMIT {
+                let count = if score.tier == Tier::Typo {
+                    &mut typos
+                } else {
+                    &mut matches
+                };
+                *count += 1;
+                let limit = match looking {
+                    Looking::Below => BELOW_LIMIT,
+                    _ => LIMIT,
+                };
+                let full = *count > limit;
+                if !full
+                    && !found(Hit {
+                        entry,
+                        score,
+                        path: below,
+                    })
+                {
+                    return;
+                }
+                if matches >= limit {
                     return;
                 }
             }
-            if enters(&meta, device) {
-                folders.push_back(path);
+            if reach.enters(&path, &meta) {
+                folders.push_back((path, depth + 1));
             }
         }
     }
@@ -118,12 +271,6 @@ fn list(folder: &Path) -> Vec<(String, PathBuf, Metadata)> {
         .collect();
     listed.sort_by(|(a, ..), (b, ..)| natural_cmp(a, b));
     listed
-}
-
-/// Whether the walk goes into an item: a real folder, not a link to one,
-/// on the volume the walk started on.
-fn enters(meta: &Metadata, device: u64) -> bool {
-    meta.is_dir() && meta.dev() == device
 }
 
 #[cfg(test)]
@@ -151,14 +298,26 @@ mod tests {
         entry.path.strip_prefix(root).unwrap().display().to_string()
     }
 
+    fn names(text: &str) -> Looking {
+        Looking::Names(Query::new(text).unwrap())
+    }
+
     /// Everything a walk finds, in the order it finds it, as paths below `root`.
     fn find(root: &Path, text: &str, show_hidden: bool) -> Vec<String> {
         let mut found = Vec::new();
         let cancel = AtomicBool::new(false);
-        walk(root, text, show_hidden, &cancel, &mut |entry| {
-            found.push(below(root, &entry));
-            true
-        });
+        let reach = Reach::volume(root.to_path_buf());
+        walk(
+            &reach,
+            &names(text),
+            show_hidden,
+            &cancel,
+            &AtomicUsize::new(0),
+            &mut |hit| {
+                found.push(below(root, &hit.entry));
+                true
+            },
+        );
         found
     }
 
@@ -196,10 +355,19 @@ mod tests {
         // What is found is an entry like a folder's own: a folder is a folder.
         let mut folders = Vec::new();
         let cancel = AtomicBool::new(false);
-        walk(dir.path(), "photo", false, &cancel, &mut |entry| {
-            folders.push(entry.is_dir);
-            true
-        });
+        let reach = Reach::volume(dir.path().to_path_buf());
+        let scanned = AtomicUsize::new(0);
+        walk(
+            &reach,
+            &names("photo"),
+            false,
+            &cancel,
+            &scanned,
+            &mut |hit| {
+                folders.push(hit.entry.is_dir);
+                true
+            },
+        );
         assert_eq!(folders, [true, true, false]);
     }
 
@@ -263,11 +431,20 @@ mod tests {
         let count = |cancelled: bool, stop_after_one: bool, refuse: bool| {
             let cancel = AtomicBool::new(cancelled);
             let mut found = 0;
-            walk(dir.path(), "match", false, &cancel, &mut |_| {
-                found += 1;
-                cancel.store(stop_after_one, Ordering::Relaxed);
-                !refuse
-            });
+            let reach = Reach::volume(dir.path().to_path_buf());
+            let scanned = AtomicUsize::new(0);
+            walk(
+                &reach,
+                &names("match"),
+                false,
+                &cancel,
+                &scanned,
+                &mut |_| {
+                    found += 1;
+                    cancel.store(stop_after_one, Ordering::Relaxed);
+                    !refuse
+                },
+            );
             found
         };
         assert_eq!(count(false, false, false), 3);
@@ -280,26 +457,28 @@ mod tests {
     fn the_walk_only_goes_into_real_folders_on_the_volume_it_started_on() {
         let dir = tree(&["folder/", "file.txt"]);
         symlink(dir.path().join("folder"), dir.path().join("link")).unwrap();
-        let device = fs::metadata(dir.path()).unwrap().dev();
+        let reach = Reach::volume(dir.path().to_path_buf());
         let on_disk = |name: &str| fs::symlink_metadata(dir.path().join(name)).unwrap();
-        assert!(enters(&on_disk("folder"), device));
-        assert!(!enters(&on_disk("file.txt"), device));
-        assert!(!enters(&on_disk("link"), device));
+        let enters = |name: &str| reach.enters(&dir.path().join(name), &on_disk(name));
+        assert!(enters("folder"));
+        assert!(!enters("file.txt"));
+        assert!(!enters("link"));
         // The devices' folder is a volume of its own, mounted on the system's.
         let other = fs::metadata("/dev").unwrap();
-        assert_ne!(other.dev(), device);
-        assert!(other.is_dir() && !enters(&other, device));
+        assert_ne!(other.dev(), fs::metadata(dir.path()).unwrap().dev());
+        assert!(other.is_dir() && !reach.enters(Path::new("/dev"), &other));
     }
 
     #[test]
     fn a_walk_hands_over_what_it_finds_until_it_says_it_is_done() {
         let dir = tree(&["a/report.txt", "report.txt", "b/c/report.txt"]);
-        let mut walk = Walk::start(dir.path().to_path_buf(), "REPORT", false);
+        let reach = Reach::volume(dir.path().to_path_buf());
+        let mut walk = Walk::start(reach, names("REPORT"), false);
         let mut found = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let (entries, finished) = walk.collect();
-            found.extend(entries.iter().map(|entry| below(dir.path(), entry)));
+            found.extend(entries.iter().map(|hit| below(dir.path(), &hit.entry)));
             if finished {
                 break;
             }
@@ -315,7 +494,8 @@ mod tests {
     #[test]
     fn dropping_a_walk_ends_its_thread() {
         let dir = tree(&["a/b/c/d/e/report.txt"]);
-        let walk = Walk::start(dir.path().to_path_buf(), "report", false);
+        let reach = Reach::volume(dir.path().to_path_buf());
+        let walk = Walk::start(reach, names("report"), false);
         // The thread holds the other end of this flag for as long as it runs.
         let flag = walk.cancel.clone();
         drop(walk);
@@ -325,5 +505,110 @@ mod tests {
             assert!(Instant::now() < deadline, "the thread is still running");
             thread::sleep(Duration::from_millis(2));
         }
+    }
+    /// Lets a walk run to its end: everything it handed over, and how many
+    /// items it scanned.
+    fn settle(mut walk: Walk) -> (Vec<Hit>, usize) {
+        let mut found = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (hits, finished) = walk.collect();
+            found.extend(hits);
+            if finished {
+                return (found, walk.scanned());
+            }
+            assert!(Instant::now() < deadline, "the walk never finished");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_walk_scores_what_it_finds_and_counts_what_it_scanned() {
+        let dir = tree(&[
+            "Trip/day-trip.jpg",
+            "trip-plan.md",
+            "daytrip.txt",
+            "tirp.txt",
+            "x.txt",
+        ]);
+        let reach = Reach::volume(dir.path().to_path_buf());
+        let (hits, scanned) = settle(Walk::start(reach, names("trip"), false));
+        let tiers: Vec<(String, Tier)> = hits
+            .iter()
+            .map(|hit| (hit.path.clone(), hit.score.tier))
+            .collect();
+        assert_eq!(
+            tiers,
+            [
+                ("daytrip.txt".to_string(), Tier::Subsequence),
+                ("tirp.txt".to_string(), Tier::Typo),
+                ("Trip".to_string(), Tier::Exact),
+                ("trip-plan.md".to_string(), Tier::Prefix),
+                ("Trip/day-trip.jpg".to_string(), Tier::WordStart),
+            ]
+        );
+        assert_eq!(scanned, 6, "every item it looked at");
+    }
+
+    #[test]
+    fn below_hands_over_every_item_in_the_folders_under_the_root_but_not_its_own() {
+        let dir = tree(&["a/one.txt", "a/b/two.txt", "top.txt", ".hid/three.txt"]);
+        let reach = Reach::volume(dir.path().to_path_buf());
+        let (hits, _) = settle(Walk::start(reach.clone(), Looking::Below, false));
+        let found: Vec<&str> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(found, ["a/b", "a/one.txt", "a/b/two.txt"]);
+        let (hits, _) = settle(Walk::start(reach, Looking::Below, true));
+        assert_eq!(hits.len(), 4, "with hidden items shown");
+    }
+
+    #[test]
+    fn contents_hands_over_what_grep_found_that_is_still_there() {
+        let dir = tree(&["notes.txt", "deep/plan.md"]);
+        let root = dir.path().to_path_buf();
+        let paths = vec![
+            root.join("deep/plan.md"),
+            root.join("gone.txt"),
+            root.join("notes.txt"),
+        ];
+        let grep: Grep = Box::new(move |found, _stop| {
+            for path in paths {
+                if !found(path) {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        let (hits, _) = settle(Walk::start(
+            Reach::volume(root),
+            Looking::Contents(grep),
+            false,
+        ));
+        let found: Vec<&str> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(found, ["deep/plan.md", "notes.txt"]);
+    }
+
+    #[test]
+    fn everywhere_starts_at_the_root_and_leaves_out_the_system_and_other_volumes() {
+        let home = tempfile::tempdir().unwrap();
+        let reach = Reach::everywhere(home.path());
+        assert_eq!(reach.root, Path::new("/"));
+        let enters = |path: &str| {
+            let meta = fs::symlink_metadata(path).unwrap();
+            reach.enters(Path::new(path), &meta)
+        };
+        assert!(!enters("/System"));
+        assert!(!enters("/dev"));
+        assert!(!enters("/Volumes"));
+        assert!(enters("/usr"));
+        // The home folder's volume is walked too, wherever it is mounted.
+        assert!(reach.enters(home.path(), &fs::metadata(home.path()).unwrap()));
+        let roots = reach.roots();
+        assert!(roots.contains(&PathBuf::from("/usr")));
+        for skipped in ["/System", "/dev", "/Volumes"] {
+            assert!(!roots.contains(&PathBuf::from(skipped)), "{skipped}");
+        }
+        // One folder's reach is the folder alone.
+        let folder = Reach::volume(home.path().to_path_buf());
+        assert_eq!(folder.roots(), [home.path().to_path_buf()]);
     }
 }

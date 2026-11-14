@@ -1,24 +1,18 @@
 //! The header: where the pane is on the left, the parent part muted and the
-//! folder itself in the foreground, and the sort order on the right. The
-//! search field follows the path.
+//! folder itself in the foreground, and the sort order on the right.
 
 use std::path::Path;
 
 use ratatui::Frame;
-use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::{fit, pad};
-use crate::app::{App, Field, HitMap, Spot};
-use crate::input::Input;
+use crate::app::{App, HitMap, Spot};
 use crate::model::SortMode;
 use crate::theme;
-
-/// The widest the search field gets, and the room the path leaves it.
-const SEARCH_WIDTH: u16 = 30;
 
 /// The sort order as the header says it: the key, then `▴` ascending or
 /// `▾` reversed.
@@ -101,26 +95,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         x += cells;
     }
 
-    if let Some(search) = app.pane().search() {
-        // A search keeps room for its field: the path gives way first.
-        let kept = (SEARCH_WIDTH + 2) as usize;
-        let crumbs_width = path_width.saturating_sub(kept);
-        let spans = crumbs(app, app.active(), crumbs_width, true, left, hits);
-        let used = spans.iter().map(|span| span.content.width()).sum::<usize>() as u16;
-        frame.render_widget(Paragraph::new(Line::from(spans)), left);
-        let x = left.x + used + 2;
-        let room = Rect {
-            x,
-            width: SEARCH_WIDTH.min(left.right().saturating_sub(x)),
-            ..left
-        };
-        let typing = matches!(app.field, Some(Field::Search));
-        field(frame, room, "/", &search.input, typing);
-        hits.add(room, Spot::SearchField);
-    } else {
-        let spans = crumbs(app, app.active(), path_width, true, left, hits);
-        frame.render_widget(Paragraph::new(Line::from(spans)), left);
-    }
+    let spans = crumbs(app, app.active(), path_width, true, left, hits);
+    frame.render_widget(Paragraph::new(Line::from(spans)), left);
 
     let sort_area = Rect::new(
         area.right().saturating_sub(1 + sort_width as u16),
@@ -222,26 +198,6 @@ fn crumbs(
     ]
 }
 
-/// A field in the header: what is being typed after its `lead`, with the
-/// terminal's cursor in it while it has the keyboard.
-fn field(frame: &mut Frame, area: Rect, lead: &str, input: &Input, typing: bool) {
-    let before = lead.width() as u16;
-    if area.width <= before {
-        return;
-    }
-    let (text, column) = input.window((area.width - before) as usize);
-    let shown = pad(&format!("{lead}{text}"), area.width as usize);
-    let style: Style = if typing {
-        theme::field()
-    } else {
-        theme::on(theme::MUTED, theme::FIELD)
-    };
-    frame.render_widget(Paragraph::new(shown).style(style), area);
-    if typing {
-        frame.set_cursor_position(Position::new(area.x + before + column, area.y));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::app::testing::{finish_search, fixture, press, type_text};
@@ -311,41 +267,18 @@ mod tests {
     }
 
     #[test]
-    fn slash_puts_a_field_after_the_path_of_the_folder_being_searched() {
+    fn find_leaves_the_header_to_the_path_of_the_folder_being_searched() {
         let mut f = fixture();
         press(
             &mut f.app,
-            &[KeyCode::Down, KeyCode::Enter, KeyCode::Char('/')],
+            &[KeyCode::Down, KeyCode::Enter, KeyCode::Char('f')],
         );
-        // Open and empty: the folder's path, then the field.
-        let drawn = buffer(&mut f.app, 120, 24);
-        assert_eq!(find(&drawn, "~/Pictures  / ", 0..120), Some((1, 0)));
-        assert_eq!(cursor(&mut f.app, 120, 24), (14, 0));
-
         type_text(&mut f.app, "jp");
         finish_search(&mut f.app);
         let drawn = buffer(&mut f.app, 120, 24);
-        assert_eq!(find(&drawn, "~/Pictures  /jp ", 0..120), Some((1, 0)));
-        assert_eq!(drawn[(3, 0)].fg, theme::FOREGROUND, "Pictures");
-        assert_eq!(drawn[(11, 0)].bg, ratatui::style::Color::Reset, "the gap");
-        for x in [13, 14, 30] {
-            assert_eq!(drawn[(x, 0)].fg, theme::FOREGROUND, "{x}");
-            assert_eq!(drawn[(x, 0)].bg, theme::FIELD, "{x}");
-        }
-        assert_eq!(cursor(&mut f.app, 120, 24), (16, 0), "after what was typed");
-
-        // With the keyboard on what was found the field stays, muted.
-        press(&mut f.app, &[KeyCode::Tab]);
-        let drawn = buffer(&mut f.app, 120, 24);
-        assert_eq!(find(&drawn, "~/Pictures  /jp ", 0..120), Some((1, 0)));
-        assert_eq!(drawn[(13, 0)].fg, theme::MUTED);
-        assert_eq!(drawn[(13, 0)].bg, theme::FIELD);
-
-        // Left, it is gone.
-        press(&mut f.app, &[KeyCode::Esc]);
-        let drawn = buffer(&mut f.app, 120, 24);
-        assert_eq!(find(&drawn, "/jp", 0..120), None);
-        assert_eq!(drawn[(13, 0)].bg, ratatui::style::Color::Reset);
+        assert_eq!(find(&drawn, "~/Pictures ", 0..120), Some((1, 0)));
+        assert_eq!(find(&drawn, "Find jp", 0..120), Some((1, 23)));
+        assert_eq!(cursor(&mut f.app, 120, 24), (8, 23), "on the bottom row");
     }
 
     #[test]

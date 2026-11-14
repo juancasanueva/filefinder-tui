@@ -82,7 +82,7 @@ impl SortMode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Entry {
     pub name: String,
     pub path: PathBuf,

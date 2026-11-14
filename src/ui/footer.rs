@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
-use super::fit;
+use super::{fit, prompt};
 use crate::app::App;
 use crate::format;
 use crate::theme;
@@ -78,10 +78,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::base()), area);
 }
 
-/// How many items, or how many are selected and their size; then the file
-/// work under way or what was last said.
+/// How many items, or how many are selected and their size, or what the
+/// filter shows, or what Find found; then the file work under way or what
+/// was last said.
 fn left_runs(app: &App) -> Vec<Run> {
     let pane = app.pane();
+    let mut runs = lead(app);
     let total = pane.entries.len();
     let marked: Vec<_> = (0..total).filter(|index| pane.is_marked(*index)).collect();
     let count = if marked.is_empty() {
@@ -99,7 +101,9 @@ fn left_runs(app: &App) -> Vec<Run> {
             format::size(bytes)
         )
     };
-    let mut runs = vec![run(count, theme::base(), 0)];
+    if runs.is_empty() || (pane.search().is_some() && !marked.is_empty()) {
+        runs.insert(0, run(count, theme::base(), 0));
+    }
     if let Some(label) = app.working() {
         runs.push(run(label.to_string(), theme::base(), 2));
     } else if let Some(message) = &app.message {
@@ -114,4 +118,32 @@ fn left_runs(app: &App) -> Vec<Run> {
         }
     }
     runs
+}
+
+/// flea's runs for a filter, muted `Filter q` and what it shows; or for
+/// what Find found, how many (and how many items it looked at while it
+/// looks), then muted what it looked for and where. None otherwise.
+fn lead(app: &App) -> Vec<Run> {
+    let pane = app.pane();
+    if let Some(filter) = pane.filter() {
+        let query = format!("Filter {}", filter.input.text());
+        return vec![
+            run(query, theme::muted(), 0),
+            run(prompt::shown(app), theme::base(), 2),
+        ];
+    }
+    let Some(search) = pane.results() else {
+        return Vec::new();
+    };
+    let query = search.input.text();
+    let found = pane.entries.len();
+    let said = if search.is_running() {
+        format!("{found} found · {} scanned", search.scanned)
+    } else if found == 0 {
+        format!("Nothing matches {query}")
+    } else {
+        format!("{found} found")
+    };
+    let looked = format!("Find “{query}” {}", app.scope_label(search));
+    vec![run(said, theme::base(), 2), run(looked, theme::muted(), 2)]
 }

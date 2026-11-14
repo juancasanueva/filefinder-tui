@@ -12,7 +12,7 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 - **Trash**: `~/.Trash`, with Restore and Empty Trash in its menu; reach it with `:`.
 - **File operations** that never overwrite: copy, cut, paste, duplicate, rename, new folder, compress, edit in `$EDITOR`, move to the trash, and delete permanently after asking. Everything except a permanent delete can be undone.
 - **Two panes** with Ctrl+4, `|` or Alt+1 to move things between folders (`y`/`x` in one, `p` or `M` in the other); the same key goes back to the view you came from.
-- **Search** this folder and below with `/`, or go to a path with `:`.
+- **Filter and Find**, both typed on the bottom row. The filter (`/`) narrows the folder you are looking at as you type: part of a name in any case, or a `*` / `?` pattern; close matches (a letter or two off, depending on how long the text is) show only when nothing matches exactly. Tab widens it to every folder below. Find (`f` or Ctrl+F) walks the folders below and ranks what it finds: the whole name, then its start, the start of a word, the letters in order, and typos last. Tab looks in this folder, home, or everywhere; Ctrl+G looks inside files instead, through [ripgrep](https://github.com/BurntSushi/ripgrep) when it is installed. Go to a path with `:`.
 - **Mouse friendly**: click, double-click, right-click for the menu, Shift+click for a range.
 
 ## Requirements
@@ -70,9 +70,12 @@ flea's own terminal keys. Digits are never counts.
 | ⏎ | Open |
 | `H` / `L` | Back, forward |
 | Tab | The list and the preview, or the two panes |
-| Escape | Close or go back: an error, the search, the file work under way, the marks |
+| Escape | Close or go back: an error, the filter, Find (its walk first), the file work under way, the marks |
 | `:`, Ctrl+L | Go to a place (Tab completes) |
-| `/`, `f`, Ctrl+F | Search this folder and below |
+| `/` | Filter this folder; in the field Tab adds its subfolders, ⏎ or ↓ keeps the filter, Escape clears it, Ctrl+A marks what it shows |
+| `f`, Ctrl+F | Find below this folder; in the field Tab changes where (this folder, home, everywhere), ⏎ or ↓ moves into what it found |
+| Ctrl+G | In Find's field: names or what files hold (needs `rg`) |
+| `o` | Show what Find found under the cursor in its own folder |
 | Space | Quick Look |
 | `.` | Show hidden files |
 | `s` / `S` | Next sort key (name, size, modified, kind) / reverse the sort |
@@ -121,6 +124,7 @@ With the mouse on, select text in the terminal with its own modifier: Shift-drag
 
 - Listing `~/.Trash` needs Full Disk Access for your terminal (System Settings → Privacy & Security). Moving things into it works without it.
 - On FAT-formatted drives macOS keeps file attributes in `._name` files. A file `name` and a file of your own called `._name` can't sit side by side there, so FileFinder refuses that operation instead of letting macOS replace your file.
+- Find stops after 500 matches. Everywhere means `/` on the system's volume and the home folder's, leaving out `/System`, `/private/var/vm`, `/Volumes`, `/dev` and `/cores`; links to folders are never followed. The filter's subfolders take in at most 20,000 items.
 - Not included: copying and pasting with other apps through the system clipboard, Open With, sharing, ejecting drives, drag and drop, and the mouse's back and forward buttons.
 
 ## Development

@@ -13,6 +13,7 @@ use crate::app::{App, Detail, HitMap, Pane, Spot};
 use crate::format;
 use crate::format::DateStyle;
 use crate::icons;
+use crate::matcher::Query;
 use crate::model::{self, Entry};
 use crate::theme;
 
@@ -115,38 +116,43 @@ pub fn inks(entry: &Entry, look: Look) -> (Color, Color) {
     (ink, meta)
 }
 
-/// A name in pieces, what `query` matches in it bold.
+/// A name in pieces, what `query` matches in it bold: the filter's match,
+/// exact or close, or what Find looked for. A name cut short keeps what of
+/// it shows.
 pub fn bold_match(name: &str, query: &str, style: Style) -> Vec<Span<'static>> {
-    match match_range(name, query) {
-        Some((start, end)) => vec![
-            Span::styled(name[..start].to_string(), style),
-            Span::styled(
-                name[start..end].to_string(),
-                style.add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(name[end..].to_string(), style),
-        ],
-        None => vec![Span::styled(name.to_string(), style)],
+    let bold = bold_chars(name, query);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = (String::new(), false);
+    for (index, c) in name.chars().enumerate() {
+        let lit = bold.contains(&index);
+        if lit != run.1 && !run.0.is_empty() {
+            let text = std::mem::take(&mut run.0);
+            spans.push(styled(text, style, run.1));
+        }
+        run = (std::mem::take(&mut run.0), lit);
+        run.0.push(c);
+    }
+    spans.push(styled(run.0, style, run.1));
+    spans
+}
+
+fn styled(text: String, style: Style, bold: bool) -> Span<'static> {
+    match bold {
+        true => Span::styled(text, style.add_modifier(Modifier::BOLD)),
+        false => Span::styled(text, style),
     }
 }
 
-/// Where `query` first appears in `text`, whatever the case, as byte offsets.
-fn match_range(text: &str, query: &str) -> Option<(usize, usize)> {
-    if query.is_empty() {
-        return None;
-    }
-    let lower: Vec<(usize, char)> = text
-        .char_indices()
-        .flat_map(|(at, c)| c.to_lowercase().map(move |lower| (at, lower)))
-        .collect();
-    let wanted: Vec<char> = query.to_lowercase().chars().collect();
-    let start = lower
-        .windows(wanted.len())
-        .position(|window| window.iter().map(|(_, c)| *c).eq(wanted.iter().copied()))?;
-    let first = lower[start].0;
-    let last = lower[start + wanted.len() - 1].0;
-    let end = last + text[last..].chars().next().map_or(0, char::len_utf8);
-    Some((first, end))
+/// Which characters of a name `query` matches, by place.
+fn bold_chars(name: &str, query: &str) -> Vec<usize> {
+    let Some(query) = Query::new(query) else {
+        return Vec::new();
+    };
+    let shown = name.trim_end_matches('…');
+    let runs = query.runs(shown);
+    runs.iter()
+        .flat_map(|run| run.start..run.start + run.len)
+        .collect()
 }
 
 /// Draws one pane's items as rows; `focused` is whether it has the keyboard.
@@ -171,11 +177,7 @@ pub fn draw(
     }
     pane.offset = scroll(pane.offset, pane.cursor, rows);
 
-    let query = pane
-        .results()
-        .map(|search| search.input.text())
-        .unwrap_or_default();
-    let searched = pane.results().is_some();
+    let query = pane.matching();
     let width = area.width as usize;
     let mut lines = Vec::new();
     for (item, entry) in pane.entries.iter().enumerate().skip(pane.offset).take(rows) {
@@ -191,14 +193,8 @@ pub fn draw(
             marked: pane.is_marked(item),
             ..Look::default()
         };
-        // What a search found says which folder below the searched one it is in.
-        let folder = entry
-            .path
-            .parent()
-            .filter(|_| searched)
-            .and_then(|parent| parent.strip_prefix(&pane.cwd).ok())
-            .map(|folder| folder.display().to_string())
-            .filter(|folder| !folder.is_empty());
+        // What was found below says which folder it is in.
+        let folder = pane.place_of(entry);
         let value = detail_text(entry, detail, now, style);
         lines.push(row(
             entry,
@@ -269,7 +265,7 @@ pub fn empty(frame: &mut Frame, area: Rect, pane: &Pane, caption: usize) {
     if text.is_empty() {
         return;
     }
-    let glyph = if pane.results().is_some() {
+    let glyph = if !pane.matching().is_empty() {
         icons::mark(icons::SEARCH, "›")
     } else {
         icons::mark(icons::FOLDER, "›")
@@ -350,10 +346,35 @@ mod tests {
     }
 
     #[test]
-    fn what_the_query_matches_is_found_whatever_its_case() {
-        assert_eq!(match_range("Harbour.JPG", "jpg"), Some((8, 11)));
-        assert_eq!(match_range("café menu", "É M"), Some((3, 7)));
-        assert_eq!(match_range("notes", ""), None);
-        assert_eq!(match_range("notes", "x"), None);
+    fn what_the_query_matches_is_bold_whatever_its_case_and_however_close() {
+        let bold = |name: &str, query: &str| -> Vec<(String, bool)> {
+            let spans = bold_match(name, query, Style::default());
+            let lit = |span: &Span| span.style.add_modifier.contains(Modifier::BOLD);
+            spans
+                .iter()
+                .map(|span| (span.content.to_string(), lit(span)))
+                .collect()
+        };
+        let pieces = |pieces: &[(&str, bool)]| -> Vec<(String, bool)> {
+            pieces
+                .iter()
+                .map(|(text, lit)| (text.to_string(), *lit))
+                .collect()
+        };
+        assert_eq!(
+            bold("Harbour.JPG", "jpg"),
+            pieces(&[("Harbour.", false), ("JPG", true)])
+        );
+        assert_eq!(
+            bold("café menu", "É M"),
+            pieces(&[("caf", false), ("é m", true), ("enu", false)])
+        );
+        assert_eq!(bold("notes", ""), pieces(&[("notes", false)]));
+        assert_eq!(bold("notes", "x"), pieces(&[("notes", false)]));
+        // A close match lights its letters.
+        assert_eq!(
+            bold("a_b", "ab"),
+            pieces(&[("a", true), ("_", false), ("b", true)])
+        );
     }
 }

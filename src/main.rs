@@ -4,6 +4,7 @@ mod app;
 mod format;
 mod icons;
 mod input;
+mod matcher;
 mod model;
 mod ops;
 mod search;

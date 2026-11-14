@@ -23,10 +23,13 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Tab", "Move between the list and the preview, or the panes"),
     (
         "Escape",
-        "Close or go back: error, search, file work, marks",
+        "Close or go back: error, filter, find, file work, marks",
     ),
     (": / Ctrl+L", "Go to a place (Tab completes)"),
-    ("/ or f", "Search this folder and below"),
+    ("/", "Filter this folder (Tab: and its subfolders)"),
+    ("f / Ctrl+F", "Find below this folder (Tab: where)"),
+    ("Ctrl+G", "In Find: names or what files hold"),
+    ("o", "Show what Find found in its folder"),
     ("Space", "Quick Look the file"),
     (".", "Show hidden files"),
     ("s / S", "Next sort key / reverse the sort"),
@@ -264,17 +267,37 @@ mod tests {
         assert!(screens[0].contains("↓ more"));
         // Too long for one line here, it goes on under itself.
         let wrapped = screens.iter().any(|shown| {
-            shown.contains("Close or go back: error, search, file")
-                && !shown.contains("file work,")
-                && shown.contains("work, marks")
+            shown.contains("Close or go back: error, filter, find,")
+                && !shown.contains("find, file")
+                && shown.contains("file work, marks")
         });
         assert!(wrapped);
     }
 
     #[test]
+    fn the_filter_and_find_keys_are_among_the_shortcuts() {
+        let does = |keys: &str| SHORTCUTS.iter().find(|(k, _)| *k == keys).map(|(_, d)| *d);
+        assert_eq!(
+            does("/"),
+            Some("Filter this folder (Tab: and its subfolders)")
+        );
+        assert_eq!(
+            does("f / Ctrl+F"),
+            Some("Find below this folder (Tab: where)")
+        );
+        assert_eq!(does("Ctrl+G"), Some("In Find: names or what files hold"));
+        assert_eq!(does("o"), Some("Show what Find found in its folder"));
+        let escape = does("Escape").unwrap();
+        assert_eq!(
+            escape,
+            "Close or go back: error, filter, find, file work, marks"
+        );
+    }
+
+    #[test]
     fn a_window_tall_enough_shows_them_all_at_once_as_before() {
         let mut f = fixture();
-        let screens = read_through(&mut f.app, 120, 50);
+        let screens = read_through(&mut f.app, 120, 53);
         assert_eq!(screens.len(), 1, "nothing to scroll");
         assert!(!screens[0].contains("more"));
         for (keys, does) in SHORTCUTS {

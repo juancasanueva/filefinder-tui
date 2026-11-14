@@ -129,6 +129,8 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
         prompt::question(frame, question, footer);
     } else if let Some(open) = &app.prompt {
         prompt::draw(frame, open, footer);
+    } else if let Some(field) = &app.field {
+        prompt::draw_field(frame, app, field, footer);
     } else {
         footer::draw(frame, app, footer);
     }
@@ -302,11 +304,16 @@ pub const CAPTIONS: [&str; crate::app::CAPTIONS] =
 
 /// What a view says in place of the items of a pane that has none.
 pub fn empty_text(pane: &Pane, caption: usize) -> String {
-    match pane.results() {
+    let running = match (pane.search(), pane.filter()) {
+        (Some(search), _) => search.is_running(),
+        (_, Some(filter)) => filter.is_running(),
+        _ => false,
+    };
+    match pane.matching() {
+        query if query.is_empty() => CAPTIONS[caption % CAPTIONS.len()].to_string(),
         // Still looking: it may find some yet.
-        Some(search) if search.is_running() => String::new(),
-        Some(search) => format!("NOTHING MATCHES {}", search.input.text()),
-        None => CAPTIONS[caption % CAPTIONS.len()].to_string(),
+        _ if running => String::new(),
+        query => format!("NOTHING MATCHES {query}"),
     }
 }
 
@@ -715,7 +722,7 @@ mod tests {
     fn what_a_search_matches_is_bold_and_where_it_was_found_follows_the_name() {
         let mut f = in_pictures();
         fs::write(f.home.join("Pictures").join("Trip").join("day.jpg"), "").unwrap();
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         type_text(&mut f.app, "JP");
         finish_search(&mut f.app);
         let drawn = buffer(&mut f.app, 120, 30);
@@ -728,6 +735,47 @@ mod tests {
         let (x, y) = find(&drawn, "day.jpg", 26..73).unwrap();
         assert_eq!(find(&drawn, "day.jpg Trip", 26..73), Some((x, y)));
         assert_eq!(drawn[(x + 8, y)].fg, theme::MUTED);
+    }
+
+    #[test]
+    fn what_the_filter_finds_in_subfolders_says_which_folder_it_is_in() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "a.jp");
+        press(&mut f.app, &[KeyCode::Tab]);
+        finish_search(&mut f.app);
+        let drawn = buffer(&mut f.app, 120, 30);
+        assert!(
+            find(&drawn, "a.jpg Pictures", 26..73).is_some(),
+            "where it is"
+        );
+    }
+
+    #[test]
+    fn the_filter_and_find_fields_sit_on_the_bottom_row_like_flea_s_prompts() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "no");
+        let drawn = buffer(&mut f.app, 100, 20);
+        assert_eq!(find(&drawn, "Filter no", 0..100), Some((1, 19)));
+        assert_eq!(drawn[(1, 19)].fg, theme::MUTED, "the label");
+        assert_eq!(
+            (drawn[(8, 19)].fg, drawn[(8, 19)].bg),
+            (theme::FOREGROUND, theme::FIELD)
+        );
+        assert_eq!(drawn[(10, 19)].bg, theme::FIELD, "the caret's cell");
+        assert_eq!(crate::ui::testing::cursor(&mut f.app, 100, 20), (10, 19));
+        let (x, _) = find(&drawn, "1 of 3 shown", 0..100).unwrap();
+        assert_eq!((x, drawn[(x, 19)].fg), (12, theme::MUTED));
+
+        press(&mut f.app, &[KeyCode::Esc, KeyCode::Char('f')]);
+        let drawn = buffer(&mut f.app, 100, 20);
+        assert_eq!(find(&drawn, "Find", 0..100), Some((1, 19)));
+        let (x, _) = find(&drawn, "in ~ · tab changes scope", 0..100).unwrap();
+        assert_eq!(drawn[(x, 19)].fg, theme::MUTED);
+        // The header keeps the path alone.
+        assert_eq!(drawn[(1, 0)].symbol(), "~");
+        assert!(!cells(&drawn, 0, 0..100).contains('/'));
     }
 
     #[test]
@@ -843,10 +891,10 @@ mod tests {
     #[test]
     fn a_search_that_found_nothing_says_so_in_every_view() {
         let mut f = fixture();
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         type_text(&mut f.app, "zebra");
         finish_search(&mut f.app);
-        press(&mut f.app, &[KeyCode::Tab]);
+        press(&mut f.app, &[KeyCode::Enter]);
         for view in ['2', '1', '3'] {
             f.app.handle_key(ctrl(KeyCode::Char(view)));
             let drawn = buffer(&mut f.app, 120, 30);
@@ -872,7 +920,7 @@ mod tests {
     fn the_help_overlay_lists_the_shortcuts() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Char('?')]);
-        let all = screen(&mut f.app, 120, 50).join("\n");
+        let all = screen(&mut f.app, 120, 53).join("\n");
         assert!(all.contains("Keyboard shortcuts"));
         assert!(all.contains("Go to the parent folder"));
         for (keys, does) in [
@@ -1124,11 +1172,11 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(
             &mut f.app,
-            &[KeyCode::Down, KeyCode::Right, KeyCode::Char('/')],
+            &[KeyCode::Down, KeyCode::Right, KeyCode::Char('f')],
         );
         type_text(&mut f.app, "jpg");
         finish_search(&mut f.app);
-        press(&mut f.app, &[KeyCode::Tab]);
+        press(&mut f.app, &[KeyCode::Enter]);
 
         // The home column steps out: what was found is the only one.
         let columns = buffer(&mut f.app, 130, 30);
@@ -1147,7 +1195,7 @@ mod tests {
         let grid = buffer(&mut f.app, 130, 30);
         let (a, day) = (find(&grid, "a.jpg", 0..79), find(&grid, "day.jpg", 0..79));
         let ((ax, ay), (dx, dy)) = (a.expect("the first"), day.expect("the second"));
-        assert!(ay == dy && ax < dx, "side by side, in the order found");
+        assert!(ay == dy && ax < dx, "side by side, best first");
 
         // Left, the folder is back with the ones above it.
         f.app.handle_key(ctrl(KeyCode::Char('2')));

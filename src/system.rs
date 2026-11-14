@@ -15,6 +15,12 @@ use std::time::Duration;
 /// that stops it: once that is set it gives up, with an error.
 pub type Archiver = Box<dyn FnOnce(&Path, &AtomicBool) -> io::Result<()> + Send>;
 
+/// What finds the files whose contents hold some text. It is handed to the
+/// thread that searches, and run there with what takes each file it finds
+/// (and says whether to go on) and the flag that stops it.
+pub type Grep =
+    Box<dyn FnOnce(&mut dyn FnMut(PathBuf) -> bool, &AtomicBool) -> io::Result<()> + Send>;
+
 pub trait System {
     /// Opens a file with its default app.
     fn open(&self, path: &Path) -> io::Result<()>;
@@ -38,6 +44,13 @@ pub trait System {
     /// Edits a file in `$EDITOR` (`vi` without one) in this terminal, and
     /// waits for it: the window is handed over meanwhile and taken back after.
     fn edit(&self, path: &Path) -> io::Result<()>;
+
+    /// What finds the files below `roots` whose contents hold `text`,
+    /// whatever its case; `None` when ripgrep isn't installed.
+    fn grep(&self, roots: &[PathBuf], text: &str, show_hidden: bool) -> Option<Grep>;
+
+    /// Whether ripgrep is installed, so that `grep` gives something.
+    fn can_grep(&self) -> bool;
 }
 
 /// A volume as the footer names it: its file-system type and the space left.
@@ -127,6 +140,110 @@ impl System for MacSystem {
             Err(io::Error::other("the editor failed"))
         }
     }
+
+    fn grep(&self, roots: &[PathBuf], text: &str, show_hidden: bool) -> Option<Grep> {
+        let rg = ripgrep()?;
+        let mut command = grep_command(&rg, roots, text, show_hidden);
+        Some(Box::new(move |found, stop| {
+            stream_lines(&mut command, found, stop)
+        }))
+    }
+
+    fn can_grep(&self) -> bool {
+        ripgrep().is_some()
+    }
+}
+
+/// Where ripgrep is: on the path, or in Homebrew's folders for a terminal
+/// started without them on its path.
+fn ripgrep() -> Option<PathBuf> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    program_on(
+        "rg",
+        Some(&format!("{path}:/opt/homebrew/bin:/usr/local/bin")),
+    )
+}
+
+/// Where a program is on a `PATH`-like list of folders, when it is.
+fn program_on(name: &str, path: Option<&str>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    path?
+        .split(':')
+        .filter(|folder| !folder.is_empty())
+        .map(|folder| Path::new(folder).join(name))
+        .find(|program| {
+            fs::metadata(program)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// ripgrep asked for the files below `roots` holding `text` as it is,
+/// whatever its case, each root's search staying on its volume, by path.
+fn grep_command(rg: &Path, roots: &[PathBuf], text: &str, show_hidden: bool) -> Command {
+    let mut command = Command::new(rg);
+    command.args([
+        "--files-with-matches",
+        "--fixed-strings",
+        "--ignore-case",
+        "--no-messages",
+        "--one-file-system",
+        "--sort",
+        "path",
+    ]);
+    if show_hidden {
+        command.arg("--hidden");
+    }
+    // After `-e` the text is the text, whatever it starts with; after `--`
+    // a folder is a folder.
+    command.arg("-e").arg(text).arg("--").args(roots);
+    command
+}
+
+/// Runs a command and hands each line it writes over as a path, until it
+/// ends, `found` says enough or `stop` is set: then it is killed.
+fn stream_lines(
+    command: &mut Command,
+    found: &mut dyn FnMut(PathBuf) -> bool,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    use std::io::BufRead;
+    use std::os::unix::ffi::OsStringExt;
+    let mut child = quiet(command).stdout(Stdio::piped()).spawn()?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("no output"))?;
+    let (sender, lines) = std::sync::mpsc::channel();
+    // Reading waits for the command; the lines come over to be looked at
+    // between waits for whether to stop. The pipe's end ends the reader.
+    thread::spawn(move || {
+        for line in io::BufReader::new(output)
+            .split(b'\n')
+            .map_while(Result::ok)
+        {
+            if sender.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    loop {
+        match lines.recv_timeout(Duration::from_millis(20)) {
+            Ok(line) => {
+                let path = PathBuf::from(std::ffi::OsString::from_vec(line));
+                if !found(path) {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if stop.load(Ordering::Relaxed) => {
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
 }
 
 /// The editor to run: `$EDITOR`, or `vi` when it says nothing.
@@ -503,6 +620,78 @@ mod tests {
         let started = std::time::Instant::now();
         let stopped = run_until(Command::new("sleep").arg("30"), &stop).unwrap_err();
         assert_eq!(stopped.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+    #[test]
+    fn the_program_that_greps_is_found_on_the_path_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let rg = dir.path().join("rg");
+        fs::write(&rg, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&rg, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let path = format!("/nowhere:{}", dir.path().display());
+        assert_eq!(program_on("rg", Some(&path)), Some(rg));
+        assert_eq!(program_on("rg", Some("/nowhere")), None);
+        assert_eq!(program_on("rg", None), None);
+    }
+
+    #[test]
+    fn grep_asks_for_the_names_of_files_holding_the_text_whatever_the_case() {
+        let roots = [PathBuf::from("/a"), PathBuf::from("/b c")];
+        let command = grep_command(Path::new("/bin/rg"), &roots, "-x y", false);
+        assert_eq!(command.get_program(), "/bin/rg");
+        assert_eq!(
+            args(&command),
+            [
+                "--files-with-matches",
+                "--fixed-strings",
+                "--ignore-case",
+                "--no-messages",
+                "--one-file-system",
+                "--sort",
+                "path",
+                "-e",
+                "-x y",
+                "--",
+                "/a",
+                "/b c"
+            ]
+        );
+        let hidden = grep_command(Path::new("/bin/rg"), &roots, "x", true);
+        assert!(args(&hidden).contains(&OsStr::new("--hidden")));
+    }
+
+    #[test]
+    fn what_a_command_writes_is_handed_over_line_by_line_until_it_is_stopped() {
+        let mut lines = Vec::new();
+        let mut shell = Command::new("/bin/sh");
+        shell.args(["-c", "printf 'one\\ntwo two\\nthree\\n'"]);
+        let stop = AtomicBool::new(false);
+        stream_lines(
+            &mut shell,
+            &mut |line| {
+                lines.push(line);
+                true
+            },
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(lines, ["one", "two two", "three"].map(PathBuf::from));
+
+        // Told to stop, it kills the command rather than wait for its end.
+        let mut slow = Command::new("/bin/sh");
+        slow.args(["-c", "echo one; sleep 30; echo two"]);
+        let started = std::time::Instant::now();
+        let mut seen = 0;
+        let stopped = stream_lines(
+            &mut slow,
+            &mut |_| {
+                seen += 1;
+                false
+            },
+            &stop,
+        );
+        assert!(stopped.is_ok());
+        assert_eq!(seen, 1);
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

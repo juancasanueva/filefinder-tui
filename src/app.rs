@@ -16,10 +16,11 @@ use ratatui::layout::{Position as Point, Rect};
 
 use crate::format::DateStyle;
 use crate::input::Input;
+use crate::matcher::{self, Query, Tier};
 use crate::model::{self, Entry, SortMode};
 use crate::ops::Collide;
 use crate::ops::{self, Change, History, Kind, Report, Step};
-use crate::search::Walk;
+use crate::search::{Hit, Looking, Reach, Walk};
 use crate::state::{self, Saved, Trashed};
 use crate::system::{System, Volume};
 use crate::theme::Depth;
@@ -236,10 +237,14 @@ fn item_if(enabled: bool, label: &'static str, action: Action) -> MenuRow {
     }
 }
 
-/// A field in the header. While one has the keyboard every key goes to it.
+/// A field on the bottom row that narrows or looks through what the
+/// active pane lists; the pane holds its text. While one has the keyboard
+/// every key goes to it.
 pub enum Field {
-    /// `/`: what the active pane searches for. The pane holds the text.
+    /// `f` and Ctrl+F: Find.
     Search,
+    /// `/`: the filter.
+    Filter,
 }
 
 /// What a prompt on the bottom row asks for.
@@ -322,8 +327,6 @@ pub enum Spot {
     },
     /// A breadcrumb, and the folder it stands for.
     Crumb { pane: usize, path: PathBuf },
-    /// The search field, `/`.
-    SearchField,
     /// A tab's label in the header's strip, by its place among the tabs.
     Tab(usize),
     /// A row of the parent folder's listing, left of the list.
@@ -389,12 +392,70 @@ struct Click {
 pub enum Listing {
     /// The items of the folder at `cwd`.
     Folder,
-    /// What a search at and below `cwd` found, or what was there before
+    /// The items of the folder at `cwd` the filter leaves standing.
+    Filter(Filter),
+    /// What Find found at and below a folder, or what was there before
     /// while nothing is typed.
     Search(Search),
 }
 
-/// A search in a pane: `/` and what was typed after it.
+/// Where Find looks; Tab goes round them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The folder it was started in.
+    Folder,
+    /// The home folder, from inside it; elsewhere the folder again.
+    Home,
+    /// Everything from `/` on the system's and home's volumes.
+    Everywhere,
+}
+
+impl Scope {
+    fn next(self) -> Self {
+        match self {
+            Scope::Folder => Scope::Home,
+            Scope::Home => Scope::Everywhere,
+            Scope::Everywhere => Scope::Folder,
+        }
+    }
+}
+
+/// What the filter narrows; Tab switches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterScope {
+    /// The folder's own items.
+    Folder,
+    /// Those, and every item in the folders below.
+    Subfolders,
+}
+
+/// The filter in a pane: `/` and what was typed after it.
+pub struct Filter {
+    pub input: Input,
+    pub scope: FilterScope,
+    /// Every item it narrows: the folder's own, then what the walk found below.
+    all: Vec<Entry>,
+    /// How many of `all` are the folder's own.
+    own: usize,
+    /// The walk listing the folders below, until it has no more to give.
+    walk: Option<Walk>,
+    /// How many of the items shown are close matches.
+    pub close: usize,
+}
+
+impl Filter {
+    /// How many items it narrows.
+    pub fn total(&self) -> usize {
+        self.all.len()
+    }
+
+    /// Whether items from below may still arrive.
+    pub fn is_running(&self) -> bool {
+        self.walk.is_some()
+    }
+}
+
+/// Find in a pane: `f` and what was typed after it.
 pub struct Search {
     pub input: Input,
     /// What the pane showed before: where Escape and Back return to.
@@ -404,6 +465,20 @@ pub struct Search {
     /// Where the cursor belongs once the walk finds one of them; the
     /// earlier in the list, the better.
     wanted: Vec<PathBuf>,
+    pub scope: Scope,
+    /// Ctrl+G: whether it looks in what files hold rather than at names.
+    pub contents: bool,
+    /// The folder the walk looks in; what is found is named below it.
+    pub root: PathBuf,
+    /// Everything the walk found, close matches included, with how well.
+    hits: Vec<Hit>,
+    /// How many items the walk has looked at.
+    pub scanned: usize,
+    /// Whether the cursor stays on its item as better ones arrive, rather
+    /// than on the best: once the user has put it somewhere.
+    held: bool,
+    /// Why Ctrl+G was refused, said after the field.
+    pub error: Option<String>,
 }
 
 impl Search {
@@ -412,6 +487,9 @@ impl Search {
         self.walk.is_some()
     }
 }
+
+/// What is said when Ctrl+G finds no ripgrep, in flea's words.
+pub const NO_RIPGREP: &str = "ripgrep is unavailable.";
 
 /// What Ctrl+C or Ctrl+X took, waiting for Ctrl+V.
 struct Clipboard {
@@ -596,10 +674,146 @@ impl Pane {
         self.marks = marks;
     }
 
-    /// Whether the pane lists a folder's own items. Only there can things
-    /// be pasted or made.
+    /// Whether the pane lists a folder's own items, filtered or not. Only
+    /// there can things be pasted or made.
     pub fn is_folder(&self) -> bool {
-        matches!(self.listing, Listing::Folder)
+        matches!(self.listing, Listing::Folder | Listing::Filter(_))
+    }
+
+    /// The filter that is on in the pane.
+    pub fn filter(&self) -> Option<&Filter> {
+        match &self.listing {
+            Listing::Filter(filter) => Some(filter),
+            _ => None,
+        }
+    }
+
+    /// What the items listed match, for drawing it bold: the filter's text
+    /// or what Find looks for.
+    pub fn matching(&self) -> String {
+        match &self.listing {
+            Listing::Filter(filter) => filter.input.text(),
+            Listing::Search(search) => search.input.text(),
+            Listing::Folder => String::new(),
+        }
+    }
+
+    /// The folder an item is in, below the one looked in, for what Find
+    /// and the filter's subfolders list; `None` for one right there.
+    pub fn place_of(&self, entry: &Entry) -> Option<String> {
+        let root = match &self.listing {
+            Listing::Search(search) if !search.input.chars().is_empty() => &search.root,
+            Listing::Filter(filter) if filter.scope == FilterScope::Subfolders => &self.cwd,
+            _ => return None,
+        };
+        let parent = entry.path.parent()?;
+        let below = parent.strip_prefix(root).ok()?;
+        let place = if root == Path::new("/") {
+            parent.display().to_string()
+        } else {
+            below.display().to_string()
+        };
+        (!below.as_os_str().is_empty()).then_some(place)
+    }
+
+    /// Ends the filter and hands it over; the pane lists what it showed.
+    fn take_filter(&mut self) -> Option<Filter> {
+        self.filter()?;
+        match std::mem::replace(&mut self.listing, Listing::Folder) {
+            Listing::Filter(filter) => Some(filter),
+            _ => None,
+        }
+    }
+
+    /// Ends the filter: the folder's own items again, the cursor and the
+    /// marks on the items they were on.
+    fn clear_filter(&mut self) {
+        if let Some(filter) = self.take_filter() {
+            let mut all = filter.all;
+            all.truncate(filter.own);
+            self.relisted(all);
+        }
+    }
+
+    /// Lists these items in place of the ones listed, the cursor on the
+    /// item it was on (or the first) and the marks on theirs.
+    fn relisted(&mut self, entries: Vec<Entry>) {
+        let under = self.selected().map(|entry| entry.path.clone());
+        let marked: HashSet<PathBuf> = (self.marks.iter())
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| entry.path.clone())
+            .collect();
+        self.entries = entries;
+        let found = |path: &PathBuf| self.entries.iter().position(|entry| entry.path == *path);
+        self.cursor = under.as_ref().and_then(found).unwrap_or(0);
+        self.marks = (self.entries.iter().enumerate())
+            .filter(|(_, entry)| marked.contains(&entry.path))
+            .map(|(index, _)| index)
+            .collect();
+    }
+
+    /// Lists what the filter leaves standing: the exact matches, or with
+    /// none of them the close ones, best first.
+    fn narrow(&mut self) {
+        let Listing::Filter(filter) = &mut self.listing else {
+            return;
+        };
+        let names = filter.all.iter().map(|entry| entry.name.as_str());
+        let (shown, close) = match matcher::narrow(&filter.input.text(), names) {
+            None => ((0..filter.all.len()).collect(), 0),
+            Some(narrowed) if !narrowed.exact.is_empty() => (narrowed.exact, 0),
+            Some(narrowed) => {
+                let close = narrowed.close.len();
+                (narrowed.close, close)
+            }
+        };
+        filter.close = close;
+        let entries = shown
+            .iter()
+            .map(|index| filter.all[*index].clone())
+            .collect();
+        self.relisted(entries);
+    }
+
+    /// Lists what Find found, best first, and only the close matches when
+    /// nothing matches at the start of a word or better. The cursor stays
+    /// on its item once the user has put it somewhere, and otherwise on
+    /// the best; one wanted goes first.
+    fn rank(&mut self) {
+        let Listing::Search(search) = &mut self.listing else {
+            return;
+        };
+        let strong = (search.hits.iter()).any(|hit| hit.score.tier >= Tier::WordStart);
+        let mut shown: Vec<&Hit> = (search.hits.iter())
+            .filter(|hit| !strong || hit.score.tier != Tier::Typo)
+            .collect();
+        shown.sort_by(|a, b| matcher::rank(&a.score, &a.path, &b.score, &b.path));
+        let entries: Vec<Entry> = shown.iter().map(|hit| hit.entry.clone()).collect();
+        let held = search.held;
+        let wanted = (search.wanted.iter().enumerate())
+            .find_map(|(rank, path)| Some((rank, entries.iter().position(|e| e.path == *path)?)));
+        if let Some((rank, _)) = wanted {
+            // Only one wanted more than this one moves the cursor again.
+            search.wanted.truncate(rank);
+            search.held = true;
+        }
+        if !held && wanted.is_none() {
+            self.cursor = 0;
+            self.offset = 0;
+            self.entries.clear();
+        }
+        self.relisted(entries);
+        if let Some((_, index)) = wanted {
+            self.cursor = index;
+            self.marks.clear();
+        }
+    }
+
+    /// The user takes over: the cursor stays on its item from now on.
+    fn hold(&mut self) {
+        if let Listing::Search(search) = &mut self.listing {
+            search.held = true;
+        }
     }
 
     /// The search that is open in the pane.
@@ -632,9 +846,13 @@ impl Pane {
             // What a search found is no place to come back to: the folder
             // it looked in is, as it was.
             Listing::Search(search) => search.origin.clone(),
-            Listing::Folder => Visit {
+            // A filtered folder comes back whole, on the item the cursor
+            // was on when that is the folder's own.
+            Listing::Folder | Listing::Filter(_) => Visit {
                 path: self.cwd.clone(),
-                selected: self.selected().map(|entry| entry.name.clone()),
+                selected: (self.selected())
+                    .filter(|entry| entry.path.parent() == Some(self.cwd.as_path()))
+                    .map(|entry| entry.name.clone()),
             },
         }
     }
@@ -673,24 +891,34 @@ impl Pane {
         }
     }
 
-    /// Takes in what the search found since the last turn.
+    /// Takes in what Find, or the filter's walk below, found since the
+    /// last turn.
     fn collect_found(&mut self) {
-        let Listing::Search(search) = &mut self.listing else {
-            return;
-        };
-        let Some(walk) = &mut search.walk else { return };
-        let (found, finished) = walk.collect();
-        if finished {
-            search.walk = None;
-        }
-        for entry in found {
-            if let Some(rank) = search.wanted.iter().position(|path| *path == entry.path) {
-                // Only one wanted more than this one moves the cursor again.
-                search.wanted.truncate(rank);
-                self.cursor = self.entries.len();
-                self.marks.clear();
+        match &mut self.listing {
+            Listing::Search(search) => {
+                let Some(walk) = &mut search.walk else { return };
+                let (found, finished) = walk.collect();
+                search.scanned = walk.scanned();
+                if finished {
+                    search.walk = None;
+                }
+                if !found.is_empty() || search.hits.is_empty() {
+                    search.hits.extend(found);
+                    self.rank();
+                }
             }
-            self.entries.push(entry);
+            Listing::Filter(filter) => {
+                let Some(walk) = &mut filter.walk else { return };
+                let (found, finished) = walk.collect();
+                if finished {
+                    filter.walk = None;
+                }
+                if !found.is_empty() {
+                    filter.all.extend(found.into_iter().map(|hit| hit.entry));
+                    self.narrow();
+                }
+            }
+            Listing::Folder => {}
         }
     }
 
@@ -1055,7 +1283,8 @@ impl App {
         {
             self.message = None;
         }
-        let empty = self.pane().entries.is_empty() && self.pane().is_folder();
+        let empty = self.pane().entries.is_empty() && self.pane().filter().is_none();
+        let empty = empty && self.pane().is_folder();
         match (empty, self.empty_since) {
             (false, _) => {
                 self.empty_since = None;
@@ -1075,8 +1304,12 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         // A key is the user taking over: the cursor is no longer moved to
-        // what a search under way was asked to find again.
+        // what a search under way was asked to find again, and one in the
+        // files stays on its item as better ones arrive.
         self.pane_mut().want(Vec::new());
+        if self.field.is_none() {
+            self.pane_mut().hold();
+        }
         // Whatever this key is, a first `d` waits for no other.
         let armed = self.trash_armed.take();
         if let Some(menu) = self.menu.take() {
@@ -1113,9 +1346,10 @@ impl App {
             self.question_key(question, key);
             return;
         }
-        if let Some(Field::Search) = self.field.take() {
-            self.search_key(key);
-            return;
+        match self.field.take() {
+            Some(Field::Search) => return self.search_key(key),
+            Some(Field::Filter) => return self.filter_key(key),
+            None => {}
         }
         if self.focus == Focus::Preview && self.preview_key(key) {
             return;
@@ -1205,8 +1439,10 @@ impl App {
             }
             KeyCode::Char(' ') if plain => self.preview_selected(),
             KeyCode::Char('.') if plain => self.toggle_hidden(),
-            KeyCode::Char('/' | 'f') if plain => self.search(),
+            KeyCode::Char('/') if plain => self.open_filter(),
+            KeyCode::Char('f') if plain => self.search(),
             KeyCode::Char('f') if ctrl => self.search(),
+            KeyCode::Char('o') if plain => self.reveal(),
             KeyCode::Char('s') if plain => self.set_sort(self.sort.next()),
             KeyCode::Char('S') if plain => self.set_sort(self.sort.reverse()),
             KeyCode::Char(':') if plain => self.ask_go_to(),
@@ -1262,6 +1498,7 @@ impl App {
         // to put the cursor somewhere.
         for pane in &mut self.tab_mut().panes {
             pane.want(Vec::new());
+            pane.hold();
         }
         match (mouse.kind, down) {
             (_, Some(down)) => self.wheel(spot, down),
@@ -1297,9 +1534,7 @@ impl App {
             return;
         }
         let Some(spot) = spot else { return };
-        if spot != Spot::SearchField {
-            self.leave_field();
-        }
+        self.leave_field();
         match (left, spot) {
             (true, Spot::Item { pane, index }) => self.click_item(pane, index, held, last),
             (true, Spot::Above { pane, depth, index }) => {
@@ -1314,7 +1549,6 @@ impl App {
                 self.navigate(&path);
             }
             (true, Spot::Tab(index)) => self.switch_tab(index),
-            (true, Spot::SearchField) => self.search(),
             (false, Spot::Item { pane, index }) => {
                 self.enter_pane(pane);
                 let pane = self.pane_mut();
@@ -1366,11 +1600,25 @@ impl App {
         self.handle_key(KeyEvent::from(KeyCode::Enter));
     }
 
-    /// A click away from the search field that has the keyboard: the
-    /// search hands the keyboard to what it found, as with Tab.
+    /// A click in the files while a field has the keyboard: the keyboard
+    /// goes to what it lists, as with Enter.
     fn leave_field(&mut self) {
-        if self.field.is_some() {
-            self.handle_key(KeyEvent::from(KeyCode::Tab));
+        if let Some(field) = self.field.take() {
+            self.commit(field);
+        }
+    }
+
+    /// Enter in a field: the keyboard goes to what the pane lists, which
+    /// stays as it is. With nothing typed there is nothing to keep.
+    fn commit(&mut self, field: Field) {
+        self.field = None;
+        if !self.pane().matching().is_empty() {
+            self.pane_mut().hold();
+            return;
+        }
+        match field {
+            Field::Search => self.leave_search(),
+            Field::Filter => self.pane_mut().clear_filter(),
         }
     }
 
@@ -1842,75 +2090,229 @@ impl App {
         (filled != text).then_some(filled)
     }
 
-    /// `/`: opens the search field, or hands the keyboard back to the one
-    /// that is open.
+    /// `/`: opens the filter on the bottom row, or hands the keyboard back
+    /// to the one that is on. What Find found is not filtered.
+    fn open_filter(&mut self) {
+        if self.pane().search().is_some() {
+            return;
+        }
+        if self.pane().filter().is_none() {
+            let pane = self.pane_mut();
+            let all = pane.entries.clone();
+            pane.listing = Listing::Filter(Filter {
+                input: Input::default(),
+                scope: FilterScope::Folder,
+                own: all.len(),
+                all,
+                walk: None,
+                close: 0,
+            });
+        }
+        self.focus = Focus::List;
+        self.field = Some(Field::Filter);
+    }
+
+    /// A key pressed while the filter's field has the keyboard: what isn't
+    /// typed into it narrows the folder, keeps it or clears it.
+    fn filter_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        match key.code {
+            KeyCode::Esc => return self.pane_mut().clear_filter(),
+            KeyCode::Enter | KeyCode::Down if plain => return self.commit(Field::Filter),
+            // Everything shown marked, and the keyboard on to it.
+            KeyCode::Char('a') if ctrl => {
+                self.commit(Field::Filter);
+                return self.pane_mut().select_all();
+            }
+            KeyCode::Menu | KeyCode::F(10)
+                if key.code == KeyCode::Menu || key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.commit(Field::Filter);
+                return self.open_menu();
+            }
+            KeyCode::Tab => self.switch_filter_scope(),
+            _ => {
+                if let Listing::Filter(filter) = &mut self.pane_mut().listing
+                    && filter.input.handle_key(key)
+                {
+                    self.pane_mut().narrow();
+                }
+            }
+        }
+        self.field = Some(Field::Filter);
+    }
+
+    /// Tab in the filter: this folder, or this folder and every folder below.
+    fn switch_filter_scope(&mut self) {
+        let hidden = self.show_hidden;
+        let pane = self.pane_mut();
+        let cwd = pane.cwd.clone();
+        let Listing::Filter(filter) = &mut pane.listing else {
+            return;
+        };
+        match filter.scope {
+            FilterScope::Folder => {
+                filter.scope = FilterScope::Subfolders;
+                let reach = Reach::volume(cwd);
+                filter.walk = Some(Walk::start(reach, Looking::Below, hidden));
+            }
+            FilterScope::Subfolders => {
+                filter.scope = FilterScope::Folder;
+                filter.walk = None;
+                filter.all.truncate(filter.own);
+            }
+        }
+        pane.narrow();
+    }
+
+    /// `f` and Ctrl+F: opens Find on the bottom row, or hands the keyboard
+    /// back to the one that is open.
     fn search(&mut self) {
         if self.pane().search().is_none() {
             let origin = self.pane().visit();
+            // A filter goes as Find comes: its folder is found in whole.
+            if self.pane().filter().is_some() {
+                self.revisit(&origin);
+            }
+            let root = origin.path.clone();
             self.pane_mut().listing = Listing::Search(Search {
                 input: Input::default(),
                 origin,
                 walk: None,
                 wanted: Vec::new(),
+                scope: Scope::Folder,
+                contents: false,
+                root,
+                hits: Vec::new(),
+                scanned: 0,
+                held: false,
+                error: None,
             });
         }
-        // Up, Down and Enter act on the files from the field.
         self.focus = Focus::List;
         self.field = Some(Field::Search);
     }
 
-    /// A key pressed while the search field has the keyboard: what isn't
-    /// typed into it moves in what was found, opens it or leaves.
+    /// A key pressed while Find's field has the keyboard: what isn't typed
+    /// into it changes where or how it looks, keeps what it found or leaves.
     fn search_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
         match key.code {
             KeyCode::Esc => {
-                self.leave_search();
-                return;
-            }
-            // The keyboard moves on to what was found. With nothing typed
-            // there is no search to keep.
-            KeyCode::Tab | KeyCode::BackTab => {
-                if self.pane().results().is_none() {
-                    self.leave_search();
+                // A walk under way stops first; then Find is left.
+                if !self.stop_search() {
+                    return self.leave_search();
                 }
-                return;
             }
+            KeyCode::Enter | KeyCode::Down if plain => return self.commit(Field::Search),
             // The menu is for what was found: the keyboard moves on to
-            // that, as with Tab, and the menu opens.
+            // that, and the menu opens.
             KeyCode::Menu | KeyCode::F(10)
                 if key.code == KeyCode::Menu || key.modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                if self.pane().results().is_none() {
-                    self.leave_search();
-                }
-                self.open_menu();
-                return;
+                self.commit(Field::Search);
+                return self.open_menu();
             }
-            KeyCode::Enter => self.open_selected(),
-            KeyCode::Up => self.step(-1),
-            KeyCode::Down => self.step(1),
-            KeyCode::PageUp => self.page(-1),
-            KeyCode::PageDown => self.page(1),
+            KeyCode::Tab => self.next_scope(),
+            KeyCode::Char('g') if ctrl => self.toggle_contents(),
             _ => {
                 let mut retyped = false;
                 if let Listing::Search(search) = &mut self.pane_mut().listing {
                     let before = search.input.text();
                     search.input.handle_key(key);
                     retyped = search.input.text() != before;
+                    if retyped {
+                        search.error = None;
+                    }
                 }
                 if retyped {
                     self.run_search();
                 }
             }
         }
-        // Enter on a folder went there and left the search.
         if self.pane().search().is_some() {
             self.field = Some(Field::Search);
         }
     }
 
-    /// Lists what the search field asks for: what was there before while
-    /// it is empty, and otherwise the matches of a walk started afresh.
+    /// Stops the walk under way, keeping what it found; false when none was.
+    fn stop_search(&mut self) -> bool {
+        match &mut self.pane_mut().listing {
+            Listing::Search(search) if search.is_running() => {
+                search.walk = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The folder a scope of Find looks in, from the folder it was started
+    /// in; `None` for everywhere.
+    fn scope_root(&self, folder: &Path, scope: Scope) -> Option<PathBuf> {
+        match scope {
+            Scope::Folder => Some(folder.to_path_buf()),
+            Scope::Home if folder.starts_with(&self.home) => Some(self.home.clone()),
+            Scope::Home => Some(folder.to_path_buf()),
+            Scope::Everywhere => None,
+        }
+    }
+
+    /// Tab in Find: the next scope that looks somewhere else.
+    fn next_scope(&mut self) {
+        let Some(search) = self.pane().search() else {
+            return;
+        };
+        let folder = search.origin.path.clone();
+        let here = self.scope_root(&folder, search.scope);
+        let mut scope = search.scope.next();
+        if self.scope_root(&folder, scope) == here {
+            scope = scope.next();
+        }
+        if let Listing::Search(search) = &mut self.pane_mut().listing {
+            search.scope = scope;
+        }
+        self.run_search();
+    }
+
+    /// Ctrl+G in Find: contents rather than names, or back; with no
+    /// ripgrep, names it stays, and it says so.
+    fn toggle_contents(&mut self) {
+        let can = self.system.can_grep();
+        if let Listing::Search(search) = &mut self.pane_mut().listing {
+            if search.contents || can {
+                search.contents = !search.contents;
+                search.error = None;
+            } else {
+                search.error = Some(NO_RIPGREP.to_string());
+                return;
+            }
+        }
+        self.run_search();
+    }
+
+    /// Where Find looks, in flea's words: `in ~/x`, `everywhere`, with
+    /// `contents` in front when it looks in what files hold.
+    pub fn scope_label(&self, search: &Search) -> String {
+        let root = self.scope_root(&search.origin.path, search.scope);
+        let place = match root {
+            Some(root) => format!("in {}", self.shown_path(&root)),
+            None => "everywhere".to_string(),
+        };
+        if search.contents {
+            format!("contents {place}")
+        } else {
+            place
+        }
+    }
+
+    /// Lists what Find's field asks for: what was there before while it
+    /// is empty, and otherwise what a walk started afresh finds.
     fn run_search(&mut self) {
         let Some(mut search) = self.pane_mut().take_search() else {
             return;
@@ -1919,26 +2321,53 @@ impl App {
         search.wanted.clear();
         // The walk under way looked for something else: dropped, it stops.
         search.walk = None;
+        search.hits.clear();
+        search.scanned = 0;
+        search.held = false;
         if text.is_empty() {
             self.revisit(&search.origin);
             self.pane_mut().listing = Listing::Search(search);
-        } else {
-            let folder = search.origin.path.clone();
-            search.walk = Some(Walk::start(folder.clone(), &text, self.show_hidden));
-            let pane = self.pane_mut();
-            pane.show(folder, Vec::new(), None);
-            pane.listing = Listing::Search(search);
-            self.refresh_ancestors();
-            self.message = None;
+            return;
         }
+        let folder = search.origin.path.clone();
+        let reach = match self.scope_root(&folder, search.scope) {
+            Some(root) => Reach::volume(root),
+            None => Reach::everywhere(&self.home),
+        };
+        let grep = (search.contents)
+            .then(|| self.system.grep(&reach.roots(), &text, self.show_hidden))
+            .flatten();
+        let looking = match grep {
+            Some(grep) => Looking::Contents(grep),
+            None => Looking::Names(Query::new(&text).expect("something was typed")),
+        };
+        search.root = reach.root.clone();
+        search.walk = Some(Walk::start(reach, looking, self.show_hidden));
+        let pane = self.pane_mut();
+        pane.show(folder, Vec::new(), None);
+        pane.listing = Listing::Search(search);
+        self.refresh_ancestors();
+        self.message = None;
     }
 
-    /// Ends the search and shows what was there before it, the cursor
-    /// where it was.
+    /// Ends Find and shows what was there before it, the cursor where it was.
     fn leave_search(&mut self) {
         self.field = None;
         if let Some(search) = self.pane_mut().take_search() {
             self.revisit(&search.origin);
+        }
+    }
+
+    /// `o`: what Find found under the cursor, shown in its folder, as a new
+    /// place in the history.
+    fn reveal(&mut self) {
+        if self.pane().results().is_none() {
+            return;
+        }
+        let Some(entry) = self.selected() else { return };
+        let (path, name) = (entry.path.clone(), entry.name.clone());
+        if let Some(folder) = path.parent() {
+            self.go_to(folder, Some(&name));
         }
     }
 
@@ -2733,8 +3162,9 @@ impl App {
     }
 
     /// Escape, "Close or go back" in flea's order: the keyboard back from
-    /// the preview to the list; an error dismissed; the search left; the
-    /// file work under way stopped; and with none of that, the marks cleared.
+    /// the preview to the list; an error dismissed; the filter cleared;
+    /// Find's walk stopped, then Find left; the file work under way
+    /// stopped; and with none of that, the marks cleared.
     fn escape(&mut self) {
         if self.focus == Focus::Preview {
             self.focus = Focus::List;
@@ -2744,8 +3174,13 @@ impl App {
             .is_some_and(|message| message.is_error)
         {
             self.message = None;
+        } else if self.pane().filter().is_some() {
+            self.pane_mut().clear_filter();
         } else if self.pane().search().is_some() {
-            self.leave_search();
+            // A walk under way stops first; then Find is left.
+            if !self.stop_search() {
+                self.leave_search();
+            }
         } else if self.work.is_some() {
             self.stop_or_dismiss();
         } else {
@@ -3019,8 +3454,36 @@ impl App {
             self.run_search();
             return true;
         }
+        if self.pane().filter().is_some() {
+            return self.reload_filtered();
+        }
         let here = self.pane().visit();
         self.revisit(&here)
+    }
+
+    /// Lists a filtered folder again, and what is below it when the filter
+    /// looks there, and narrows it as before.
+    fn reload_filtered(&mut self) -> bool {
+        let here = self.pane().visit();
+        let under = self.selected().map(|entry| entry.path.clone());
+        let Some(mut filter) = self.pane_mut().take_filter() else {
+            return false;
+        };
+        if !self.revisit(&here) {
+            return false;
+        }
+        let pane = self.pane_mut();
+        filter.all = pane.entries.clone();
+        filter.own = filter.all.len();
+        if filter.scope == FilterScope::Subfolders {
+            let reach = Reach::volume(pane.cwd.clone());
+            filter.walk = Some(Walk::start(reach, Looking::Below, self.show_hidden));
+        }
+        let pane = self.pane_mut();
+        pane.listing = Listing::Filter(filter);
+        pane.narrow();
+        pane.want(under.into_iter().collect());
+        true
     }
 
     /// Shows the folder a visit was of.
@@ -3237,7 +3700,7 @@ fn read_error(path: &Path, error: &io::Error) -> String {
 #[cfg(test)]
 pub mod testing {
     use super::*;
-    use crate::system::Archiver;
+    use crate::system::{Archiver, Grep};
     use crate::thumbs::testing::FakeThumbnailer;
     use std::cell::{Cell, RefCell};
     use std::fs;
@@ -3266,7 +3729,18 @@ pub mod testing {
         pub edited: Rc<RefCell<Vec<PathBuf>>>,
         /// Whether the editor can't be started.
         pub no_editor: Rc<Cell<bool>>,
+        /// What the stand-in for ripgrep finds, whatever it is asked;
+        /// `None` when ripgrep isn't installed.
+        pub grep_finds: Rc<RefCell<Option<Vec<PathBuf>>>>,
+        /// Every search of contents asked for: the folders and the text.
+        pub grepped: Rc<RefCell<Vec<Grepped>>>,
+        /// When set, the next search of contents hands over what comes
+        /// through here, as it comes, until the other end goes.
+        pub grep_feed: Rc<RefCell<Option<mpsc::Receiver<PathBuf>>>>,
     }
+
+    /// A search of contents asked of the stand-in for ripgrep: where, and for what.
+    pub type Grepped = (Vec<PathBuf>, String);
 
     /// What the stand-in for the program that zips does with an archive. One
     /// it writes holds the names of what went in, a line each.
@@ -3334,6 +3808,45 @@ pub mod testing {
             self.edited.borrow_mut().push(path.to_path_buf());
             Ok(())
         }
+
+        fn grep(&self, roots: &[PathBuf], text: &str, _show_hidden: bool) -> Option<Grep> {
+            let finds = self.grep_finds.borrow().clone()?;
+            self.grepped
+                .borrow_mut()
+                .push((roots.to_vec(), text.to_string()));
+            if let Some(feed) = self.grep_feed.borrow_mut().take() {
+                return Some(Box::new(move |found, stop| {
+                    loop {
+                        match feed.recv_timeout(Duration::from_millis(2)) {
+                            Ok(path) => {
+                                if !found(path) {
+                                    return Ok(());
+                                }
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                                if stop.load(Ordering::Relaxed) =>
+                            {
+                                return Ok(());
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                }));
+            }
+            Some(Box::new(move |found, _stop| {
+                for path in finds {
+                    if !found(path) {
+                        break;
+                    }
+                }
+                Ok(())
+            }))
+        }
+
+        fn can_grep(&self) -> bool {
+            self.grep_finds.borrow().is_some()
+        }
     }
 
     impl FakeSystem {
@@ -3382,16 +3895,15 @@ pub mod testing {
         }
     }
 
-    /// Lets the search under way look everywhere and takes in what it found.
+    /// Lets Find's walk, or the filter's below the folder, look everywhere
+    /// and takes in what it found.
     pub fn finish_search(app: &mut App) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             app.tick();
-            if app
-                .pane()
-                .search()
-                .is_none_or(|search| !search.is_running())
-            {
+            let pane = app.pane();
+            let searching = pane.search().is_some_and(Search::is_running);
+            if !searching && pane.filter().is_none_or(|filter| !filter.is_running()) {
                 return;
             }
             assert!(Instant::now() < deadline, "the search never finished");
@@ -5191,9 +5703,13 @@ mod tests {
     }
 
     const FOLDER: [&str; 3] = ["Documents", "Pictures", "notes.txt"];
-    const TRIPS: [&str; 3] = ["trip-plan.md", "Trip", "day-trip.jpg"];
+    /// What Find finds for "trip", best first: the whole name, the start of
+    /// a name, the start of a word.
+    const TRIPS: [&str; 3] = ["Trip", "trip-plan.md", "day-trip.jpg"];
+    /// The `.txt` files of `several()`.
+    const TEXTS: [&str; 6] = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "notes.txt"];
 
-    /// Types into the search field and lets the walk look everywhere.
+    /// Types into the find field and lets the walk look everywhere.
     fn search_for(app: &mut App, text: &str) {
         type_text(app, text);
         finish_search(app);
@@ -5208,157 +5724,450 @@ mod tests {
         matches!(app.field, Some(Field::Search))
     }
 
+    fn typing_a_filter(app: &App) -> bool {
+        matches!(app.field, Some(Field::Filter))
+    }
+
+    fn filter_text(app: &App) -> String {
+        app.pane().filter().expect("no filter is on").input.text()
+    }
+
+    /// The bottom row as drawn 100 cells wide, without its padding.
+    fn bottom_row(app: &mut App) -> String {
+        let rows = crate::ui::testing::screen(app, 100, 20);
+        rows.last().unwrap().trim().to_string()
+    }
+
+    /// Ticks until `done` holds, as the event loop would.
+    fn tick_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !done(app) {
+            assert!(std::time::Instant::now() < deadline, "it never happened");
+            std::thread::sleep(Duration::from_millis(2));
+            app.tick();
+        }
+    }
+
+    // The filter, `/`: narrows the listing as it is typed.
+
     #[test]
-    fn slash_lists_what_matches_at_and_below_the_folder_as_it_is_typed() {
-        let mut f = searchable();
+    fn slash_opens_the_filter_on_the_bottom_row_and_narrows_the_folder_as_it_is_typed() {
+        let mut f = several();
         press(&mut f.app, &[KeyCode::Char('/')]);
-        assert!(typing_a_search(&f.app));
-        assert_eq!(search_text(&f.app), "");
+        assert!(typing_a_filter(&f.app));
+        assert_eq!(filter_text(&f.app), "");
+        assert_eq!(names(&f.app).len(), 8, "nothing typed hides nothing");
 
-        type_text(&mut f.app, "TR");
-        assert!(names(&f.app).is_empty(), "typing doesn't wait for the walk");
-        assert!(f.app.pane().search().unwrap().is_running());
-        finish_search(&mut f.app);
-        // The nearest first, a file before a folder: the order they were found in.
-        assert_eq!(names(&f.app), TRIPS);
-        assert_eq!(f.app.pane().cursor, 0);
-        assert_eq!(f.app.pane().cwd, f.home, "the folder being searched");
-        assert!(typing_a_search(&f.app));
-        assert_eq!(f.app.message, None);
+        type_text(&mut f.app, "TXT");
+        assert_eq!(names(&f.app), TEXTS);
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert!(f.app.pane().is_folder(), "still the folder's own items");
+        let row = bottom_row(&mut f.app);
+        assert!(row.starts_with("Filter TXT"), "{row}");
+        assert!(row.contains("6 of 8 shown"), "{row}");
 
-        // What is typed next is looked for in place of it.
-        search_for(&mut f.app, "ip-");
-        assert_eq!(search_text(&f.app), "TRip-");
-        assert_eq!(names(&f.app), ["trip-plan.md"]);
-        search_for(&mut f.app, "x");
+        type_text(&mut f.app, "!");
         assert!(names(&f.app).is_empty());
         press(&mut f.app, &[KeyCode::Backspace; 4]);
-        finish_search(&mut f.app);
-        assert_eq!(search_text(&f.app), "TR");
-        assert_eq!(names(&f.app), TRIPS);
+        type_text(&mut f.app, "note");
+        assert_eq!(names(&f.app), ["notes.txt"]);
     }
 
     #[test]
-    fn a_search_skips_hidden_items_until_they_are_shown_and_is_never_sorted() {
+    fn a_close_match_shows_only_when_nothing_matches_exactly() {
+        let mut f = several();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "ntoes");
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        let row = bottom_row(&mut f.app);
+        assert!(row.contains("1 of 8 shown · 1 close match"), "{row}");
+        press(&mut f.app, &[KeyCode::Backspace; 5]);
+        type_text(&mut f.app, "notes");
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        let row = bottom_row(&mut f.app);
+        assert!(
+            row.contains("1 of 8 shown") && !row.contains("close"),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn enter_or_down_keeps_the_filter_and_hands_the_keyboard_to_the_list() {
+        for done in [KeyCode::Enter, KeyCode::Down] {
+            let mut f = several();
+            press(&mut f.app, &[KeyCode::Char('/')]);
+            type_text(&mut f.app, "txt");
+            press(&mut f.app, &[done]);
+            assert!(f.app.field.is_none(), "{done:?}");
+            assert_eq!(names(&f.app), TEXTS);
+            assert_eq!(selected_name(&f.app), Some("a.txt"), "nothing was opened");
+            assert!(f.system.opened.borrow().is_empty());
+            // The footer says what is filtered, and the keys are the list's again.
+            let row = bottom_row(&mut f.app);
+            assert!(row.starts_with("Filter txt  6 of 8 shown"), "{row}");
+            press(&mut f.app, &[KeyCode::Char('j')]);
+            assert_eq!(selected_name(&f.app), Some("b.txt"));
+            // `/` goes back to the field as it was left.
+            press(&mut f.app, &[KeyCode::Char('/')]);
+            assert!(typing_a_filter(&f.app));
+            assert_eq!(filter_text(&f.app), "txt");
+        }
+    }
+
+    #[test]
+    fn escape_clears_the_filter_from_the_field_or_from_the_list() {
+        for from_the_list in [false, true] {
+            let mut f = several();
+            press(&mut f.app, &[KeyCode::Char('/')]);
+            type_text(&mut f.app, "txt");
+            press(&mut f.app, &[KeyCode::Down]);
+            if from_the_list {
+                press(&mut f.app, &[KeyCode::Down]);
+            }
+            press(&mut f.app, &[KeyCode::Esc]);
+            assert!(f.app.field.is_none() && f.app.pane().filter().is_none());
+            assert_eq!(names(&f.app).len(), 8);
+            let kept = if from_the_list { "b.txt" } else { "a.txt" };
+            assert_eq!(
+                selected_name(&f.app),
+                Some(kept),
+                "the cursor stays on its item"
+            );
+            assert!(bottom_row(&mut f.app).starts_with("8 items"));
+        }
+    }
+
+    #[test]
+    fn ctrl_a_marks_only_what_the_filter_shows_and_that_is_what_is_acted_on() {
+        let mut f = several();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "txt");
+        // From the field: the keyboard moves on to the list, everything shown marked.
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        assert!(f.app.field.is_none());
+        assert_eq!(chosen(&f.app), TEXTS);
+        // From the list as well.
+        press(&mut f.app, &[KeyCode::Char('V')]);
+        assert_eq!(chosen(&f.app), ["a.txt"], "none marked: the cursor's");
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(chosen(&f.app), TEXTS);
+
+        // Moving them to the trash takes those and no other, and the filter stays.
+        press(&mut f.app, &[KeyCode::Delete]);
+        finish_work(&mut f.app);
+        let left: Vec<String> = on_disk(&f.home)
+            .into_iter()
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        assert_eq!(left, ["Documents", "Pictures"]);
+        assert_eq!(filter_text(&f.app), "txt");
+        assert!(names(&f.app).is_empty());
+        let drawn = crate::ui::testing::screen(&mut f.app, 100, 20);
+        assert!(drawn.iter().any(|row| row.contains("NOTHING MATCHES txt")));
+        assert!(drawn.iter().any(|row| row.contains('\u{ea6d}')));
+        assert!(bottom_row(&mut f.app).starts_with("Filter txt  0 of 2 shown"));
+    }
+
+    #[test]
+    fn tab_switches_the_filter_between_this_folder_and_its_subfolders() {
         let mut f = searchable();
         press(&mut f.app, &[KeyCode::Char('/')]);
-        search_for(&mut f.app, "trip");
-        assert_eq!(names(&f.app), TRIPS);
+        type_text(&mut f.app, "trip");
+        assert!(names(&f.app).is_empty(), "nothing in the folder itself");
+
         press(&mut f.app, &[KeyCode::Tab]);
-
-        // Another order sorts the folders, not what was found.
-        press(&mut f.app, &[KeyCode::Char('s'), KeyCode::Char('S')]);
+        assert_eq!(
+            f.app.pane().filter().unwrap().scope,
+            FilterScope::Subfolders
+        );
         finish_search(&mut f.app);
-        assert_eq!(f.app.sort, BY_SIZE);
-        assert_eq!(names(&f.app), TRIPS);
-
-        f.app.handle_key(key(KeyCode::Char('.')));
-        finish_search(&mut f.app);
-        let with_hidden = ["trip.log", "trip-plan.md", "Trip", "day-trip.jpg"];
-        assert_eq!(names(&f.app), with_hidden);
-        assert_eq!(search_text(&f.app), "trip");
-    }
-
-    #[test]
-    fn an_empty_search_field_shows_the_folder_as_it_was() {
-        let mut f = searchable();
-        select(&mut f.app, "Pictures");
-        press(&mut f.app, &[KeyCode::Char('/')]);
-        assert_eq!(names(&f.app), FOLDER);
-        assert_eq!(selected_name(&f.app), Some("Pictures"));
-
-        search_for(&mut f.app, "trip");
-        assert_eq!(names(&f.app), TRIPS);
-        press(&mut f.app, &[KeyCode::Backspace; 4]);
-        assert_eq!(search_text(&f.app), "");
-        assert_eq!(names(&f.app), FOLDER);
-        assert_eq!(selected_name(&f.app), Some("Pictures"));
-        assert!(typing_a_search(&f.app), "the field stays open");
-        assert!(!f.app.pane().search().unwrap().is_running());
-    }
-
-    #[test]
-    fn up_down_and_enter_act_on_what_was_found_without_leaving_the_field() {
-        let mut f = searchable();
-        select(&mut f.app, "notes.txt");
-        press(&mut f.app, &[KeyCode::Char('/')]);
-        search_for(&mut f.app, "trip");
-        press(&mut f.app, &[KeyCode::Down, KeyCode::Down, KeyCode::Up]);
-        assert_eq!(selected_name(&f.app), Some("Trip"));
-        assert!(typing_a_search(&f.app));
-        assert_eq!(search_text(&f.app), "trip");
-
-        // Enter on a file opens it, and the search stays.
-        press(&mut f.app, &[KeyCode::Up, KeyCode::Enter]);
-        let plan = f.home.join("Documents").join("trip-plan.md");
-        assert_eq!(*f.system.opened.borrow(), [plan]);
-        assert!(typing_a_search(&f.app));
-        assert_eq!(names(&f.app), TRIPS);
-
-        // Enter on a folder goes into it, leaving the search.
-        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
-        assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
+        // The folder's own first, then each level down; hidden ones stay out.
+        assert_eq!(names(&f.app), ["trip-plan.md", "Trip", "day-trip.jpg"]);
+        let row = bottom_row(&mut f.app);
+        assert!(row.contains("3 of 7 shown in ~ and subfolders"), "{row}");
+        assert!(typing_a_filter(&f.app), "Tab stays in the field");
+        // What is narrowed below is the walk's, typed or not.
+        type_text(&mut f.app, ".");
         assert_eq!(names(&f.app), ["day-trip.jpg"]);
-        assert!(f.app.field.is_none() && f.app.pane().search().is_none());
 
-        // Back is the folder that was searched, as it was: not what was found.
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.pane().filter().unwrap().scope, FilterScope::Folder);
+        assert!(names(&f.app).is_empty());
+        assert!(bottom_row(&mut f.app).contains("0 of 3 shown"));
+    }
+
+    #[test]
+    fn the_filter_ends_when_the_pane_goes_to_another_folder() {
+        let mut f = several();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "pic");
+        press(&mut f.app, &[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert!(f.app.pane().filter().is_none());
+        assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
         f.app.handle_key(key(KeyCode::Char('H')));
         assert_eq!(f.app.pane().cwd, f.home);
-        assert_eq!(names(&f.app), FOLDER);
-        assert_eq!(selected_name(&f.app), Some("notes.txt"));
-        assert!(f.app.pane().search().is_none());
+        assert!(f.app.pane().filter().is_none());
+        assert_eq!(names(&f.app).len(), 8);
     }
 
     #[test]
-    fn escape_leaves_the_search_and_shows_the_folder_with_the_cursor_where_it_was() {
+    fn what_the_filter_matches_in_a_name_is_bold() {
+        let mut f = several();
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "tes");
+        let drawn = crate::ui::testing::buffer(&mut f.app, 100, 20);
+        let (x, y) = crate::ui::testing::find(&drawn, "notes.txt", 22..60).unwrap();
+        let bold = |at: u16| {
+            drawn[(at, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        };
+        assert_eq!(
+            (0..5).map(|i| bold(x + i)).collect::<Vec<_>>(),
+            [false, false, true, true, true]
+        );
+    }
+
+    // Find, `f` and Ctrl+F: a walk below the folder, ranked.
+
+    #[test]
+    fn f_opens_find_on_the_bottom_row_and_ranks_what_it_finds_as_it_is_typed() {
+        for chord in [key(KeyCode::Char('f')), ctrl(KeyCode::Char('f'))] {
+            let mut f = searchable();
+            f.app.handle_key(chord);
+            assert!(typing_a_search(&f.app), "{chord:?}");
+            let row = bottom_row(&mut f.app);
+            assert!(row.starts_with("Find"), "{row}");
+            assert!(row.ends_with("in ~ · tab changes scope"), "{row}");
+
+            type_text(&mut f.app, "TR");
+            assert!(f.app.pane().search().unwrap().is_running());
+            finish_search(&mut f.app);
+            assert_eq!(search_text(&f.app), "TR");
+            type_text(&mut f.app, "ip");
+            finish_search(&mut f.app);
+            assert_eq!(names(&f.app), TRIPS);
+            assert_eq!(f.app.pane().cursor, 0);
+            assert_eq!(f.app.pane().cwd, f.home, "the folder being searched");
+        }
+    }
+
+    #[test]
+    fn a_typo_shows_only_when_nothing_matches_at_a_word_start_or_better() {
+        let mut f = fixture();
+        fs::write(f.home.join("lmap.txt"), "").unwrap();
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        search_for(&mut f.app, "lamp");
+        assert_eq!(names(&f.app), ["lmap.txt"]);
+        fs::create_dir(f.home.join("Documents").join("Lamp")).unwrap();
+        press(&mut f.app, &[KeyCode::Backspace]);
+        search_for(&mut f.app, "p");
+        assert_eq!(names(&f.app), ["Lamp"]);
+    }
+
+    #[test]
+    fn tab_takes_find_from_this_folder_to_home_to_everywhere_and_back() {
+        let mut f = searchable();
+        select(&mut f.app, "Pictures");
+        press(&mut f.app, &[KeyCode::Enter, KeyCode::Char('f')]);
+        search_for(&mut f.app, "trip");
+        assert_eq!(names(&f.app), ["Trip", "day-trip.jpg"]);
+        assert!(bottom_row(&mut f.app).ends_with("in ~/Pictures · tab changes scope"));
+
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.pane().search().unwrap().scope, Scope::Home);
+        finish_search(&mut f.app);
+        assert_eq!(names(&f.app), TRIPS);
+        assert!(bottom_row(&mut f.app).ends_with("in ~ · tab changes scope"));
+        assert!(typing_a_search(&f.app), "Tab stays in the field");
+
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.pane().search().unwrap().scope, Scope::Everywhere);
+        assert!(bottom_row(&mut f.app).ends_with("everywhere · tab changes scope"));
+        // No waiting for all of the disk: Escape stops the walk.
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(!f.app.pane().search().unwrap().is_running());
+
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.pane().search().unwrap().scope, Scope::Folder);
+        finish_search(&mut f.app);
+        assert_eq!(names(&f.app), ["Trip", "day-trip.jpg"]);
+
+        // At home, Home is this folder again: Tab goes on to everywhere.
+        press(
+            &mut f.app,
+            &[KeyCode::Esc, KeyCode::Esc, KeyCode::Char('h')],
+        );
+        press(&mut f.app, &[KeyCode::Char('f'), KeyCode::Tab]);
+        assert_eq!(f.app.pane().search().unwrap().scope, Scope::Everywhere);
+    }
+
+    #[test]
+    fn ctrl_g_finds_in_contents_through_ripgrep_and_says_so_when_it_is_missing() {
+        let mut f = searchable();
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        f.app.handle_key(ctrl(KeyCode::Char('g')));
+        assert!(!f.app.pane().search().unwrap().contents);
+        let row = bottom_row(&mut f.app);
+        assert!(row.contains("ripgrep is unavailable."), "{row}");
+        let drawn = crate::ui::testing::buffer(&mut f.app, 100, 20);
+        let (x, y) = crate::ui::testing::find(&drawn, "ripgrep", 0..100).unwrap();
+        assert_eq!((y, drawn[(x, y)].fg), (19, crate::theme::ERROR));
+
+        let notes = f.home.join("notes.txt");
+        *f.system.grep_finds.borrow_mut() = Some(vec![notes.clone()]);
+        f.app.handle_key(ctrl(KeyCode::Char('g')));
+        assert!(f.app.pane().search().unwrap().contents);
+        assert!(bottom_row(&mut f.app).ends_with("contents in ~ · tab changes scope"));
+        search_for(&mut f.app, "hello");
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        let asked = f.system.grepped.borrow().last().cloned();
+        assert_eq!(asked, Some((vec![f.home.clone()], "hello".to_string())));
+        // Back to names.
+        f.app.handle_key(ctrl(KeyCode::Char('g')));
+        finish_search(&mut f.app);
+        assert!(names(&f.app).is_empty());
+    }
+
+    #[test]
+    fn results_rerank_as_they_stream_and_the_cursor_stays_on_its_item() {
+        let mut f = searchable();
+        *f.system.grep_finds.borrow_mut() = Some(Vec::new());
+        let (feed, gate) = std::sync::mpsc::channel();
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        type_text(&mut f.app, "a");
+        *f.system.grep_feed.borrow_mut() = Some(gate);
+        f.app.handle_key(ctrl(KeyCode::Char('g')));
+        let deep = f.home.join("Pictures").join("Trip").join("day-trip.jpg");
+        feed.send(deep).unwrap();
+        tick_until(&mut f.app, |app| names(app) == ["day-trip.jpg"]);
+        assert!(bottom_row(&mut f.app).ends_with("contents in ~ · tab changes scope"));
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert!(bottom_row(&mut f.app).starts_with("1 found · 1 scanned"));
+
+        // A shorter path ranks first; the cursor stays on what it was on.
+        feed.send(f.home.join("notes.txt")).unwrap();
+        tick_until(&mut f.app, |app| names(app).len() == 2);
+        assert_eq!(names(&f.app), ["notes.txt", "day-trip.jpg"]);
+        assert_eq!(selected_name(&f.app), Some("day-trip.jpg"));
+        assert!(f.app.pane().search().unwrap().is_running());
+
+        // Escape stops the walk first, keeping what it found; then it leaves.
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(!f.app.pane().search().unwrap().is_running());
+        assert_eq!(names(&f.app), ["notes.txt", "day-trip.jpg"]);
+        let row = bottom_row(&mut f.app);
+        assert!(row.starts_with("2 found  Find “a” contents in ~"), "{row}");
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.pane().search().is_none());
+        assert_eq!(names(&f.app), FOLDER);
+        drop(feed);
+    }
+
+    #[test]
+    fn enter_keeps_the_results_and_moves_the_keyboard_into_them() {
         let mut f = searchable();
         select(&mut f.app, "notes.txt");
-        // From the field, and from what was found once the keyboard is there.
-        for at_what_was_found in [false, true] {
-            press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        search_for(&mut f.app, "trip");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert!(f.app.field.is_none());
+        assert_eq!(names(&f.app), TRIPS);
+        assert!(f.system.opened.borrow().is_empty(), "Enter opened nothing");
+        let row = bottom_row(&mut f.app);
+        assert!(row.starts_with("3 found  Find “trip” in ~"), "{row}");
+
+        // Enter on a file opens it; on a folder goes into it.
+        press(&mut f.app, &[KeyCode::Char('j'), KeyCode::Enter]);
+        let plan = f.home.join("Documents").join("trip-plan.md");
+        assert_eq!(*f.system.opened.borrow(), [plan]);
+        assert!(f.app.pane().search().is_some());
+        press(&mut f.app, &[KeyCode::Char('k'), KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
+        assert!(f.app.pane().search().is_none());
+        // Back is the folder that was searched, as it was.
+        f.app.handle_key(key(KeyCode::Char('H')));
+        assert_eq!(names(&f.app), FOLDER);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+    }
+
+    #[test]
+    fn o_reveals_a_result_in_its_folder_as_a_new_place_in_the_history() {
+        let mut f = searchable();
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        search_for(&mut f.app, "trip");
+        press(
+            &mut f.app,
+            &[KeyCode::Enter, KeyCode::End, KeyCode::Char('o')],
+        );
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
+        assert_eq!(selected_name(&f.app), Some("day-trip.jpg"));
+        assert!(f.app.pane().search().is_none());
+        f.app.handle_key(key(KeyCode::Char('H')));
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(selected_name(&f.app), Some("notes.txt"));
+        // Away from results `o` does nothing.
+        press(&mut f.app, &[KeyCode::Char('o')]);
+        assert_eq!(f.app.pane().cwd, f.home);
+    }
+
+    #[test]
+    fn escape_leaves_find_and_shows_the_folder_with_the_cursor_where_it_was() {
+        let mut f = searchable();
+        select(&mut f.app, "notes.txt");
+        for from_the_results in [false, true] {
+            press(&mut f.app, &[KeyCode::Char('f')]);
             search_for(&mut f.app, "trip");
-            press(&mut f.app, &[KeyCode::Down]);
-            if at_what_was_found {
-                press(&mut f.app, &[KeyCode::Tab]);
-                assert!(f.app.field.is_none() && f.app.pane().search().is_some());
+            if from_the_results {
+                press(&mut f.app, &[KeyCode::Enter]);
             }
             press(&mut f.app, &[KeyCode::Esc]);
             assert!(f.app.field.is_none() && f.app.pane().search().is_none());
-            assert_eq!(f.app.pane().cwd, f.home);
             assert_eq!(names(&f.app), FOLDER);
             assert_eq!(selected_name(&f.app), Some("notes.txt"));
         }
     }
 
     #[test]
-    fn what_a_search_finds_works_like_any_item_but_nothing_is_pasted_or_made_there() {
+    fn find_says_what_it_found_and_when_it_found_nothing() {
+        let mut f = searchable();
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        search_for(&mut f.app, "zebra");
+        press(&mut f.app, &[KeyCode::Enter]);
+        let row = bottom_row(&mut f.app);
+        assert!(
+            row.starts_with("Nothing matches zebra  Find “zebra” in ~"),
+            "{row}"
+        );
+        let drawn = crate::ui::testing::screen(&mut f.app, 100, 20);
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.contains("NOTHING MATCHES zebra"))
+        );
+    }
+
+    #[test]
+    fn what_find_finds_works_like_any_item_but_nothing_is_pasted_or_made_there() {
         let mut f = searchable();
         let plan = f.home.join("Documents").join("trip-plan.md");
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         search_for(&mut f.app, "trip");
-        // Tab hands the keyboard to what was found; the search stays.
-        press(&mut f.app, &[KeyCode::Tab]);
-        assert!(f.app.field.is_none());
-        assert_eq!(f.app.focus, Focus::List);
+        press(&mut f.app, &[KeyCode::Enter, KeyCode::Down]);
+        assert_eq!(selected_name(&f.app), Some("trip-plan.md"));
 
-        press(&mut f.app, &[KeyCode::Char(' '), KeyCode::Enter]);
-        let asked_for = [plan.clone()];
-        assert_eq!(*f.system.previewed.borrow(), asked_for);
-        assert_eq!(*f.system.opened.borrow(), asked_for);
-        assert_eq!(search_text(&f.app), "trip", "the space wasn't typed");
+        press(&mut f.app, &[KeyCode::Char(' ')]);
+        assert_eq!(*f.system.previewed.borrow(), std::slice::from_ref(&plan));
         f.app.handle_key(ctrl_shift('c'));
         assert_eq!(*f.system.copied.borrow(), [plan.display().to_string()]);
-        f.app.handle_key(ctrl(KeyCode::Char('x')));
-        assert_eq!(said(&f.app), ("1 item ready to move.", false));
         f.app.handle_key(ctrl(KeyCode::Char('c')));
         assert_eq!(said(&f.app), ("1 item ready to paste.", false));
-
         f.app.handle_key(ctrl(KeyCode::Char('v')));
         assert_eq!(said(&f.app), ("Files can't be pasted here.", false));
-        assert_eq!(f.app.working(), None);
         f.app.handle_key(ctrl_shift('n'));
         assert_eq!(said(&f.app), ("Folders can't be made here.", false));
-        assert!(f.app.dialog.is_none());
 
         // F2 renames it where it is; the search looks again and finds it.
         press(&mut f.app, &[KeyCode::F(2)]);
@@ -5367,70 +6176,71 @@ mod tests {
         press(&mut f.app, &[KeyCode::Enter]);
         finish_search(&mut f.app);
         assert_eq!(on_disk(&f.home.join("Documents")), ["trip-notes.md"]);
-        assert_eq!(names(&f.app), ["trip-notes.md", "Trip", "day-trip.jpg"]);
+        assert_eq!(names(&f.app), ["Trip", "trip-notes.md", "day-trip.jpg"]);
         assert_eq!(selected_name(&f.app), Some("trip-notes.md"));
-        let renamed = "Renamed";
-        assert_eq!(said(&f.app), (renamed, false));
 
         // Delete moves it to the trash, and the cursor to what was next to it.
         select(&mut f.app, "day-trip.jpg");
         press(&mut f.app, &[KeyCode::Delete]);
+        finish_work(&mut f.app);
         finish_search(&mut f.app);
         assert_eq!(read(f.trash.join("day-trip.jpg")), "jpg");
-        assert_eq!(names(&f.app), ["trip-notes.md", "Trip"]);
-        assert_eq!(selected_name(&f.app), Some("Trip"));
-        assert_eq!(said(&f.app), ("Moved 1 item to Trash", false));
+        assert_eq!(names(&f.app), ["Trip", "trip-notes.md"]);
+        assert_eq!(selected_name(&f.app), Some("trip-notes.md"));
 
-        // `/` hands the keyboard back to the field, as it was left.
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        // `f` hands the keyboard back to the field, as it was left.
+        press(&mut f.app, &[KeyCode::Char('f')]);
         assert!(typing_a_search(&f.app));
         assert_eq!(search_text(&f.app), "trip");
-        assert_eq!(names(&f.app), ["trip-notes.md", "Trip"]);
     }
 
     #[test]
-    fn while_the_search_field_is_open_what_is_typed_is_searched_for() {
-        let mut f = searchable();
-        press(&mut f.app, &[KeyCode::Char('/')]);
-        type_text(&mut f.app, "q s?/");
-        assert_eq!(search_text(&f.app), "q s?/");
-        for other in [
-            key(KeyCode::F(2)),
-            key(KeyCode::F(5)),
-            ctrl(KeyCode::Char('c')),
-            ctrl(KeyCode::Char('p')),
-            ctrl(KeyCode::Char('2')),
-            ctrl(KeyCode::Char('l')),
-            ctrl_shift('n'),
-            alt(KeyCode::Char('b')),
-        ] {
-            f.app.handle_key(other);
-            assert_eq!(search_text(&f.app), "q s?/", "{other:?}");
-            assert!(typing_a_search(&f.app), "{other:?}");
+    fn while_a_filter_or_find_field_is_open_what_is_typed_goes_into_it() {
+        for (open, filter) in [('/', true), ('f', false)] {
+            let mut f = searchable();
+            press(&mut f.app, &[KeyCode::Char(open)]);
+            type_text(&mut f.app, "q s?/1j");
+            let text = |app: &App| match filter {
+                true => filter_text(app),
+                false => search_text(app),
+            };
+            assert_eq!(text(&f.app), "q s?/1j");
+            for other in [
+                key(KeyCode::F(2)),
+                key(KeyCode::F(5)),
+                ctrl(KeyCode::Char('c')),
+                ctrl(KeyCode::Char('p')),
+                ctrl(KeyCode::Char('2')),
+                ctrl(KeyCode::Char('l')),
+                ctrl_shift('n'),
+                alt(KeyCode::Char('b')),
+                key(KeyCode::Up),
+            ] {
+                f.app.handle_key(other);
+                assert_eq!(text(&f.app), "q s?/1j", "{other:?}");
+                assert!(f.app.field.is_some(), "{other:?}");
+            }
+            assert!(!f.app.should_quit && !f.app.help_visible && f.app.dialog.is_none());
+            assert_eq!((f.app.sort, f.app.view()), (SortMode::Name, ViewMode::List));
+            assert_eq!(f.app.tabs.len(), 1);
+            assert!(f.system.previewed.borrow().is_empty());
+            assert_eq!(f.app.pane().cwd, f.home);
+
+            // With nothing typed, Enter closes the field and shows the folder.
+            press(&mut f.app, &[KeyCode::Backspace; 7]);
+            press(&mut f.app, &[KeyCode::Enter]);
+            assert!(f.app.field.is_none());
+            assert!(f.app.pane().search().is_none() && f.app.pane().filter().is_none());
+            assert_eq!(names(&f.app), FOLDER);
         }
-        assert!(!f.app.should_quit && !f.app.help_visible && f.app.dialog.is_none());
-        let (sort, view, hidden) = (f.app.sort, f.app.view(), f.app.show_hidden);
-        assert_eq!(
-            (sort, view, hidden),
-            (SortMode::Name, ViewMode::List, false)
-        );
-        assert!(f.system.previewed.borrow().is_empty());
-        assert_eq!(f.app.pane().cwd, f.home);
-
-        // With nothing typed there is no search to hand the keyboard on to.
-        press(&mut f.app, &[KeyCode::Backspace; 5]);
-        press(&mut f.app, &[KeyCode::Tab]);
-        assert!(f.app.field.is_none() && f.app.pane().search().is_none());
-        assert_eq!(f.app.focus, Focus::List);
-        assert_eq!(names(&f.app), FOLDER);
     }
 
     #[test]
-    fn escape_leaves_a_search_before_it_stops_the_file_work_under_way() {
+    fn escape_leaves_find_before_it_stops_the_file_work_under_way() {
         let mut f = searchable();
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         search_for(&mut f.app, "trip");
-        press(&mut f.app, &[KeyCode::Tab]);
+        press(&mut f.app, &[KeyCode::Enter, KeyCode::Down]);
         f.app.handle_key(key(KeyCode::Char('U')));
         assert_eq!(f.app.working(), Some("Duplicating trip-plan.md…"));
         press(&mut f.app, &[KeyCode::Esc]);
@@ -5613,12 +6423,12 @@ mod tests {
         assert_eq!(under_cursor(&f.app, 1), Some("Trip"));
 
         // A search on the left, a folder on the right.
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         search_for(&mut f.app, "trip");
         assert_eq!(names(&f.app), TRIPS);
         assert_eq!(pane_names(&f.app, 1), ["Trip", "a.jpg"]);
         // Out of the field, then on to the right pane.
-        press(&mut f.app, &[KeyCode::Tab, KeyCode::Tab]);
+        press(&mut f.app, &[KeyCode::Enter, KeyCode::Tab]);
         assert_eq!(keyboard(&f.app), (Focus::List, 1));
         assert!(f.app.panes()[0].results().is_some());
 
@@ -6488,10 +7298,10 @@ mod tests {
 
         // What a search found in several folders has no one folder for an archive.
         fs::write(f.home.join("Pictures").join("b.txt"), "b").unwrap();
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         type_text(&mut f.app, "b.txt");
         finish_search(&mut f.app);
-        press(&mut f.app, &[KeyCode::Tab]);
+        press(&mut f.app, &[KeyCode::Enter]);
         f.app.handle_key(ctrl(KeyCode::Char('a')));
         assert_eq!(chosen(&f.app).len(), 2);
         f.app.handle_key(key(KeyCode::Char('m')));
@@ -6499,7 +7309,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::Esc, KeyCode::Esc]);
 
         // A search that found nothing: nothing is pasted or made there.
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         type_text(&mut f.app, "zzz");
         finish_search(&mut f.app);
         assert!(names(&f.app).is_empty());
@@ -6926,7 +7736,7 @@ mod tests {
     #[test]
     fn shift_f10_in_the_search_field_opens_the_menu_for_what_was_found() {
         let mut f = fixture();
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         type_text(&mut f.app, "notes");
         finish_search(&mut f.app);
         assert!(typing_a_search(&f.app));
@@ -7445,16 +8255,6 @@ mod tests {
         // folio's Ctrl+H is gone.
         f.app.handle_key(ctrl(KeyCode::Char('h')));
         assert!(!f.app.show_hidden);
-    }
-
-    #[test]
-    fn f_and_ctrl_f_search_as_slash_does_for_now() {
-        for chord in [key(KeyCode::Char('f')), ctrl(KeyCode::Char('f'))] {
-            let mut f = fixture();
-            f.app.handle_key(chord);
-            assert!(f.app.pane().search().is_some(), "{chord:?}");
-            assert!(matches!(f.app.field, Some(Field::Search)));
-        }
     }
 }
 
@@ -8060,7 +8860,7 @@ mod mouse_tests {
         click(&mut f.app, notes);
         assert_eq!(cursor_name(&f.app), "notes.txt");
 
-        press(&mut f.app, &[KeyCode::Char('/')]);
+        press(&mut f.app, &[KeyCode::Char('f')]);
         type_text(&mut f.app, "jpg");
         finish_search(&mut f.app);
         let found = spot(&mut f.app, "a.jpg", 26..73);
@@ -8068,10 +8868,6 @@ mod mouse_tests {
         assert!(f.app.field.is_none(), "the keyboard is with what was found");
         assert!(f.app.pane().results().is_some(), "still showing it");
         assert_eq!(cursor_name(&f.app), "a.jpg");
-        // A click on the field hands the keyboard back to it.
-        let field = spot(&mut f.app, "/jpg", 0..86);
-        click(&mut f.app, field);
-        assert!(matches!(f.app.field, Some(Field::Search)));
     }
 
     #[test]

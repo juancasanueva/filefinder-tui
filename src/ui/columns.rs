@@ -94,10 +94,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, tracks: &[Rect], hits: &mut HitMap
         return item;
     }
     pane.offset = scroll(pane.offset, pane.cursor, rows);
-    let query = pane
-        .results()
-        .map(|search| search.input.text())
-        .unwrap_or_default();
+    let query = pane.matching();
     let mut lines = Vec::new();
     for (row, entry) in pane.entries.iter().enumerate().skip(pane.offset).take(rows) {
         let y = own.y + lines.len() as u16;
