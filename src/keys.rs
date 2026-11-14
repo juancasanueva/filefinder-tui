@@ -858,8 +858,9 @@ fn where_(line: Option<usize>) -> String {
 
 /// The line, from 1, a byte of the file is on.
 fn line_at(text: &str, at: usize) -> Option<usize> {
-    let at = at.min(text.len());
-    Some(text[..at].matches('\n').count() + 1)
+    // Bytes, not a slice of the text: `at` may fall inside a character.
+    let before = &text.as_bytes()[..at.min(text.len())];
+    Some(before.iter().filter(|byte| **byte == b'\n').count() + 1)
 }
 
 /// The line a command's name is written on, bare or quoted, before its `=`
@@ -1081,6 +1082,18 @@ mod tests {
         for command in [Command::Cut, Command::Paste, Command::Undo, Command::Down] {
             assert!(keymap.is_default(command), "{}", command.name());
         }
+    }
+
+    #[test]
+    fn a_place_inside_a_character_still_has_its_line() {
+        let text = "# ñandú\ncopy = [\"é\"\n";
+        // The middle of `ñ`, and of `é` on the second line.
+        assert_eq!(line_at(text, 3), Some(1));
+        assert_eq!(line_at(text, text.find('é').unwrap() + 1), Some(2));
+        assert_eq!(line_at(text, text.len() + 5), Some(3));
+        let (keymap, problems) = Keymap::read(text);
+        assert_eq!(keymap, Keymap::default());
+        assert_eq!(problems.len(), 1, "{problems:?}");
     }
 
     #[test]
