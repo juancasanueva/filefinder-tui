@@ -10,6 +10,7 @@ mod help;
 mod list;
 mod look;
 mod menu;
+mod places;
 mod preview;
 mod prompt;
 mod topbar;
@@ -43,7 +44,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits = hits;
 }
 
-/// The widths of the parent's column, the list and the preview, in that
+/// The widths of the places panel, the files and the preview, in that
 /// order, for a window `columns` wide; the preview's is 0 when it is hidden.
 /// A `│` follows each of the first two.
 pub fn pane_widths(columns: u16, preview: bool) -> (u16, u16, u16) {
@@ -87,41 +88,42 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
     let column = |x: u16, width: u16| Rect::new(body.x + x, body.y, width, body.height);
     // Where the lines between the panes meet the rules.
     let mut junctions = Vec::new();
-    // The files beside the preview, when it shows: the list view keeps the
-    // parent's column left of them, the columns and the grid take its room.
-    let files = match app.view() {
-        ViewMode::List => {
-            junctions.push(left);
-            column(left + 1, middle)
-        }
-        ViewMode::Dual => {
-            junctions.push(dual::divider(body.width));
-            body
-        }
-        _ if preview => column(0, left + middle + 1),
-        _ => body,
+    // The places panel on the left in every view, when it shows; the files
+    // between it and the preview, or in their room when either is hidden.
+    let panel = app.places_visible;
+    let start = if panel { left + 1 } else { 0 };
+    let end = if preview {
+        left + middle + 1
+    } else {
+        body.width
     };
+    let files = column(start, end.saturating_sub(start));
+    if panel {
+        junctions.push(left);
+    }
     if preview {
         junctions.push(left + middle + 1);
     }
     let tracks = match app.view() {
-        ViewMode::Columns => columns::tracks(app, files, area.width),
+        // As many columns as the room left for them takes.
+        ViewMode::Columns => columns::tracks(app, files, files.width),
         _ => Vec::new(),
     };
     junctions.extend(tracks.iter().skip(1).map(|track| track.x - body.x - 1));
+    if app.view() == ViewMode::Dual {
+        junctions.push(start + dual::divider(files.width));
+    }
     rule(frame, top_rule, &junctions, '┬');
     rule(frame, bottom_rule, &junctions, '┴');
 
+    if panel {
+        places::draw(frame, app, column(0, left), hits);
+        separator(frame, column(left, 1));
+    }
     let item = match app.view() {
-        ViewMode::Dual => dual::draw(frame, app, body, hits),
+        ViewMode::Dual => dual::draw(frame, app, files, hits),
         ViewMode::Columns => columns::draw(frame, app, &tracks, hits),
-        _ => {
-            if app.view() == ViewMode::List {
-                list::draw_parent(frame, app, column(0, left), hits);
-                separator(frame, column(left, 1));
-            }
-            draw_pane(frame, app, app.active(), files, hits)
-        }
+        _ => draw_pane(frame, app, app.active(), files, hits),
     };
     if preview {
         separator(frame, column(left + middle + 1, 1));
@@ -565,48 +567,6 @@ mod tests {
     }
 
     #[test]
-    fn the_parent_column_lists_the_parent_folder_muted_with_this_folder_lifted() {
-        let mut f = in_pictures();
-        let drawn = buffer(&mut f.app, 120, 30);
-        assert_eq!(find(&drawn, "Documents", 0..25), Some((3, 2)));
-        assert_eq!(drawn[(3, 2)].fg, theme::MUTED);
-        assert_eq!(drawn[(1, 2)].fg, theme::MUTED, "the glyph");
-        // This folder: on the selected fill from edge to edge, no accent edge.
-        assert_eq!(cells(&drawn, 3, 3..11), "Pictures");
-        assert_eq!(drawn[(3, 3)].fg, theme::FOREGROUND);
-        for x in 0..25 {
-            assert_eq!(drawn[(x, 3)].bg, theme::SELECTED, "{x}");
-        }
-        assert_eq!(drawn[(0, 3)].symbol(), " ");
-        assert_eq!(find(&drawn, "notes.txt", 0..25), Some((3, 4)));
-        assert_eq!(drawn[(3, 4)].fg, theme::MUTED);
-        // No sizes there.
-        for y in 2..28 {
-            let row = cells(&drawn, y, 0..25);
-            assert!(
-                !row.contains("5 B") && !row.contains("item"),
-                "row {y}: {row}"
-            );
-        }
-
-        // A click on a row there goes into that folder.
-        f.app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 5,
-            row: 2,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(f.app.pane().cwd, f.home.join("Documents"));
-
-        // At the root it is empty.
-        f.app.navigate(std::path::Path::new("/"));
-        let root = buffer(&mut f.app, 120, 30);
-        for y in 2..28 {
-            assert_eq!(cells(&root, y, 0..25).trim(), "", "row {y}");
-        }
-    }
-
-    #[test]
     fn list_rows_are_an_edge_a_glyph_the_name_and_the_size() {
         let mut f = in_pictures();
         let drawn = buffer(&mut f.app, 120, 30);
@@ -974,11 +934,12 @@ mod tests {
         let mut f = fixture();
         f.app.handle_key(ctrl(KeyCode::Char('3')));
         let grid = buffer(&mut f.app, 120, 30);
-        // Three tiles across the list's and the parent's room, the names
-        // under the pictures; no parent column.
-        assert_eq!(find(&grid, "notes.txt", 0..73), Some((53, 9)));
-        assert_eq!(grid[(25, 10)].symbol(), " ", "no parent column");
-        assert_eq!(grid[(25, 1)].symbol(), "─");
+        // The tiles between the places panel and the preview, the names
+        // under the pictures.
+        let (x, _) = find(&grid, "notes.txt", 26..73).expect("a tile");
+        assert!(x > 26);
+        assert_eq!(grid[(25, 10)].symbol(), "│", "the places panel's line");
+        assert_eq!(grid[(25, 1)].symbol(), "┬");
         // The preview on the right, as in the list, of the cursor's item.
         assert_eq!(grid[(73, 1)].symbol(), "┬");
         assert_eq!(grid[(73, 28)].symbol(), "┴");
@@ -993,10 +954,11 @@ mod tests {
 
         f.app.handle_key(ctrl(KeyCode::Char('2')));
         let columns = buffer(&mut f.app, 120, 30);
-        // At home, home is the only column: it takes the room left of the preview.
-        assert_eq!(find(&columns, "notes.txt", 0..73), Some((3, 4)));
-        assert_eq!(find(&columns, "5 B", 0..73).map(|(_, y)| y), Some(4));
-        assert_eq!(columns[(25, 10)].symbol(), " ");
+        // At home, home is the only column: it takes the room between the
+        // places panel and the preview.
+        assert_eq!(find(&columns, "notes.txt", 26..73), Some((29, 4)));
+        assert_eq!(find(&columns, "5 B", 26..73).map(|(_, y)| y), Some(4));
+        assert_eq!(columns[(25, 10)].symbol(), "│");
         assert_eq!(columns[(73, 10)].symbol(), "│");
         assert_eq!(
             find(&columns, "Documents", 74..120).map(|(_, y)| y),
@@ -1011,14 +973,14 @@ mod tests {
         press(&mut f.app, &[KeyCode::Down, KeyCode::Char('l')]);
         f.app.tick();
         let drawn = buffer(&mut f.app, 120, 30);
-        // Room for three columns of 23 in the 73 cells left of the preview:
-        // home, then Pictures taking what is left over.
+        // Room for two columns of 23 in the 47 cells between the places
+        // panel and the preview: home, then Pictures.
         for y in 2..28 {
-            assert_eq!(drawn[(23, y)].symbol(), "│", "row {y}");
-            assert_eq!(drawn[(23, y)].fg, theme::BORDER);
+            assert_eq!(drawn[(49, y)].symbol(), "│", "row {y}");
+            assert_eq!(drawn[(49, y)].fg, theme::BORDER);
         }
         assert_eq!(
-            (drawn[(23, 1)].symbol(), drawn[(23, 28)].symbol()),
+            (drawn[(49, 1)].symbol(), drawn[(49, 28)].symbol()),
             ("┬", "┴")
         );
         assert_eq!(
@@ -1026,37 +988,37 @@ mod tests {
             ("┬", "┴")
         );
         // Home: muted, the way down on the selected fill without the edge.
-        assert_eq!(find(&drawn, "Documents", 0..23), Some((3, 2)));
-        assert_eq!(drawn[(3, 2)].fg, theme::MUTED);
-        assert_eq!(cells(&drawn, 3, 3..11), "Pictures");
-        assert_eq!(drawn[(3, 3)].fg, theme::FOREGROUND);
+        assert_eq!(find(&drawn, "Documents", 26..49), Some((29, 2)));
+        assert_eq!(drawn[(29, 2)].fg, theme::MUTED);
+        assert_eq!(cells(&drawn, 3, 29..37), "Pictures");
+        assert_eq!(drawn[(29, 3)].fg, theme::FOREGROUND);
         assert_eq!(
-            (drawn[(0, 3)].symbol(), drawn[(0, 3)].bg),
+            (drawn[(26, 3)].symbol(), drawn[(26, 3)].bg),
             (" ", theme::SELECTED)
         );
-        assert_eq!(drawn[(22, 3)].bg, theme::SELECTED);
-        assert!(!cells(&drawn, 4, 0..23).contains("5 B"), "no sizes above");
+        assert_eq!(drawn[(48, 3)].bg, theme::SELECTED);
+        assert!(!cells(&drawn, 4, 26..49).contains("5 B"), "no sizes above");
         // Pictures: the cursor with the accent edge, the detail column.
-        assert_eq!(find(&drawn, "Trip", 24..73), Some((27, 2)));
+        assert_eq!(find(&drawn, "Trip", 50..73), Some((53, 2)));
         assert_eq!(
-            (drawn[(24, 2)].symbol(), drawn[(24, 2)].fg),
+            (drawn[(50, 2)].symbol(), drawn[(50, 2)].fg),
             ("▎", theme::ACCENT)
         );
         assert_eq!(
-            (drawn[(24, 2)].bg, drawn[(72, 2)].bg),
+            (drawn[(50, 2)].bg, drawn[(72, 2)].bg),
             (theme::CURSOR, theme::CURSOR)
         );
-        assert_eq!(find(&drawn, "a.jpg", 24..73), Some((27, 3)));
-        assert_eq!(find(&drawn, "3 B", 24..73).map(|(_, y)| y), Some(3));
+        assert_eq!(find(&drawn, "a.jpg", 50..73), Some((53, 3)));
+        assert_eq!(find(&drawn, "3 B", 50..73).map(|(_, y)| y), Some(3));
         // The preview of Trip on the right.
         assert_eq!(find(&drawn, "Trip", 74..120).map(|(_, y)| y), Some(2));
 
-        // `l` goes on into Trip: three columns, the last empty; `h` back out.
+        // `l` goes on into Trip: Pictures, then Trip, empty; `h` back out.
         press(&mut f.app, &[KeyCode::Char('l')]);
         let deeper = buffer(&mut f.app, 120, 30);
-        assert_eq!(deeper[(47, 10)].symbol(), "│");
-        assert_eq!(find(&deeper, "a.jpg", 24..47), Some((27, 3)));
-        assert!(find(&deeper, "NOTHING HERE YET", 48..73).is_some());
+        assert_eq!(deeper[(49, 10)].symbol(), "│");
+        assert_eq!(find(&deeper, "a.jpg", 26..49), Some((29, 3)));
+        assert!(find(&deeper, "NOTHING HERE YET", 50..73).is_some());
         press(&mut f.app, &[KeyCode::Char('h')]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
         assert_eq!(
@@ -1074,17 +1036,19 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('2')));
         f.app.navigate(&deep);
         let drawn = buffer(&mut f.app, 120, 30);
-        // Three of home, Documents, alpha, bravo and charlie: alpha's,
-        // bravo's and charlie's own items.
-        assert_eq!(cells(&drawn, 2, 3..8), "bravo");
-        assert_eq!(cells(&drawn, 2, 27..34), "charlie");
-        assert_eq!(cells(&drawn, 2, 51..61), "inside.txt");
-        assert!((2..28).all(|y| !cells(&drawn, y, 0..73).contains("Documents")));
-        // A narrow window has room for two.
-        let narrow = buffer(&mut f.app, 80, 30);
-        assert_eq!(cells(&narrow, 2, 3..10), "charlie");
-        assert_eq!(cells(&narrow, 2, 27..37), "inside.txt");
-        assert!(!cells(&narrow, 2, 0..48).contains("bravo"));
+        // Two of home, Documents, alpha, bravo and charlie in the 47 cells
+        // beside the preview: bravo's and charlie's own items.
+        assert_eq!(cells(&drawn, 2, 29..36), "charlie");
+        assert_eq!(cells(&drawn, 2, 53..63), "inside.txt");
+        assert!((2..28).all(|y| !cells(&drawn, y, 26..73).contains("Documents")));
+        assert!(!cells(&drawn, 2, 26..73).contains("bravo"));
+        // Without the preview the 94 cells have room for three.
+        f.app
+            .handle_key(crate::app::testing::alt(KeyCode::Char('p')));
+        let wide = buffer(&mut f.app, 120, 30);
+        assert_eq!(cells(&wide, 2, 29..34), "bravo");
+        assert_eq!(cells(&wide, 2, 60..67), "charlie");
+        assert_eq!(cells(&wide, 2, 91..101), "inside.txt");
     }
 
     #[test]
@@ -1097,10 +1061,10 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('2')));
         f.app.navigate(&f.home.join("Folder 30"));
         let drawn = buffer(&mut f.app, 120, 30);
-        let y = (2..28).find(|y| cells(&drawn, *y, 3..12) == "Folder 30");
+        let y = (2..28).find(|y| cells(&drawn, *y, 29..38) == "Folder 30");
         let y = y.expect("the way down, in view");
-        assert_eq!(drawn[(3, y)].bg, theme::SELECTED);
-        assert_eq!(find(&drawn, "inside.txt", 24..73), Some((27, 2)));
+        assert_eq!(drawn[(29, y)].bg, theme::SELECTED);
+        assert_eq!(find(&drawn, "inside.txt", 50..73), Some((53, 2)));
     }
 
     #[test]
@@ -1111,7 +1075,7 @@ mod tests {
         buffer(&mut f.app, 120, 30);
         f.app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: 5,
+            column: 31,
             row: 2,
             modifiers: KeyModifiers::NONE,
         });
@@ -1136,12 +1100,13 @@ mod tests {
         finish_search(&mut f.app);
         press(&mut f.app, &[KeyCode::Enter]);
 
-        // The home column steps out: what was found is the only one.
+        // The home column steps out: what was found is the only one,
+        // between the places panel (27 cells and its line) and the preview.
         let columns = buffer(&mut f.app, 130, 30);
-        assert_eq!(find(&columns, "a.jpg", 0..79), Some((3, 2)));
-        assert_eq!(find(&columns, "day.jpg", 0..79), Some((3, 3)));
+        assert_eq!(find(&columns, "a.jpg", 0..79), Some((31, 2)));
+        assert_eq!(find(&columns, "day.jpg", 0..79), Some((31, 3)));
         assert_eq!(find(&columns, "notes.txt", 0..130), None);
-        assert_eq!(columns[(0, 2)].bg, theme::CURSOR, "the cursor");
+        assert_eq!(columns[(28, 2)].bg, theme::CURSOR, "the cursor");
 
         f.app.handle_key(ctrl(KeyCode::Char('1')));
         let list = buffer(&mut f.app, 130, 30);
@@ -1159,8 +1124,8 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(&mut f.app, &[KeyCode::Esc]);
         let columns = buffer(&mut f.app, 130, 30);
-        assert_eq!(find(&columns, "notes.txt", 0..130), Some((3, 4)));
-        assert_eq!(find(&columns, "a.jpg", 0..79), Some((29, 3)));
+        assert_eq!(find(&columns, "notes.txt", 0..130), Some((31, 4)));
+        assert_eq!(find(&columns, "a.jpg", 0..79), Some((57, 3)));
     }
 
     #[test]
@@ -1174,39 +1139,40 @@ mod tests {
         f.app.tick();
         let right = buffer(&mut f.app, 120, 30);
 
-        // The whole body: 60, a line, 59, meeting the rules; no preview.
+        // The body right of the places panel: 47, a line, 46, meeting the
+        // rules; no preview.
         for y in 2..28 {
-            assert_eq!(right[(60, y)].symbol(), "│", "row {y}");
-            assert_eq!(right[(60, y)].fg, theme::BORDER);
+            assert_eq!(right[(73, y)].symbol(), "│", "row {y}");
+            assert_eq!(right[(73, y)].fg, theme::BORDER);
         }
         assert_eq!(
-            (right[(60, 1)].symbol(), right[(60, 28)].symbol()),
+            (right[(73, 1)].symbol(), right[(73, 28)].symbol()),
             ("┬", "┴")
         );
-        for x in (0..120).filter(|x| *x != 60) {
+        for x in (0..120).filter(|x| *x != 25 && *x != 73) {
             assert_eq!(
                 (right[(x, 1)].symbol(), right[(x, 28)].symbol()),
                 ("─", "─")
             );
         }
         // Each pane's path on its first row: the folder lit where the keyboard is.
-        assert_eq!(cells(&right, 2, 0..3), " ~ ");
-        assert_eq!(right[(1, 2)].fg, theme::MUTED);
-        assert_eq!(cells(&right, 2, 61..73), " ~/Pictures ");
-        assert_eq!(right[(62, 2)].fg, theme::MUTED);
-        assert_eq!(right[(64, 2)].fg, theme::FOREGROUND);
+        assert_eq!(cells(&right, 2, 26..29), " ~ ");
+        assert_eq!(right[(27, 2)].fg, theme::MUTED);
+        assert_eq!(cells(&right, 2, 74..86), " ~/Pictures ");
+        assert_eq!(right[(75, 2)].fg, theme::MUTED);
+        assert_eq!(right[(77, 2)].fg, theme::FOREGROUND);
         // Under it the files, each pane's own, with its own cursor: only the
         // pane with the keyboard draws the edge.
-        assert_eq!(cells(&right, 3, 3..12), "Documents");
-        assert_eq!(cells(&right, 4, 3..11), "Pictures");
-        assert_eq!(cells(&right, 3, 64..68), "Trip");
-        assert_eq!(cells(&right, 4, 64..69), "a.jpg");
+        assert_eq!(cells(&right, 3, 29..38), "Documents");
+        assert_eq!(cells(&right, 4, 29..37), "Pictures");
+        assert_eq!(cells(&right, 3, 77..81), "Trip");
+        assert_eq!(cells(&right, 4, 77..82), "a.jpg");
         assert_eq!(
-            (right[(0, 4)].symbol(), right[(0, 4)].bg),
+            (right[(26, 4)].symbol(), right[(26, 4)].bg),
             (" ", theme::SELECTED)
         );
         assert_eq!(
-            (right[(61, 4)].symbol(), right[(61, 4)].bg),
+            (right[(74, 4)].symbol(), right[(74, 4)].bg),
             ("▎", theme::CURSOR)
         );
         // The header is the right pane's.
@@ -1216,10 +1182,10 @@ mod tests {
         press(&mut f.app, &[KeyCode::BackTab]);
         f.app.tick();
         let left = buffer(&mut f.app, 120, 30);
-        assert_eq!(left[(1, 2)].fg, theme::FOREGROUND);
-        assert_eq!(left[(64, 2)].fg, theme::MUTED);
-        assert_eq!(left[(0, 4)].symbol(), "▎");
-        assert_eq!(left[(61, 4)].symbol(), " ");
+        assert_eq!(left[(27, 2)].fg, theme::FOREGROUND);
+        assert_eq!(left[(77, 2)].fg, theme::MUTED);
+        assert_eq!(left[(26, 4)].symbol(), "▎");
+        assert_eq!(left[(74, 4)].symbol(), " ");
         assert_eq!(cells(&left, 0, 0..60).trim(), "~");
 
         // Closed, the window is what it was before.
@@ -1235,7 +1201,7 @@ mod tests {
         let colors = |drawn: &Buffer, x, y| (drawn[(x, y)].fg, drawn[(x, y)].bg);
 
         // Documents and Pictures, not notes.txt: rows in the list and the columns.
-        for (view, x) in [('1', 29), ('2', 3)] {
+        for (view, x) in [('1', 29), ('2', 29)] {
             f.app.handle_key(ctrl(KeyCode::Char(view)));
             let drawn = buffer(&mut f.app, 120, 30);
             let at = |y| colors(&drawn, x, y);
@@ -1246,11 +1212,11 @@ mod tests {
         // Tiles in the grid: the marked fill and the cursor's.
         f.app.handle_key(ctrl(KeyCode::Char('3')));
         let grid = buffer(&mut f.app, 120, 30);
-        let (x, y) = find(&grid, "Documents", 0..73).unwrap();
+        let (x, y) = find(&grid, "Documents", 26..73).unwrap();
         assert_eq!(colors(&grid, x, y), (theme::FOREGROUND, theme::MARKED));
-        let (x, y) = find(&grid, "Pictures", 0..73).unwrap();
+        let (x, y) = find(&grid, "Pictures", 26..73).unwrap();
         assert_eq!(colors(&grid, x, y), (theme::FOREGROUND, theme::CURSOR));
-        let (x, y) = find(&grid, "notes.txt", 0..73).unwrap();
+        let (x, y) = find(&grid, "notes.txt", 26..73).unwrap();
         assert_eq!(colors(&grid, x, y), (theme::FOREGROUND, Color::Reset));
     }
 }

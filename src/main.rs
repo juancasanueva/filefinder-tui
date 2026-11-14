@@ -7,6 +7,7 @@ mod input;
 mod matcher;
 mod model;
 mod ops;
+mod places;
 mod search;
 mod state;
 mod system;
@@ -53,6 +54,7 @@ fn main() -> io::Result<()> {
         state_dir: Some(home.join(".config/filefinder-tui")),
         thumbs: Some(Thumbs::new(picker, Arc::new(thumbnailer))),
         trash_dir: home.join(".Trash"),
+        volumes_dir: PathBuf::from("/Volumes"),
         home: home.clone(),
         start,
         date_style: DateStyle::from_env(),

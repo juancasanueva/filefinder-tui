@@ -1,5 +1,5 @@
 //! The list: flea's rows, an edge, a glyph, the name and the detail column
-//! (`I`), and the parent folder's column on its left.
+//! (`I`).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -26,7 +26,7 @@ pub struct Look {
     pub focused: bool,
     /// It is one of several selected.
     pub marked: bool,
-    /// It is in the parent folder's column: muted.
+    /// It is in a column of a folder above, in the columns view: muted.
     pub parent: bool,
     /// It is in the preview: in the metadata ink.
     pub quiet: bool,
@@ -99,7 +99,7 @@ pub fn row(
 /// cyan, programs green, everything else the foreground.
 pub fn inks(entry: &Entry, look: Look) -> (Color, Color) {
     let lifted = look.cursor || look.marked;
-    // The preview's and the parent's rows are never read from here; what
+    // The preview's and the columns above are never read from here; what
     // can't be read shows as such only in the list itself.
     let dimmed = !look.parent && !look.quiet && entry.unreadable();
     let ink = if dimmed {
@@ -211,28 +211,6 @@ pub fn draw(
             &query,
             folder.as_deref(),
         ));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// The parent folder's items, left of the list: muted, without sizes, the
-/// folder the list shows on the cursor's fill. Empty at `/`. Each row is a
-/// spot for the mouse.
-pub fn draw_parent(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
-    let pane = app.pane();
-    let current = pane.parent.iter().position(|entry| entry.path == pane.cwd);
-    let rows = area.height as usize;
-    let offset = scroll(0, current.unwrap_or(0), rows);
-    let mut lines = Vec::new();
-    for (index, entry) in pane.parent.iter().enumerate().skip(offset).take(rows) {
-        let y = area.y + lines.len() as u16;
-        hits.add(Rect::new(area.x, y, area.width, 1), Spot::Parent(index));
-        let look = Look {
-            cursor: current == Some(index),
-            parent: true,
-            ..Look::default()
-        };
-        lines.push(row(entry, area.width as usize, None, look, "", None));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }

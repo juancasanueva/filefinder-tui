@@ -374,10 +374,12 @@ mod tests {
     use std::fs::{self, File};
     use std::time::{Duration, SystemTime};
 
-    /// Ctrl+3 with the preview hidden: the grid takes the whole body.
+    /// Ctrl+3 with the preview and the places panel hidden: the grid takes
+    /// the whole body.
     fn whole_grid(app: &mut App) {
         app.handle_key(ctrl(KeyCode::Char('3')));
         app.handle_key(alt(KeyCode::Char('p')));
+        app.handle_key(ctrl(KeyCode::Char('b')));
     }
 
     #[test]

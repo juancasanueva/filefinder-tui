@@ -1,5 +1,6 @@
 //! The header: where the pane is on the left, the parent part muted and the
-//! folder itself in the foreground, and the sort order on the right.
+//! folder itself in the foreground, then the tabs, the view buttons and the
+//! sort order on the right.
 
 use std::path::Path;
 
@@ -10,9 +11,35 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 use super::{fit, pad};
-use crate::app::{App, HitMap, Spot};
+use crate::app::{App, HitMap, Spot, ViewMode};
+use crate::icons;
 use crate::model::SortMode;
 use crate::theme;
+
+/// The view buttons, in order: what Ctrl+1 to Ctrl+4 switch to.
+const VIEWS: [ViewMode; 4] = [
+    ViewMode::List,
+    ViewMode::Columns,
+    ViewMode::Grid,
+    ViewMode::Dual,
+];
+/// The cells the buttons take: four glyphs, one space apart.
+const BUTTONS_WIDTH: usize = 7;
+/// The cells of path the buttons always leave; with fewer they are dropped,
+/// before the sort label is.
+const PATH_BEFORE_BUTTONS: usize = 24;
+
+/// The cells the view buttons and the gap before them take in `inner` cells
+/// of header beside a sort label `sort` cells wide: none when there isn't
+/// room for them and enough of the path.
+fn buttons_room(inner: usize, sort: usize) -> usize {
+    let room = BUTTONS_WIDTH + 2;
+    if inner >= sort + 2 + room + PATH_BEFORE_BUTTONS {
+        room
+    } else {
+        0
+    }
+}
 
 /// The sort order as the header says it: the key, then `▴` ascending or
 /// `▾` reversed.
@@ -37,7 +64,8 @@ pub fn tab_label(app: &App, index: usize) -> String {
 }
 
 /// The tab strip in `inner` cells of header, flea's way: none with one tab;
-/// else the room left of the sort label, the path's share first and then
+/// else the room left of the view buttons and the sort label, the path's
+/// share first and then
 /// the labels, as many as fit from the one before the tab showing, the last
 /// one cut with `…` when it doesn't fit whole. Each label with its tab.
 pub fn tab_strip(app: &App, inner: usize) -> (usize, Vec<(usize, String)>) {
@@ -45,7 +73,9 @@ pub fn tab_strip(app: &App, inner: usize) -> (usize, Vec<(usize, String)>) {
         return (0, Vec::new());
     }
     let sort = sort_label(app.sort).width();
-    let available = inner.saturating_sub(sort + 2).max(1);
+    let available = inner
+        .saturating_sub(sort + 2 + buttons_room(inner, sort))
+        .max(1);
     let width = |index: usize| tab_label(app, index).width();
     // As many before the tab showing as fit whole with it.
     let mut first = app.current;
@@ -68,14 +98,15 @@ pub fn tab_strip(app: &App, inner: usize) -> (usize, Vec<(usize, String)>) {
 }
 
 /// Draws the header row; each folder of the path, each tab's label and
-/// each field is a spot for the mouse.
+/// each view button is a spot for the mouse.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // One blank cell on each side.
     let inner = (area.width as usize).saturating_sub(2);
     let sort = sort_label(app.sort);
     let sort = sort.as_str();
     let sort_width = sort.width().min(inner);
-    let room = inner - sort_width;
+    let buttons = buttons_room(inner, sort_width);
+    let room = inner - sort_width - buttons;
     let gap = room.min(2);
     let (strip_path, labels) = tab_strip(app, inner);
     let path_width = if labels.is_empty() {
@@ -98,16 +129,26 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let spans = crumbs(app, app.active(), path_width, true, left, hits);
     frame.render_widget(Paragraph::new(Line::from(spans)), left);
 
-    let sort_area = Rect::new(
-        area.right().saturating_sub(1 + sort_width as u16),
-        area.y,
-        sort_width as u16,
-        1,
-    );
+    let sort_x = area.right().saturating_sub(1 + sort_width as u16);
+    if buttons > 0 {
+        draw_buttons(frame, app, sort_x - 2 - BUTTONS_WIDTH as u16, area.y, hits);
+    }
+    let sort_area = Rect::new(sort_x, area.y, sort_width as u16, 1);
     frame.render_widget(
         Paragraph::new(sort_cells(sort, sort_width)).style(theme::muted()),
         sort_area,
     );
+}
+
+/// The four view buttons from `x`, one space apart: the view showing on the
+/// tab fill in the foreground, the others muted. Each is a spot for the mouse.
+fn draw_buttons(frame: &mut Frame, app: &App, x: u16, y: u16, hits: &mut HitMap) {
+    for (slot, view) in VIEWS.into_iter().enumerate() {
+        let rect = Rect::new(x + 2 * slot as u16, y, 1, 1);
+        let style = theme::tab_label(view == app.view());
+        frame.render_widget(Paragraph::new(icons::view(view)).style(style), rect);
+        hits.add(rect, Spot::View(view));
+    }
 }
 
 /// The label fitted to `width` with its arrow kept in the last cell.
@@ -285,36 +326,49 @@ mod tests {
     fn the_tab_strip_shows_with_two_tabs_between_the_path_and_the_sort_label() {
         let mut f = fixture();
         let one = screen(&mut f.app, 120, 30);
-        assert_eq!(one[0].trim_end(), format!(" ~{}Name ▴", " ".repeat(111)));
+        let buttons = format!(
+            "{} {} {} {}",
+            crate::icons::VIEW_LIST,
+            crate::icons::VIEW_COLUMNS,
+            crate::icons::VIEW_GRID,
+            crate::icons::VIEW_DUAL
+        );
+        assert_eq!(
+            one[0].trim_end(),
+            format!(" ~{}{buttons}  Name ▴", " ".repeat(102))
+        );
         press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
         let drawn = buffer(&mut f.app, 120, 30);
         let header = screen(&mut f.app, 120, 30).remove(0);
-        // The path's share, the labels packed against the sort label.
+        // The path's share, the labels packed against the view buttons.
         assert_eq!(
             header,
-            format!(" ~/Pictures{} 1 ~  2 Pictures   Name ▴ ", " ".repeat(83))
+            format!(
+                " ~/Pictures{} 1 ~  2 Pictures   {buttons}  Name ▴ ",
+                " ".repeat(74)
+            )
         );
         // The tab showing on the tab fill in the foreground, the other muted.
-        for x in 94..99 {
+        for x in 85..90 {
             assert_eq!(
                 (drawn[(x, 0)].fg, drawn[(x, 0)].bg),
                 (theme::MUTED, Color::Reset),
                 "{x}"
             );
         }
-        for x in 99..111 {
+        for x in 90..102 {
             assert_eq!(
                 (drawn[(x, 0)].fg, drawn[(x, 0)].bg),
                 (theme::FOREGROUND, theme::TAB),
                 "{x}"
             );
         }
-        assert_eq!(drawn[(111, 0)].bg, Color::Reset);
+        assert_eq!(drawn[(102, 0)].bg, Color::Reset);
         assert_eq!(drawn[(113, 0)].fg, theme::MUTED, "the sort label");
 
         // At the root the label is a slash; closed down to one, no strip.
         f.app.navigate(std::path::Path::new("/"));
-        assert!(screen(&mut f.app, 120, 30)[0].contains(" 1 ~  2 /   Name ▴ "));
+        assert!(screen(&mut f.app, 120, 30)[0].contains(" 1 ~  2 /   "));
         press(&mut f.app, &[KeyCode::Char('w')]);
         assert_eq!(screen(&mut f.app, 120, 30)[0], one[0]);
     }
@@ -355,6 +409,105 @@ mod tests {
     }
 
     #[test]
+    fn the_view_buttons_sit_before_the_sort_label_with_the_current_one_lit() {
+        use crate::app::ViewMode;
+        use crate::app::testing::ctrl;
+        use crate::icons;
+        let mut f = fixture();
+        let buttons = [
+            (104, ViewMode::List, icons::VIEW_LIST),
+            (106, ViewMode::Columns, icons::VIEW_COLUMNS),
+            (108, ViewMode::Grid, icons::VIEW_GRID),
+            (110, ViewMode::Dual, icons::VIEW_DUAL),
+        ];
+        for (code, lit) in [('1', 104), ('2', 106), ('3', 108), ('4', 110)] {
+            f.app.handle_key(ctrl(KeyCode::Char(code)));
+            let drawn = buffer(&mut f.app, 120, 30);
+            for (x, view, glyph) in buttons {
+                assert_eq!(drawn[(x, 0)].symbol(), glyph, "{view:?}");
+                let style = (drawn[(x, 0)].fg, drawn[(x, 0)].bg);
+                if x == lit {
+                    assert_eq!(style, (theme::FOREGROUND, theme::TAB), "{code} {view:?}");
+                } else {
+                    assert_eq!(style, (theme::MUTED, Color::Reset), "{code} {view:?}");
+                }
+            }
+            // One space apart, two cells before the sort label.
+            for x in [105, 107, 109, 111, 112] {
+                assert_eq!(drawn[(x, 0)].symbol(), " ", "{x}");
+            }
+            assert_eq!(find(&drawn, "Name ▴", 100..120), Some((113, 0)));
+            if code == '4' {
+                f.app.handle_key(ctrl(KeyCode::Char('4')));
+            }
+        }
+        // With tabs, the strip ends two cells before the buttons.
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
+        let header = screen(&mut f.app, 120, 30).remove(0);
+        let glyphs: String = [icons::VIEW_LIST, icons::VIEW_COLUMNS, icons::VIEW_GRID]
+            .iter()
+            .map(|glyph| format!("{glyph} "))
+            .collect();
+        let wanted = format!(
+            " ~/Pictures{} 1 ~  2 Pictures   {glyphs}{}  Name ▴ ",
+            " ".repeat(74),
+            icons::VIEW_DUAL
+        );
+        assert_eq!(header, wanted);
+    }
+
+    #[test]
+    fn a_click_on_a_view_button_does_what_ctrl_1_to_4_do() {
+        use crate::app::ViewMode;
+        let mut f = fixture();
+        let click = |app: &mut crate::app::App, column| {
+            buffer(app, 120, 30);
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        click(&mut f.app, 108);
+        assert_eq!(f.app.view(), ViewMode::Grid);
+        click(&mut f.app, 110);
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Dual, 2));
+        // Again, like Ctrl+4: back to the view the two panes came from.
+        click(&mut f.app, 110);
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Grid, 1));
+        click(&mut f.app, 106);
+        assert_eq!(f.app.view(), ViewMode::Columns);
+        click(&mut f.app, 104);
+        assert_eq!(f.app.view(), ViewMode::List);
+        // Between the buttons, nothing.
+        click(&mut f.app, 107);
+        assert_eq!(f.app.view(), ViewMode::List);
+    }
+
+    #[test]
+    fn a_narrow_header_drops_the_buttons_before_the_sort_label() {
+        use crate::icons;
+        let mut f = fixture();
+        let has_buttons = |app: &mut crate::app::App, width| {
+            let header = screen(app, width, 10).remove(0);
+            header.contains(icons::VIEW_LIST)
+        };
+        // Room for them and 24 cells of path: 6 + 2 + 7 + 2 + 24 inside.
+        assert!(has_buttons(&mut f.app, 43));
+        assert!(!has_buttons(&mut f.app, 42));
+        assert_eq!(
+            screen(&mut f.app, 42, 10)[0],
+            format!(" ~{}Name ▴ ", " ".repeat(33))
+        );
+        // A longer sort label needs more.
+        press(&mut f.app, &[KeyCode::Char('s'), KeyCode::Char('s')]);
+        assert!(!has_buttons(&mut f.app, 46));
+        assert!(has_buttons(&mut f.app, 47));
+    }
+
+    #[test]
     fn a_click_on_a_tab_label_shows_that_tab() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
@@ -367,17 +520,17 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             });
         };
-        click(&mut f.app, 95);
+        click(&mut f.app, 86);
         assert_eq!(
             (f.app.current, f.app.pane().cwd.clone()),
             (0, f.home.clone())
         );
         buffer(&mut f.app, 120, 30);
-        click(&mut f.app, 110);
+        click(&mut f.app, 101);
         assert_eq!(f.app.current, 1);
-        // Between the labels and the sort label, nothing.
+        // Between the labels and the view buttons, nothing.
         buffer(&mut f.app, 120, 30);
-        click(&mut f.app, 112);
+        click(&mut f.app, 103);
         assert_eq!(f.app.current, 1);
     }
 }

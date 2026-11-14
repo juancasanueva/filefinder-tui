@@ -1,6 +1,6 @@
 //! What is remembered between launches: the view, the size of the tiles,
-//! whether the preview pane shows, the sort, the list's detail column, and
-//! where what is in the trash came from.
+//! whether the preview pane shows, the sort, the list's detail column,
+//! whether the places panel shows, and where what is in the trash came from.
 
 use std::fs;
 use std::io;
@@ -22,6 +22,8 @@ pub struct Saved {
     pub sort: SortMode,
     /// What the list's right-hand column shows.
     pub detail: Detail,
+    /// Whether the places panel shows left of the files: Ctrl+B.
+    pub places: bool,
 }
 
 impl Default for Saved {
@@ -32,6 +34,7 @@ impl Default for Saved {
             preview: true,
             sort: SortMode::Name,
             detail: Detail::Size,
+            places: true,
         }
     }
 }
@@ -64,6 +67,8 @@ pub fn load(dir: &Path) -> Saved {
             ("detail", "modified") => saved.detail = Detail::Modified,
             ("detail", "mode") => saved.detail = Detail::Mode,
             ("detail", "owner") => saved.detail = Detail::Owner,
+            ("places", "on") => saved.places = true,
+            ("places", "off") => saved.places = false,
             _ => {}
         }
     }
@@ -88,11 +93,12 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
     let sort = saved.sort.key.label().to_lowercase();
     let reverse = if saved.sort.reversed { "on" } else { "off" };
     let detail = saved.detail.label().to_lowercase();
+    let places = if saved.places { "on" } else { "off" };
     fs::create_dir_all(dir)?;
     fs::write(
         dir.join(FILE),
         format!(
-            "view={view}\ntiles={tiles}\npreview={preview}\nsort={sort}\nreverse={reverse}\ndetail={detail}\n"
+            "view={view}\ntiles={tiles}\npreview={preview}\nsort={sort}\nreverse={reverse}\ndetail={detail}\nplaces={places}\n"
         ),
     )
 }
@@ -182,6 +188,7 @@ mod tests {
                 preview: true,
                 sort: SortMode::Name,
                 detail: Detail::Size,
+                places: true,
             }
         );
     }
@@ -200,11 +207,12 @@ mod tests {
                 reversed: true,
             },
             detail: Detail::Mode,
+            places: true,
         };
         save(&folder, saved).unwrap();
         assert_eq!(
             fs::read_to_string(folder.join("state")).unwrap(),
-            "view=columns\ntiles=small\npreview=off\nsort=modified\nreverse=on\ndetail=mode\n"
+            "view=columns\ntiles=small\npreview=off\nsort=modified\nreverse=on\ndetail=mode\nplaces=on\n"
         );
         assert_eq!(load(&folder), saved);
         let shown = Saved {
@@ -231,8 +239,25 @@ mod tests {
                 preview: true,
                 sort: SortMode::Name,
                 detail: Detail::Size,
+                places: true,
             }
         );
+    }
+
+    #[test]
+    fn whether_the_places_panel_shows_is_remembered_and_shows_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load(dir.path()).places);
+        let hidden = Saved {
+            places: false,
+            ..Saved::default()
+        };
+        save(dir.path(), hidden).unwrap();
+        let text = fs::read_to_string(dir.path().join("state")).unwrap();
+        assert!(text.ends_with("detail=size\nplaces=off\n"), "{text}");
+        assert_eq!(load(dir.path()), hidden);
+        save(dir.path(), Saved::default()).unwrap();
+        assert!(load(dir.path()).places);
     }
 
     #[test]

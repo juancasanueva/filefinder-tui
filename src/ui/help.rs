@@ -32,7 +32,7 @@ pub const ROWS: &[(usize, &str, &str)] = &[
     (0, "l / right", "Browse in"),
     (0, "H", "Back"),
     (0, "L", "Forward"),
-    (0, "tab", "Focus the preview"),
+    (0, "tab / shift-tab", "Cycle focus"),
     (0, "t", "New tab"),
     (0, "O", "Open in new tab"),
     (0, "w / ctrl-w", "Close tab"),
@@ -48,6 +48,7 @@ pub const ROWS: &[(usize, &str, &str)] = &[
     (1, ".", "Hidden files"),
     (1, "I", "Detail column"),
     (1, "alt-p", "Preview column"),
+    (1, "ctrl-b", "Places panel"),
     (1, "ctrl-1", "List view"),
     (1, "ctrl-2", "Columns view"),
     (1, "ctrl-3", "Grid view"),
@@ -301,7 +302,7 @@ mod tests {
         );
         assert_eq!(move_x, (title.0, 5));
         assert_eq!(look_x.1, 5);
-        assert_eq!(find_x, (look_x.0, 5 + 12), "under Look's heading and keys");
+        assert_eq!(find_x, (look_x.0, 5 + 13), "under Look's heading and keys");
         assert_eq!(change_x.1, 5);
         assert!(move_x.0 < look_x.0 && look_x.0 < change_x.0);
         assert_eq!(
@@ -310,8 +311,8 @@ mod tests {
             "headings in the metadata ink"
         );
         // Four cells between columns: Move's widest is its keys, 20 cells,
-        // two of space and its widest words, 17.
-        assert_eq!(look_x.0, move_x.0 + 20 + 2 + 17 + 4);
+        // two of space and its widest words, "Close or go back", 16.
+        assert_eq!(look_x.0, move_x.0 + 20 + 2 + 16 + 4);
         // Keys right-aligned in the metadata ink, words in the foreground.
         let quit = find(&drawn, "Quit", 0..140).expect("Quit");
         assert_eq!(drawn[(quit.0 - 3, quit.1)].symbol(), "q");
@@ -352,6 +353,8 @@ mod tests {
             "E",
             "M",
             "U",
+            "tab / shift-tab",
+            "ctrl-b",
         ] {
             assert_eq!(
                 keys.iter().filter(|keys| **keys == wanted).count(),
@@ -360,6 +363,12 @@ mod tests {
             );
         }
         assert_eq!(keys.len(), ROWS.len());
+        let says = |wanted: &str| ROWS.iter().find(|(_, keys, _)| *keys == wanted);
+        assert_eq!(
+            says("tab / shift-tab"),
+            Some(&(0, "tab / shift-tab", "Cycle focus"))
+        );
+        assert_eq!(says("ctrl-b"), Some(&(1, "ctrl-b", "Places panel")));
         let words: Vec<&str> = ROWS.iter().map(|(_, _, does)| *does).collect();
         for flea in [
             "Close or go back",

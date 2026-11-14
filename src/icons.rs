@@ -3,7 +3,9 @@
 
 use std::sync::OnceLock;
 
+use crate::app::ViewMode;
 use crate::model::{self, Category, Entry};
+use crate::places::Kind;
 
 pub const FOLDER: &str = "\u{ea83}";
 pub const FILE: &str = "\u{ea7b}";
@@ -105,6 +107,71 @@ pub fn glyph_in(set: IconSet, name: &str, is_dir: bool, is_link: bool, mode: u32
     }
 }
 
+// The places panel's glyphs, Codicons: home, a screen, a text page, a
+// download, music, a picture, a video camera, a project board, a bin and a
+// server for a drive.
+pub const PLACE_HOME: &str = "\u{eb06}";
+pub const PLACE_DESKTOP: &str = "\u{ea7a}";
+pub const PLACE_DOCUMENTS: &str = TEXT;
+pub const PLACE_DOWNLOADS: &str = "\u{ea78}";
+pub const PLACE_MUSIC: &str = "\u{ec1b}";
+pub const PLACE_PICTURES: &str = "\u{eaea}";
+pub const PLACE_MOVIES: &str = "\u{ead9}";
+pub const PLACE_PROJECTS: &str = "\u{eb30}";
+pub const PLACE_TRASH: &str = "\u{ea81}";
+pub const PLACE_DRIVE: &str = "\u{eb50}";
+
+/// The glyph in front of a place's name in the panel.
+pub fn place(kind: Kind) -> &'static str {
+    place_in(set(), kind)
+}
+
+/// A place's glyph in a set of glyphs; the plain set has `~` for home, `×`
+/// for the trash and `›` for the folders and drives.
+pub fn place_in(set: IconSet, kind: Kind) -> &'static str {
+    match (set, kind) {
+        (IconSet::Plain, Kind::Home) => "~",
+        (IconSet::Plain, Kind::Trash) => "×",
+        (IconSet::Plain, _) => "›",
+        (IconSet::Nerd, Kind::Home) => PLACE_HOME,
+        (IconSet::Nerd, Kind::Desktop) => PLACE_DESKTOP,
+        (IconSet::Nerd, Kind::Documents) => PLACE_DOCUMENTS,
+        (IconSet::Nerd, Kind::Downloads) => PLACE_DOWNLOADS,
+        (IconSet::Nerd, Kind::Music) => PLACE_MUSIC,
+        (IconSet::Nerd, Kind::Pictures) => PLACE_PICTURES,
+        (IconSet::Nerd, Kind::Movies) => PLACE_MOVIES,
+        (IconSet::Nerd, Kind::Projects) => PLACE_PROJECTS,
+        (IconSet::Nerd, Kind::Trash) => PLACE_TRASH,
+        (IconSet::Nerd, Kind::Drive) => PLACE_DRIVE,
+    }
+}
+
+// The header's view buttons, Codicons: a list, an editor layout for the
+// columns, four squares for the grid, a window split in two.
+pub const VIEW_LIST: &str = "\u{eb17}";
+pub const VIEW_COLUMNS: &str = "\u{eae3}";
+pub const VIEW_GRID: &str = "\u{eae6}";
+pub const VIEW_DUAL: &str = "\u{eb56}";
+
+/// The glyph of a view's button in the header.
+pub fn view(view: ViewMode) -> &'static str {
+    view_in(set(), view)
+}
+
+/// A view button's glyph in a set of glyphs.
+pub fn view_in(set: IconSet, view: ViewMode) -> &'static str {
+    match (set, view) {
+        (IconSet::Plain, ViewMode::List) => "≡",
+        (IconSet::Plain, ViewMode::Columns) => "∥",
+        (IconSet::Plain, ViewMode::Grid) => "▦",
+        (IconSet::Plain, ViewMode::Dual) => "◫",
+        (IconSet::Nerd, ViewMode::List) => VIEW_LIST,
+        (IconSet::Nerd, ViewMode::Columns) => VIEW_COLUMNS,
+        (IconSet::Nerd, ViewMode::Grid) => VIEW_GRID,
+        (IconSet::Nerd, ViewMode::Dual) => VIEW_DUAL,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +231,36 @@ mod tests {
             glyph_in(IconSet::Nerd, "tool", false, false, 0o755),
             "\u{eae8}"
         );
+    }
+
+    #[test]
+    fn places_and_view_buttons_have_codicons_and_plain_marks() {
+        use crate::app::ViewMode;
+        use crate::places::Kind;
+        for (kind, nerd, plain) in [
+            (Kind::Home, "\u{eb06}", "~"),
+            (Kind::Desktop, "\u{ea7a}", "›"),
+            (Kind::Documents, "\u{ec5e}", "›"),
+            (Kind::Downloads, "\u{ea78}", "›"),
+            (Kind::Music, "\u{ec1b}", "›"),
+            (Kind::Pictures, "\u{eaea}", "›"),
+            (Kind::Movies, "\u{ead9}", "›"),
+            (Kind::Projects, "\u{eb30}", "›"),
+            (Kind::Trash, "\u{ea81}", "×"),
+            (Kind::Drive, "\u{eb50}", "›"),
+        ] {
+            assert_eq!(place_in(IconSet::Nerd, kind), nerd, "{kind:?}");
+            assert_eq!(place_in(IconSet::Plain, kind), plain, "{kind:?}");
+        }
+        for (view, nerd, plain) in [
+            (ViewMode::List, "\u{eb17}", "≡"),
+            (ViewMode::Columns, "\u{eae3}", "∥"),
+            (ViewMode::Grid, "\u{eae6}", "▦"),
+            (ViewMode::Dual, "\u{eb56}", "◫"),
+        ] {
+            assert_eq!(view_in(IconSet::Nerd, view), nerd, "{view:?}");
+            assert_eq!(view_in(IconSet::Plain, view), plain, "{view:?}");
+        }
     }
 
     #[test]

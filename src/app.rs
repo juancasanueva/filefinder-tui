@@ -20,6 +20,7 @@ use crate::matcher::{self, Query, Tier};
 use crate::model::{self, Entry, SortMode};
 use crate::ops::{self, Change, History, Kind, Report, Step};
 use crate::ops::{Collide, Format};
+use crate::places::{self, Section};
 use crate::search::{Hit, Looking, Reach, Walk};
 use crate::state::{self, Saved, Trashed};
 use crate::system::{System, Volume};
@@ -62,9 +63,11 @@ impl TileSize {
     }
 }
 
-/// Where the keyboard is: in a pane's list, or in the preview pane.
+/// Where the keyboard is: in the places panel, in a pane's list, or in the
+/// preview pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
+    Places,
     List,
     Preview,
 }
@@ -409,8 +412,12 @@ pub enum Spot {
     Crumb { pane: usize, path: PathBuf },
     /// A tab's label in the header's strip, by its place among the tabs.
     Tab(usize),
-    /// A row of the parent folder's listing, left of the list.
-    Parent(usize),
+    /// A view's button in the header.
+    View(ViewMode),
+    /// The places panel, wherever no place is.
+    Places,
+    /// A place in the panel, by its place among them all.
+    Place(usize),
     /// The preview pane.
     Preview,
     /// The menu, wherever no line is.
@@ -652,9 +659,6 @@ pub struct Pane {
     /// The folders from home (or `/`) down to this one's parent. Only the columns
     /// view needs them, so they are listed when a folder is shown in that view.
     pub ancestors: Vec<Ancestor>,
-    /// The parent folder's items, which the list view shows on its left;
-    /// none at `/`, and none in the other views.
-    pub parent: Vec<Entry>,
     /// Rows the pane's view showed last time, for Page Up and Page Down.
     pub page_rows: usize,
     /// Tiles across the pane's grid last time, for Up and Down.
@@ -673,7 +677,6 @@ impl Pane {
             marks: BTreeSet::new(),
             offset: 0,
             ancestors: Vec::new(),
-            parent: Vec::new(),
             page_rows: 10,
             grid_columns: 1,
             back: Vec::new(),
@@ -928,10 +931,7 @@ impl Pane {
             .ancestors
             .iter_mut()
             .flat_map(|above| &mut above.entries);
-        let copies = (self.entries.iter_mut())
-            .chain(self.parent.iter_mut())
-            .chain(above)
-            .chain(kept);
+        let copies = (self.entries.iter_mut()).chain(above).chain(kept);
         copies
             .filter(|entry| entry.path == path)
             .for_each(|entry| entry.tags = tags);
@@ -1136,6 +1136,8 @@ pub struct Config {
     pub thumbs: Option<Thumbs>,
     /// Where Delete moves things: the trash folder.
     pub trash_dir: PathBuf,
+    /// Where the mounted volumes are, which the panel lists under DEVICES.
+    pub volumes_dir: PathBuf,
     /// How many colours the terminal shows.
     pub depth: Depth,
 }
@@ -1154,6 +1156,14 @@ pub struct App {
     pub show_hidden: bool,
     /// Whether the preview pane shows beside the list: Alt+P.
     pub preview_visible: bool,
+    /// What the places panel lists, as last read.
+    pub places: Vec<Section>,
+    /// Whether the places panel shows left of the files: Ctrl+B.
+    pub places_visible: bool,
+    /// The place the panel's cursor is on, among them all.
+    pub places_cursor: usize,
+    /// The first line of the panel shown; drawing keeps it in range.
+    pub places_offset: usize,
     /// How many rows of the preview's body are scrolled away.
     pub preview_scroll: usize,
     /// Rows of the preview's body shown last time, for paging it.
@@ -1202,6 +1212,7 @@ pub struct App {
     /// record for each item, as long as it is there.
     trashed: Vec<Trashed>,
     trash_dir: PathBuf,
+    volumes_dir: PathBuf,
     state_dir: Option<PathBuf>,
     system: Box<dyn System>,
     /// Where the last frame drew what a click can land on.
@@ -1234,6 +1245,10 @@ impl App {
             detail: saved.detail,
             show_hidden: false,
             preview_visible: saved.preview,
+            places: Vec::new(),
+            places_visible: saved.places,
+            places_cursor: 0,
+            places_offset: 0,
             preview_scroll: 0,
             preview_rows: 1,
             previewed: None,
@@ -1262,6 +1277,7 @@ impl App {
             work: None,
             trashed,
             trash_dir: config.trash_dir,
+            volumes_dir: config.volumes_dir,
             state_dir: config.state_dir,
             system,
             hits: HitMap::default(),
@@ -1288,6 +1304,7 @@ impl App {
             let home = app.home.clone();
             app.show_folder(&home, None);
         }
+        app.read_places();
         app
     }
 
@@ -1480,6 +1497,9 @@ impl App {
         if self.focus == Focus::Preview && self.preview_key(key) {
             return;
         }
+        if self.focus == Focus::Places {
+            return self.places_key(key);
+        }
         self.command_key(key, armed);
     }
 
@@ -1577,6 +1597,7 @@ impl App {
             KeyCode::Char('r') if ctrl => self.refresh(),
             KeyCode::F(5) => self.refresh(),
             KeyCode::Char('p' | 'P') if alt => self.toggle_preview(),
+            KeyCode::Char('b') if ctrl => self.toggle_places(),
             KeyCode::Char('m') if plain => self.open_menu(),
             KeyCode::Menu => self.open_menu(),
             KeyCode::F(10) if shift => self.open_menu(),
@@ -1714,7 +1735,9 @@ impl App {
                 self.click_above(pane, depth, index);
             }
             (true, Spot::Pane(pane)) => self.enter_pane(pane),
-            (true, Spot::Parent(index)) => self.open_parent_row(index),
+            (true, Spot::Place(index)) => self.open_place(index),
+            (true, Spot::Places) => self.enter_places(),
+            (true, Spot::View(view)) => self.choose_view(view),
             (true, Spot::Preview) => self.focus_preview(),
             (true, Spot::Crumb { pane, path }) => {
                 let tab = self.tab_mut();
@@ -1798,18 +1821,83 @@ impl App {
         }
     }
 
-    /// A click on a row of the parent folder's listing: goes into the
-    /// folder it is, or to the parent folder with the file selected.
-    fn open_parent_row(&mut self, index: usize) {
-        self.enter_pane(self.active());
-        let Some(entry) = self.pane().parent.get(index) else {
+    /// The keyboard goes to the places panel, read again, with its cursor
+    /// on the place holding the active pane's folder.
+    fn enter_places(&mut self) {
+        if !self.places_visible {
+            return;
+        }
+        self.read_places();
+        self.focus = Focus::Places;
+        if let Some(current) = places::current(&self.places, &self.pane().cwd) {
+            self.places_cursor = current;
+        }
+    }
+
+    /// Reads what the panel lists again, keeping its cursor among them.
+    fn read_places(&mut self) {
+        self.places = places::read(&self.home, &self.trash_dir, &self.volumes_dir);
+        let last = places::flat(&self.places).count().saturating_sub(1);
+        self.places_cursor = self.places_cursor.min(last);
+    }
+
+    /// Enter, `l` or a click on a place: the active pane goes there, as a
+    /// new place in its history, and the keyboard to its list. The trash
+    /// says so when it can't be listed, and the keyboard stays.
+    fn open_place(&mut self, index: usize) {
+        let Some(place) = places::flat(&self.places).nth(index) else {
             return;
         };
-        let (path, name, is_dir) = (entry.path.clone(), entry.name.clone(), entry.is_dir);
-        if is_dir {
-            self.navigate(&path);
-        } else if let Some(folder) = path.parent().map(Path::to_path_buf) {
-            self.go_to(&folder, Some(&name));
+        let path = place.path.clone();
+        self.places_cursor = index;
+        if self.go_to(&path, None) {
+            self.focus = Focus::List;
+        }
+    }
+
+    /// Keys while the places panel has the keyboard: these move its cursor
+    /// and open a place; the window's own keys (views, tabs, panes, the
+    /// shortcuts, quitting) do what they do anywhere; the keys that act on
+    /// files do nothing.
+    fn places_key(&mut self, key: KeyEvent) {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let last = places::flat(&self.places).count().saturating_sub(1);
+        let cursor = self.places_cursor;
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down if plain => {
+                self.places_cursor = (cursor + 1).min(last)
+            }
+            KeyCode::Char('k') | KeyCode::Up if plain => {
+                self.places_cursor = cursor.saturating_sub(1)
+            }
+            KeyCode::Char('g') | KeyCode::Home if plain => self.places_cursor = 0,
+            KeyCode::Char('G') | KeyCode::End if plain => self.places_cursor = last,
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if plain => {
+                self.open_place(cursor)
+            }
+            KeyCode::Esc => self.focus = Focus::List,
+            _ if window_key(key) => self.command_key(key, None),
+            _ => {}
+        }
+    }
+
+    /// Ctrl+B: hides or shows the places panel, and remembers it. Hidden,
+    /// it gives the keyboard to the list.
+    fn toggle_places(&mut self) {
+        self.places_visible = !self.places_visible;
+        if !self.places_visible && self.focus == Focus::Places {
+            self.focus = Focus::List;
+        }
+        self.remember();
+    }
+
+    /// A click on a view's button in the header: what Ctrl+1 to Ctrl+4 do.
+    fn choose_view(&mut self, view: ViewMode) {
+        match view {
+            ViewMode::Dual => self.toggle_split(),
+            view => self.set_view(view),
         }
     }
 
@@ -1918,6 +2006,10 @@ impl App {
                 self.step(rows);
             }
             Some(Spot::Preview) => self.scroll_preview(rows),
+            // The panel scrolls a line; drawing keeps it in range.
+            Some(Spot::Places | Spot::Place(_)) => {
+                self.places_offset = self.places_offset.saturating_add_signed(rows)
+            }
             _ => {}
         }
     }
@@ -3511,7 +3603,7 @@ impl App {
         if shown {
             self.tab_mut().active = 1;
             self.focus = Focus::List;
-            // The parent's column and the folders above go with one pane.
+            // The folders above go with one pane.
             self.in_pane(0, Self::refresh_ancestors);
         } else {
             // Why was said; a pane with nothing to show is no use.
@@ -3675,11 +3767,14 @@ impl App {
         self.preview_scroll = self.preview_scroll.saturating_add_signed(rows);
     }
 
-    /// Tab and Shift+Tab: each pane in turn, then the preview when it shows.
+    /// Tab and Shift+Tab: the places panel when it shows, each pane in
+    /// turn, then the preview when it shows.
     fn move_focus(&mut self, delta: isize) {
-        let mut stops: Vec<(Focus, Option<usize>)> = (0..self.panes().len())
-            .map(|pane| (Focus::List, Some(pane)))
-            .collect();
+        let mut stops: Vec<(Focus, Option<usize>)> = Vec::new();
+        if self.places_visible {
+            stops.push((Focus::Places, None));
+        }
+        stops.extend((0..self.panes().len()).map(|pane| (Focus::List, Some(pane))));
         if self.shows_preview() {
             stops.push((Focus::Preview, None));
         }
@@ -3688,6 +3783,9 @@ impl App {
         };
         let index = stops.iter().position(here).unwrap_or(0) as isize;
         let (focus, pane) = stops[(index + delta).rem_euclid(stops.len() as isize) as usize];
+        if focus == Focus::Places {
+            return self.enter_places();
+        }
         self.focus = focus;
         if let Some(pane) = pane {
             self.tab_mut().active = pane;
@@ -3830,8 +3928,8 @@ impl App {
         self.remember();
     }
 
-    /// Saves the view, the tile size, the preview, the sort and the detail
-    /// column for the next launch.
+    /// Saves the view, the tile size, the preview, the sort, the detail
+    /// column and the places panel for the next launch.
     fn remember(&self) {
         if let Some(dir) = &self.state_dir {
             let saved = Saved {
@@ -3840,6 +3938,7 @@ impl App {
                 preview: self.preview_visible,
                 sort: self.sort,
                 detail: self.detail,
+                places: self.places_visible,
             };
             // A view that isn't remembered is no reason to interrupt.
             let _ = state::save(dir, saved);
@@ -3867,9 +3966,11 @@ impl App {
         self.remember();
     }
 
-    /// Ctrl+R and F5: reads what the pane shows, and its volume, again.
+    /// Ctrl+R and F5: reads what the pane shows, its volume and the places
+    /// panel again.
     fn refresh(&mut self) {
         self.volumes.clear();
+        self.read_places();
         self.reload();
     }
 
@@ -3943,25 +4044,15 @@ impl App {
         }
     }
 
-    /// Lists the folders above the active pane's again, when the view shows
-    /// them: the columns view all of them, the list view the parent. What
-    /// a search found is a column on its own.
+    /// Lists the folders above the active pane's again, when the columns
+    /// view shows them. What a search found is a column on its own.
     fn refresh_ancestors(&mut self) {
         let ancestors = if self.view() == ViewMode::Columns && self.pane().results().is_none() {
             self.list_ancestors(&self.pane().cwd)
         } else {
             Vec::new()
         };
-        let parent = match self.pane().cwd.parent() {
-            // A folder that can't be read leaves the column empty.
-            Some(parent) if self.view() == ViewMode::List => {
-                model::list_dir(parent, self.show_hidden, self.sort).unwrap_or_default()
-            }
-            _ => Vec::new(),
-        };
-        let pane = self.pane_mut();
-        pane.ancestors = ancestors;
-        pane.parent = parent;
+        self.pane_mut().ancestors = ancestors;
     }
 
     /// One listing for each folder from home (or `/` outside it) down to the parent of `cwd`.
@@ -4011,6 +4102,23 @@ impl App {
     /// What went wrong, for eight seconds.
     fn fail(&mut self, text: String) {
         self.say(text, true, false, RECEIPT_LASTS);
+    }
+}
+
+/// Whether a key is the window's own rather than the files': it does what
+/// it does even while the places panel has the keyboard.
+fn window_key(key: KeyEvent) -> bool {
+    let held = key.modifiers;
+    let ctrl = held.contains(KeyModifiers::CONTROL) && !held.contains(KeyModifiers::ALT);
+    let alt = held.contains(KeyModifiers::ALT) && !held.contains(KeyModifiers::CONTROL);
+    let plain = !held.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+    match key.code {
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::F(5) => true,
+        KeyCode::Char('b' | 'r' | 'w' | '1'..='4') if ctrl => true,
+        KeyCode::Char('1' | 'p' | 'P') if alt => true,
+        KeyCode::Char('?' | 'q' | 'Q' | '|' | '.' | 's' | 'S' | 'I') if plain => true,
+        KeyCode::Char('t' | 'w' | '[' | ']' | '{' | '}' | '1'..='9') if plain => true,
+        _ => false,
     }
 }
 
@@ -4382,7 +4490,10 @@ pub mod testing {
         pub home: PathBuf,
         /// The trash the app was given: a folder of the fixture's own.
         pub trash: PathBuf,
+        /// Where the app looks for mounted volumes: empty, outside home.
+        pub volumes: PathBuf,
         _dir: tempfile::TempDir,
+        _volumes: tempfile::TempDir,
     }
 
     /// A home folder with `Documents/`, `Pictures/{Trip/, a.jpg}`, `notes.txt` and `.hidden`.
@@ -4449,6 +4560,9 @@ pub mod testing {
         fs::write(home.join(".hidden"), "").unwrap();
         let system = FakeSystem::new();
         let trash = home.join(".Trash");
+        // The volumes folder, outside home and empty: tests mount what they need.
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let volumes = volumes_dir.path().canonicalize().unwrap();
         let config = Config {
             home: home.clone(),
             start: home.clone(),
@@ -4456,6 +4570,7 @@ pub mod testing {
             state_dir: None,
             thumbs,
             trash_dir: trash.clone(),
+            volumes_dir: volumes.clone(),
             depth: Depth::Truecolor,
         };
         let mut app = App::new(config, Box::new(system.clone()));
@@ -4466,7 +4581,9 @@ pub mod testing {
             system,
             home,
             trash,
+            volumes,
             _dir: dir,
+            _volumes: volumes_dir,
         }
     }
 
@@ -4479,6 +4596,8 @@ pub mod testing {
             state_dir: state_dir.map(Path::to_path_buf),
             thumbs: None,
             trash_dir: home.join(".Trash"),
+            // No volumes there: DEVICES lists nothing.
+            volumes_dir: home.join(".no-volumes"),
             depth: Depth::Truecolor,
         };
         App::new(config, Box::new(FakeSystem::new()))
@@ -4492,8 +4611,9 @@ pub mod testing {
             fs::write(f.home.join(format!("{name}.txt")), name).unwrap();
         }
         f.app.handle_key(ctrl(KeyCode::Char('3')));
-        // The preview hidden: the grid takes the whole body.
+        // The preview and the places panel hidden: the grid takes the whole body.
         f.app.handle_key(alt(KeyCode::Char('p')));
+        f.app.handle_key(ctrl(KeyCode::Char('b')));
         f.app.handle_key(key(KeyCode::F(5)));
         // The body of a window 62 across and 26 down is 62 by 22.
         crate::ui::testing::screen(&mut f.app, 62, 26);
@@ -4607,6 +4727,7 @@ mod tests {
             state_dir: None,
             thumbs: None,
             trash_dir: f.trash.clone(),
+            volumes_dir: f.volumes.clone(),
             depth: Depth::Truecolor,
         };
         let app = App::new(config, Box::new(FakeSystem::default()));
@@ -4705,31 +4826,42 @@ mod tests {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::Preview);
+        // Round past the places panel, back to the list.
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.focus, Focus::Places);
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::List);
-        press(&mut f.app, &[KeyCode::BackTab]);
+        press(&mut f.app, &[KeyCode::BackTab, KeyCode::BackTab]);
         assert_eq!(f.app.focus, Focus::Preview);
         // Escape gives it back to the list.
         press(&mut f.app, &[KeyCode::Esc]);
         assert_eq!(f.app.focus, Focus::List);
-        // Without the preview Tab stays in the list.
+        // Without the preview Tab goes between the panel and the list.
         f.app.handle_key(alt(KeyCode::Char('p')));
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.focus, Focus::Places);
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::List);
         // The columns and the grid show the preview too.
         f.app.handle_key(alt(KeyCode::Char('p')));
         for view in ['2', '3'] {
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            press(&mut f.app, &[KeyCode::Tab]);
-            assert_eq!(f.app.focus, Focus::Preview, "view {view}");
-            press(&mut f.app, &[KeyCode::Tab]);
-            assert_eq!(f.app.focus, Focus::List, "view {view}");
+            for focus in [Focus::Preview, Focus::Places, Focus::List] {
+                press(&mut f.app, &[KeyCode::Tab]);
+                assert_eq!(f.app.focus, focus, "view {view}");
+            }
         }
-        // Two panes have no preview: Tab goes from one list to the other.
+        // Two panes have no preview: Tab goes from the panel to one list
+        // and the other.
         f.app.handle_key(ctrl(KeyCode::Char('4')));
-        for active in [0, 1, 0] {
+        for (focus, active) in [
+            (Focus::Places, 1),
+            (Focus::List, 0),
+            (Focus::List, 1),
+            (Focus::Places, 1),
+        ] {
             press(&mut f.app, &[KeyCode::Tab]);
-            assert_eq!((f.app.focus, f.app.active()), (Focus::List, active));
+            assert_eq!((f.app.focus, f.app.active()), (focus, active));
         }
     }
 
@@ -4980,7 +5112,7 @@ mod tests {
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
-            "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\n"
+            "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\n"
         );
         app.handle_key(ctrl(KeyCode::Char('3')));
         assert_eq!(app.view(), ViewMode::Grid);
@@ -5107,7 +5239,7 @@ mod tests {
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
-            "view=list\ntiles=large\npreview=on\nsort=name\nreverse=off\ndetail=size\n"
+            "view=list\ntiles=large\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\n"
         );
         assert_eq!(launch(&f.home, Some(state.path())).tile, Large);
     }
@@ -7024,20 +7156,20 @@ mod tests {
         let mut f = fixture();
         split(&mut f.app);
         let walk = |app: &mut App, code: KeyCode| {
-            let stops = (0..2).map(|_| {
+            let stops = (0..3).map(|_| {
                 press(app, &[code]);
                 keyboard(app)
             });
             stops.collect::<Vec<_>>()
         };
-        // Two panes show no preview: they are the only stops.
+        // Two panes show no preview: the places panel and they are the stops.
         assert_eq!(
             walk(&mut f.app, KeyCode::Tab),
-            [(Focus::List, 0), (Focus::List, 1)]
+            [(Focus::Places, 1), (Focus::List, 0), (Focus::List, 1)]
         );
         assert_eq!(
             walk(&mut f.app, KeyCode::BackTab),
-            [(Focus::List, 0), (Focus::List, 1)]
+            [(Focus::List, 0), (Focus::Places, 0), (Focus::List, 1)]
         );
     }
 
@@ -7529,8 +7661,8 @@ mod tests {
         assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(chosen(&f.app).len(), 8);
-        // Round the two panes and back to the left one.
-        press(&mut f.app, &[KeyCode::Tab; 3]);
+        // Round the places panel and the two panes, and on to the left one.
+        press(&mut f.app, &[KeyCode::Tab; 5]);
         assert_eq!(keyboard(&f.app), (Focus::List, 0));
         assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
 
@@ -7571,13 +7703,17 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('c')));
         assert_eq!(said(&f.app), ("1 item ready to paste.", false));
 
-        // Tab goes to the preview and back, and the one pane stays the active one.
+        // Tab goes to the preview, the places panel and back, and the one
+        // pane stays the active one.
         let mut stops = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             press(&mut f.app, &[KeyCode::Tab]);
             stops.push(keyboard(&f.app));
         }
-        assert_eq!(stops, [(Focus::Preview, 0), (Focus::List, 0)]);
+        assert_eq!(
+            stops,
+            [(Focus::Preview, 0), (Focus::Places, 0), (Focus::List, 0)]
+        );
         press(&mut f.app, &[KeyCode::F(2)]);
         assert!(matches!(asking(&f.app), Some(Asking::Rename(_))));
     }
@@ -9545,10 +9681,9 @@ mod mouse_tests {
     const VIEWS: [char; 3] = ['1', '3', '2'];
 
     /// The columns a view draws a single pane's items in, at 120 across:
-    /// the list between the parent's column and the preview, the others
-    /// the whole width.
-    fn files(view: char) -> Range<u16> {
-        if view == '1' { 26..73 } else { 0..120 }
+    /// between the places panel and the preview, in every view.
+    fn files(_view: char) -> Range<u16> {
+        26..73
     }
 
     #[test]
@@ -9611,7 +9746,7 @@ mod mouse_tests {
             f.app.handle_key(shift(KeyCode::Down));
             f.app.focus = Focus::Preview;
             draw(&mut f.app);
-            click(&mut f.app, (40, 37));
+            click(&mut f.app, (70, 37));
             assert_eq!(f.app.focus, Focus::List, "view {view}");
             assert_eq!(selection(&f.app), ["Documents", "Pictures"], "view {view}");
             assert_eq!(cursor_name(&f.app), "Pictures", "view {view}");
@@ -9624,8 +9759,8 @@ mod mouse_tests {
         f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(&mut f.app, &[KeyCode::Down, KeyCode::Right]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-        let trip = spot(&mut f.app, "Trip", 27..53);
-        let jpg = spot(&mut f.app, "a.jpg", 27..53);
+        let trip = spot(&mut f.app, "Trip", 42..73);
+        let jpg = spot(&mut f.app, "a.jpg", 42..73);
         click(&mut f.app, jpg);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
         assert_eq!(cursor_name(&f.app), "a.jpg");
@@ -9633,7 +9768,7 @@ mod mouse_tests {
         assert_eq!(cursor_name(&f.app), "Trip");
 
         // The home column, left of it: there, with the row clicked selected.
-        let notes = spot(&mut f.app, "notes.txt", 0..26);
+        let notes = spot(&mut f.app, "notes.txt", 26..42);
         click(&mut f.app, notes);
         assert_eq!(f.app.pane().cwd, f.home);
         assert_eq!(cursor_name(&f.app), "notes.txt");
@@ -10426,5 +10561,273 @@ mod tab_tests {
             .map(|e| e.name.as_str())
             .collect();
         assert_eq!(left, ["Documents", "Pictures"]);
+    }
+}
+
+#[cfg(test)]
+mod places_tests {
+    use super::testing::*;
+    use super::*;
+    use crate::ui::testing::{buffer, find, screen};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Where the keyboard is: the panel, or a pane's list, or the preview.
+    fn keyboard(app: &App) -> (Focus, usize) {
+        (app.focus, app.active())
+    }
+
+    /// The names the panel lists, in order.
+    fn listed(app: &App) -> Vec<&str> {
+        let places = crate::places::flat(&app.places);
+        places.map(|place| place.name.as_str()).collect()
+    }
+
+    fn on_disk(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(folder)
+            .unwrap()
+            .map(|item| item.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn tab_goes_round_the_places_the_list_and_the_preview_and_shift_tab_back() {
+        let mut f = fixture();
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
+        f.app.handle_key(key(KeyCode::Tab));
+        assert_eq!(keyboard(&f.app), (Focus::Preview, 0));
+        f.app.handle_key(key(KeyCode::Tab));
+        assert_eq!(keyboard(&f.app), (Focus::Places, 0));
+        f.app.handle_key(key(KeyCode::Tab));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(keyboard(&f.app), (Focus::Places, 0));
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(keyboard(&f.app), (Focus::Preview, 0));
+
+        // Two panes: the panel, the left list, the right one.
+        f.app.handle_key(key(KeyCode::Esc));
+        split(&mut f.app);
+        assert_eq!(keyboard(&f.app), (Focus::List, 1));
+        f.app.handle_key(key(KeyCode::Tab));
+        assert_eq!(keyboard(&f.app), (Focus::Places, 1));
+        f.app.handle_key(key(KeyCode::Tab));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
+        f.app.handle_key(key(KeyCode::Tab));
+        assert_eq!(keyboard(&f.app), (Focus::List, 1));
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(keyboard(&f.app), (Focus::Places, 0));
+
+        // With the panel hidden, Tab never stops there.
+        f.app.handle_key(ctrl(KeyCode::Char('b')));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
+        f.app.handle_key(key(KeyCode::Tab));
+        assert_eq!(keyboard(&f.app), (Focus::List, 1));
+        f.app.handle_key(key(KeyCode::Tab));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
+    }
+
+    #[test]
+    fn in_the_panel_the_cursor_starts_on_this_place_and_moves_with_j_k_g_and_capital_g() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        assert_eq!(listed(&f.app), ["Home", "Documents", "Pictures", "Trash"]);
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(f.app.focus, Focus::Places);
+        // On the place holding the folder: Pictures.
+        assert_eq!(f.app.places_cursor, 2);
+        for (code, cursor) in [
+            (KeyCode::Char('j'), 3),
+            (KeyCode::Char('j'), 3),
+            (KeyCode::Char('k'), 2),
+            (KeyCode::Up, 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Char('g'), 0),
+            (KeyCode::Char('G'), 3),
+            (KeyCode::Home, 0),
+            (KeyCode::End, 3),
+        ] {
+            f.app.handle_key(key(code));
+            assert_eq!(f.app.places_cursor, cursor, "{code:?}");
+        }
+        // The list's cursor stayed where it was.
+        assert_eq!(f.app.pane().cursor, 0);
+    }
+
+    #[test]
+    fn file_keys_do_nothing_while_the_panel_has_the_keyboard() {
+        let mut f = fixture();
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(f.app.focus, Focus::Places);
+        let before = on_disk(&f.home);
+        for code in [
+            KeyCode::Char('d'),
+            KeyCode::Char('d'),
+            KeyCode::Delete,
+            KeyCode::Char('v'),
+            KeyCode::Char(' '),
+            KeyCode::Char('m'),
+            KeyCode::Char('y'),
+            KeyCode::Char('p'),
+            KeyCode::Char('U'),
+            KeyCode::Char('r'),
+            KeyCode::Char('N'),
+            KeyCode::Char('/'),
+            KeyCode::Char('h'),
+        ] {
+            f.app.handle_key(key(code));
+        }
+        f.app.handle_key(ctrl(KeyCode::Char('a')));
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&f.home), before);
+        assert!(f.app.dialog.is_none() && f.app.menu.is_none() && f.app.look.is_none());
+        assert!(f.app.prompt.is_none() && f.app.field.is_none());
+        assert_eq!(f.app.pane().selection().count(), 1, "nothing marked");
+        assert_eq!(
+            (f.app.pane().cwd.clone(), f.app.focus),
+            (f.home.clone(), Focus::Places)
+        );
+        // The window's own keys still work: the views, and quitting.
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        assert_eq!(f.app.view(), ViewMode::Grid);
+        f.app.handle_key(key(KeyCode::Char('q')));
+        assert!(f.app.should_quit);
+    }
+
+    #[test]
+    fn enter_l_or_right_opens_the_place_and_gives_the_keyboard_to_the_list() {
+        let mut f = fixture();
+        f.app.handle_key(key(KeyCode::BackTab));
+        press(&mut f.app, &[KeyCode::Char('j'), KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.home.join("Documents"));
+        assert_eq!(f.app.focus, Focus::List);
+        // A place in the history: back returns.
+        press(&mut f.app, &[KeyCode::Char('H')]);
+        assert_eq!(f.app.pane().cwd, f.home);
+        for opens in [KeyCode::Char('l'), KeyCode::Right] {
+            f.app.navigate(&f.home);
+            f.app.handle_key(key(KeyCode::BackTab));
+            press(&mut f.app, &[KeyCode::Char('j'), KeyCode::Char('j'), opens]);
+            assert_eq!(f.app.pane().cwd, f.home.join("Pictures"), "{opens:?}");
+            assert_eq!(f.app.focus, Focus::List);
+        }
+        // In two panes, the pane that had the keyboard goes there.
+        split(&mut f.app);
+        f.app.handle_key(key(KeyCode::BackTab));
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(keyboard(&f.app), (Focus::Places, 0));
+        press(&mut f.app, &[KeyCode::Char('g'), KeyCode::Enter]);
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
+        assert_eq!(f.app.panes()[0].cwd, f.home);
+        assert_eq!(f.app.panes()[1].cwd, f.home.join("Pictures"));
+        // Escape gives the keyboard back without going anywhere.
+        f.app.handle_key(key(KeyCode::BackTab));
+        press(&mut f.app, &[KeyCode::Char('j'), KeyCode::Esc]);
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
+        assert_eq!(f.app.panes()[0].cwd, f.home);
+    }
+
+    #[test]
+    fn the_trash_opens_from_the_panel_and_one_that_cannot_be_listed_says_how() {
+        let mut f = fixture();
+        f.app.handle_key(key(KeyCode::BackTab));
+        press(&mut f.app, &[KeyCode::Char('G'), KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, f.trash);
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.message, None);
+
+        f.app.navigate(&f.home.join("Pictures"));
+        fs::create_dir(&f.trash).unwrap();
+        fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o000)).unwrap();
+        f.app.handle_key(key(KeyCode::BackTab));
+        press(&mut f.app, &[KeyCode::Char('G'), KeyCode::Enter]);
+        fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        let message = f.app.message.as_ref().expect("it says why");
+        assert_eq!(
+            (message.text.as_str(), message.is_error),
+            (TRASH_REFUSED, true)
+        );
+        assert_eq!(f.app.focus, Focus::Places, "the keyboard stays");
+    }
+
+    #[test]
+    fn the_panel_is_read_on_start_on_f5_and_when_the_keyboard_enters_it_never_while_drawing() {
+        let mut f = fixture();
+        assert_eq!(listed(&f.app), ["Home", "Documents", "Pictures", "Trash"]);
+        fs::create_dir(f.home.join("Music")).unwrap();
+        fs::create_dir(f.volumes.join("Backup")).unwrap();
+        screen(&mut f.app, 120, 30);
+        f.app.tick();
+        assert_eq!(listed(&f.app), ["Home", "Documents", "Pictures", "Trash"]);
+        f.app.handle_key(key(KeyCode::F(5)));
+        let read = ["Home", "Documents", "Music", "Pictures", "Trash", "Backup"];
+        assert_eq!(listed(&f.app), read);
+        fs::create_dir(f.home.join("Movies")).unwrap();
+        screen(&mut f.app, 120, 30);
+        assert_eq!(listed(&f.app), read);
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(
+            listed(&f.app),
+            [
+                "Home",
+                "Documents",
+                "Music",
+                "Pictures",
+                "Movies",
+                "Trash",
+                "Backup"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_place_opens_it_and_the_wheel_over_the_panel_scrolls_it() {
+        let mut f = fixture();
+        let drawn = buffer(&mut f.app, 120, 30);
+        let (x, y) = find(&drawn, "Pictures", 0..25).expect("the place");
+        f.app.focus = Focus::Preview;
+        f.app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
+        assert_eq!(f.app.focus, Focus::List);
+        assert_eq!(f.app.pane().back.len(), 1);
+
+        for index in 0..20 {
+            fs::create_dir(f.volumes.join(format!("Disk {index:02}"))).unwrap();
+        }
+        f.app.handle_key(key(KeyCode::F(5)));
+        let top = |app: &mut App| {
+            let row: String = screen(app, 120, 14)[2].chars().take(25).collect();
+            row.trim().to_string()
+        };
+        assert_eq!(top(&mut f.app), "PLACES");
+        for _ in 0..3 {
+            f.app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 5,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        let first = top(&mut f.app);
+        assert!(first.ends_with("Pictures"), "{first}");
+        // The list's cursor stayed put, and back up the wheel goes.
+        assert_eq!(f.app.pane().cursor, 0);
+        f.app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 5,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(top(&mut f.app).ends_with("Documents"));
     }
 }
