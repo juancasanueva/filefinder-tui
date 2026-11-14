@@ -61,21 +61,31 @@ The screenshots were taken in WezTerm with JetBrains Mono Nerd Font and the Toky
 
 ## Requirements
 
-- macOS.
-- A Rust toolchain. With Homebrew: `brew install rustup && rustup default stable`. Homebrew's rustup is keg-only, so put it on your `PATH`, for example in `~/.zshrc`:
-
-  ```sh
-  export PATH="$(brew --prefix rustup)/bin:$PATH"
-  ```
-
+- macOS, on Apple Silicon or Intel.
 - A terminal with a graphics protocol for real thumbnails: Ghostty, kitty and WezTerm use the kitty protocol, and iTerm2 its own. Other terminals fall back to coarser half-block pictures.
 - A terminal with the kitty keyboard protocol for chords such as Ctrl+Opt+1/2/3/4 and Ctrl+Shift+N. Ghostty, kitty, WezTerm and iTerm2 have it.
-- [bat](https://github.com/sharkdp/bat) for coloured code in the preview (`brew install bat`). Without it, code shows plain.
+- [bat](https://github.com/sharkdp/bat) for coloured code in the preview. Homebrew installs it with the app; otherwise `brew install bat`. Without it, code shows plain.
 - A [Nerd Font](https://www.nerdfonts.com/) for the icons. Without one, run with `FILEFINDER_ICONS=plain` for plain Unicode symbols.
 
 ## Installing
 
-Straight from GitHub:
+With [Homebrew](https://brew.sh), from the [juancasanueva/tap](https://github.com/juancasanueva/homebrew-tap) tap:
+
+```sh
+brew install juancasanueva/tap/filefinder-tui
+```
+
+`brew upgrade filefinder-tui` updates it. The binaries are on the [releases page](https://github.com/juancasanueva/filefinder-tui/releases) too.
+
+### From source
+
+This needs a Rust toolchain. With Homebrew: `brew install rustup && rustup default stable`. Homebrew's rustup is keg-only, so put it on your `PATH`, for example in `~/.zshrc`:
+
+```sh
+export PATH="$(brew --prefix rustup)/bin:$PATH"
+```
+
+Then straight from GitHub:
 
 ```sh
 cargo install --git https://github.com/juancasanueva/filefinder-tui
