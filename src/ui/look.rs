@@ -102,6 +102,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
         current,
         facts,
         thumbs,
+        highlighter,
         look,
         show_hidden,
         sort,
@@ -141,7 +142,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
             .collect();
         scrolled(frame, rows, body, &mut look.scroll);
     } else if !facts.opening.is_empty() {
-        let rows = text_rows(&facts.opening, width as usize);
+        let coloured = highlighter
+            .as_mut()
+            .and_then(|highlighter| highlighter.get(&entry.path, entry.modified, &facts.opening));
+        let rows = text_rows(&facts.opening, width as usize, coloured);
         scrolled(frame, rows, body, &mut look.scroll);
     } else if matches!(entry.category(), Category::Image | Category::App)
         && let Some(thumbs) = thumbs.as_mut()

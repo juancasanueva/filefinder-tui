@@ -23,6 +23,7 @@ use crate::ops::{Collide, Format};
 use crate::places::{self, Section};
 use crate::search::{Hit, Looking, Reach, Walk};
 use crate::state::{self, Saved, Trashed};
+use crate::syntax::Highlighter;
 use crate::system::{System, Volume};
 use crate::theme::Depth;
 use crate::thumbs::{Facts, Thumbs};
@@ -1134,6 +1135,8 @@ pub struct Config {
     pub state_dir: Option<PathBuf>,
     /// What makes the thumbnails; `None` leaves every file its stand-in.
     pub thumbs: Option<Thumbs>,
+    /// What colours code in the preview; `None` shows it plain.
+    pub highlighter: Option<Highlighter>,
     /// Where Delete moves things: the trash folder.
     pub trash_dir: PathBuf,
     /// Where the mounted volumes are, which the panel lists under DEVICES.
@@ -1204,6 +1207,8 @@ pub struct App {
     volumes: HashMap<PathBuf, Option<Volume>>,
     pub should_quit: bool,
     pub date_style: DateStyle,
+    /// What colours code in the preview.
+    pub highlighter: Option<Highlighter>,
     pub thumbs: Option<Thumbs>,
     /// What was read about the selected item for the preview pane.
     pub facts: Option<Facts>,
@@ -1274,6 +1279,7 @@ impl App {
             should_quit: false,
             date_style: config.date_style,
             thumbs: config.thumbs,
+            highlighter: config.highlighter,
             facts: None,
             clipboard: None,
             history: History::default(),
@@ -1384,6 +1390,9 @@ impl App {
         }
         if let Some(thumbs) = &mut self.thumbs {
             thumbs.collect();
+        }
+        if let Some(highlighter) = &mut self.highlighter {
+            highlighter.collect();
         }
         let (hidden, sort) = (self.show_hidden, self.sort);
         let selected = self.tabs[self.current].pane().selected();
@@ -4565,7 +4574,8 @@ pub mod testing {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             app.tick();
-            if app.thumbs.as_ref().is_none_or(Thumbs::is_idle) {
+            let coloured = app.highlighter.as_ref().is_none_or(Highlighter::is_idle);
+            if app.thumbs.as_ref().is_none_or(Thumbs::is_idle) && coloured {
                 return;
             }
             assert!(Instant::now() < deadline, "the thumbnails never arrived");
@@ -4592,6 +4602,7 @@ pub mod testing {
             date_style: DateStyle::MonthFirst,
             state_dir: None,
             thumbs,
+            highlighter: None,
             trash_dir: trash.clone(),
             volumes_dir: volumes.clone(),
             // No applications there: PLACES starts at Home.
@@ -4622,6 +4633,7 @@ pub mod testing {
             date_style: DateStyle::MonthFirst,
             state_dir: state_dir.map(Path::to_path_buf),
             thumbs: None,
+            highlighter: None,
             trash_dir: home.join(".Trash"),
             // No volumes there: DEVICES lists nothing.
             volumes_dir: home.join(".no-volumes"),
@@ -4763,6 +4775,7 @@ mod tests {
             date_style: DateStyle::MonthFirst,
             state_dir: None,
             thumbs: None,
+            highlighter: None,
             trash_dir: f.trash.clone(),
             volumes_dir: f.volumes.clone(),
             applications_dir: f.home.join(".no-applications"),

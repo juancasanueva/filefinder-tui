@@ -59,6 +59,18 @@ pub const ACCENT: Color = FOREGROUND;
 
 /// The seven Finder tags' colours, in their order: Red, Orange, Yellow,
 /// Green, Blue, Purple, Gray.
+/// Code's colours by `bat`'s role: the foreground, then flea's red, green,
+/// yellow, blue, magenta and cyan.
+pub const SYNTAX: [Color; 7] = [
+    FOREGROUND,
+    Color::Rgb(0xf3, 0x8b, 0xa8),
+    Color::Rgb(0xa6, 0xe3, 0xa1),
+    Color::Rgb(0xf9, 0xe2, 0xaf),
+    Color::Rgb(0x89, 0xb4, 0xfa),
+    Color::Rgb(0xcb, 0xa6, 0xf7),
+    Color::Rgb(0x94, 0xe2, 0xd5),
+];
+
 pub const TAGS: [Color; 7] = [
     Color::Rgb(0xf7, 0x76, 0x8e),
     Color::Rgb(0xeb, 0x92, 0x7b),

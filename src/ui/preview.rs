@@ -16,6 +16,7 @@ use crate::app::{App, HitMap, Spot};
 use crate::format;
 use crate::icons;
 use crate::model::{Category, Entry};
+use crate::syntax::{Run, Runs};
 use crate::theme;
 use crate::thumbs::Facts;
 
@@ -47,6 +48,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
         current,
         facts,
         thumbs,
+        highlighter,
         preview_scroll,
         show_hidden,
         sort,
@@ -110,7 +112,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
             Err(reason) => refused(frame, body, reason),
         }
     } else if !facts.opening.is_empty() {
-        let rows = text_rows(&facts.opening, width);
+        let coloured = highlighter
+            .as_mut()
+            .and_then(|highlighter| highlighter.get(&entry.path, entry.modified, &facts.opening));
+        let rows = text_rows(&facts.opening, width, coloured);
         scrolled(frame, rows, body, preview_scroll);
     } else if matches!(entry.category(), Category::Image | Category::App) {
         *preview_scroll = 0;
@@ -205,42 +210,57 @@ pub(super) fn scrolled(
 
 /// A text's lines under a right-aligned gutter of line numbers, long lines
 /// wrapped with the number on their first part only.
-pub(super) fn text_rows(lines: &[String], width: usize) -> Vec<Line<'static>> {
+pub(super) fn text_rows(
+    lines: &[String],
+    width: usize,
+    coloured: Option<&[Runs]>,
+) -> Vec<Line<'static>> {
     let gutter = lines.len().to_string().width();
     let room = width.saturating_sub(gutter + 1).max(1);
     let mut rows = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        for (part, text) in wrapped(line, room).into_iter().enumerate() {
+        let plain = [(0, line.clone())];
+        let runs = coloured
+            .and_then(|coloured| coloured.get(index))
+            .map_or(&plain[..], Vec::as_slice);
+        for (part, pieces) in wrapped_runs(runs, room).into_iter().enumerate() {
             let number = if part == 0 {
                 pad_left(&(index + 1).to_string(), gutter)
             } else {
                 " ".repeat(gutter)
             };
-            rows.push(Line::from(vec![
-                Span::styled(format!("{number} "), theme::muted()),
-                Span::styled(text, theme::base()),
-            ]));
+            let mut spans = vec![Span::styled(format!("{number} "), theme::muted())];
+            for (role, text) in pieces {
+                let color = theme::SYNTAX[usize::from(role).min(theme::SYNTAX.len() - 1)];
+                spans.push(Span::styled(text, theme::fg(color)));
+            }
+            rows.push(Line::from(spans));
         }
     }
     rows
 }
 
-/// A line cut into parts of at most `width` cells; an empty line is one part.
-fn wrapped(line: &str, width: usize) -> Vec<String> {
-    let mut parts = vec![String::new()];
+/// Coloured runs cut into rows of at most `width` cells, each row its runs;
+/// an empty line is one row.
+fn wrapped_runs(runs: &[Run], width: usize) -> Vec<Runs> {
+    let mut rows: Vec<Runs> = vec![Vec::new()];
     let mut used = 0;
-    for c in line.chars() {
-        let cells = c.width().unwrap_or(0);
-        if used + cells > width && used > 0 {
-            parts.push(String::new());
-            used = 0;
+    for (role, text) in runs {
+        for c in text.chars() {
+            let cells = c.width().unwrap_or(0);
+            if used + cells > width && used > 0 {
+                rows.push(Vec::new());
+                used = 0;
+            }
+            let row = rows.last_mut().expect("never empty");
+            match row.last_mut() {
+                Some((last, run)) if last == role => run.push(c),
+                _ => row.push((*role, c.to_string())),
+            }
+            used += cells;
         }
-        if let Some(part) = parts.last_mut() {
-            part.push(c);
-        }
-        used += cells;
     }
-    parts
+    rows
 }
 
 /// A folder that can't be read: the lock in the error colour over why.
@@ -461,6 +481,38 @@ mod tests {
         assert_eq!(row(&drawn, last + 1).trim(), "");
         assert_eq!(row(&drawn, last + 2).trim(), "Kind · Application");
         assert_eq!(row(&drawn, last + 3).trim(), "");
+    }
+
+    #[test]
+    fn code_shows_in_bat_s_colours_once_they_are_ready() {
+        use crate::syntax::Highlighter;
+        use crate::syntax::testing::FakeColourer;
+        use std::sync::Arc;
+        let mut f = fixture();
+        fs::write(f.home.join("main.rs"), "fn main\nlet s = \"hi\"\n").unwrap();
+        f.app.highlighter = Some(Highlighter::new(Arc::new(FakeColourer::default())));
+        f.app.handle_key(crate::app::testing::key(KeyCode::F(5)));
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Down]);
+        f.app.tick();
+        assert_eq!(f.app.pane().selected().unwrap().name, "main.rs");
+        // Plain until the colours come back.
+        let first = buffer(&mut f.app, 120, 30);
+        let (x, y) = find(&first, "fn main", 74..120).expect("the code");
+        assert_eq!(first[(x, y)].fg, theme::FOREGROUND);
+        settle(&mut f.app);
+        let drawn = buffer(&mut f.app, 120, 30);
+        assert_eq!(find(&drawn, "fn main", 74..120), Some((x, y)));
+        let ink = |at: (u16, u16)| drawn[at].fg;
+        // The line number stays muted; `fn` magenta, the rest the foreground.
+        assert_eq!(ink((x - 2, y)), theme::MUTED);
+        assert_eq!(ink((x, y)), theme::SYNTAX[5]);
+        assert_eq!(ink((x + 1, y)), theme::SYNTAX[5]);
+        assert_eq!(ink((x + 3, y)), theme::FOREGROUND);
+        // A lone `=` is calmed to the foreground; the string green.
+        let (s, line) = find(&drawn, "let s = \"hi\"", 74..120).expect("line 2");
+        assert_eq!(ink((s + 6, line)), theme::FOREGROUND);
+        assert_eq!(ink((s + 8, line)), theme::SYNTAX[2]);
+        assert_eq!(ink((s + 11, line)), theme::SYNTAX[2]);
     }
 
     #[test]

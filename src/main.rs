@@ -10,6 +10,7 @@ mod ops;
 mod places;
 mod search;
 mod state;
+mod syntax;
 mod system;
 mod tags;
 mod theme;
@@ -33,6 +34,7 @@ use ratatui_image::picker::Picker;
 
 use app::{App, Config};
 use format::DateStyle;
+use syntax::{Bat, Highlighter};
 use system::{MacSystem, TrackMouse};
 use theme::Depth;
 use thumbs::{MacThumbnailer, Thumbs};
@@ -53,6 +55,7 @@ fn main() -> io::Result<()> {
     let config = Config {
         state_dir: Some(home.join(".config/filefinder-tui")),
         thumbs: Some(Thumbs::new(picker, Arc::new(thumbnailer))),
+        highlighter: Some(Highlighter::new(Arc::new(Bat))),
         trash_dir: home.join(".Trash"),
         volumes_dir: PathBuf::from("/Volumes"),
         applications_dir: PathBuf::from("/Applications"),
