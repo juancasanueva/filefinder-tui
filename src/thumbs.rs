@@ -453,6 +453,18 @@ impl Facts {
     /// kilobytes, a folder's items listed the way the list lists them.
     pub fn read(entry: &Entry, show_hidden: bool, sort: SortMode) -> Self {
         let category = entry.category();
+        // A text by its extension, or a file without one whose start is
+        // text (`pinned`, `.zshrc`). Only a regular file is opened to look:
+        // opening a pipe would wait for a writer.
+        let regular = || std::fs::metadata(&entry.path).is_ok_and(|meta| meta.is_file());
+        let opening = if is_plain_text(entry) {
+            opening_lines(&entry.path, false)
+        } else if !entry.is_dir && model::extension(&entry.name).is_none() && regular() {
+            opening_lines(&entry.path, true)
+        } else {
+            Vec::new()
+        };
+        let text = is_plain_text(entry) || !opening.is_empty();
         Self {
             path: entry.path.clone(),
             modified: entry.modified,
@@ -460,12 +472,8 @@ impl Facts {
             dimensions: (category == Category::Image)
                 .then(|| dimensions(&entry.path))
                 .flatten(),
-            opening: if is_plain_text(entry) {
-                opening_lines(&entry.path)
-            } else {
-                Vec::new()
-            },
-            lines: (is_plain_text(entry) && entry.size <= COUNTED_BYTES)
+            opening,
+            lines: (text && entry.size <= COUNTED_BYTES)
                 .then(|| line_count(&entry.path))
                 .flatten(),
             children: entry
@@ -534,10 +542,11 @@ fn line_count(path: &Path) -> Option<usize> {
 }
 
 /// The first lines of a file that is text; nothing when it isn't UTF-8.
-fn opening_lines(path: &Path) -> Vec<String> {
+/// Sniffing a file nothing names as text, a NUL byte says it isn't.
+fn opening_lines(path: &Path, sniffing: bool) -> Vec<String> {
     let mut bytes = Vec::new();
     let read = File::open(path).and_then(|file| file.take(OPENING_BYTES).read_to_end(&mut bytes));
-    if read.is_err() {
+    if read.is_err() || (sniffing && bytes.contains(&0)) {
         return Vec::new();
     }
     let text = match str::from_utf8(&bytes) {
@@ -825,5 +834,36 @@ mod tests {
         assert!(facts("data.bin", b"plain enough\n").opening.is_empty());
         assert!(facts("letter.rtf", b"{\\rtf1 Hello}").opening.is_empty());
         assert!(facts("empty.txt", b"").opening.is_empty());
+    }
+
+    #[test]
+    fn a_file_without_an_extension_shows_its_lines_when_it_is_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let facts = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            read(&entry(path))
+        };
+        let pinned = facts("pinned", b"/Users/me/Projects\n/Users/me/Music\n");
+        assert_eq!(pinned.opening, ["/Users/me/Projects", "/Users/me/Music"]);
+        assert_eq!(pinned.lines, Some(2));
+        let rc = facts(".zshrc", b"export EDITOR=nvim\n");
+        assert_eq!(rc.opening, ["export EDITOR=nvim"]);
+
+        // A program, bytes that aren't UTF-8, or nothing at all: no lines.
+        let program = facts("tool", b"\xcf\xfa\xed\xfe\x07\x00\x00\x01");
+        assert!(program.opening.is_empty());
+        assert_eq!(program.lines, None);
+        assert!(facts("zeros", b"ab\0cd\n").opening.is_empty());
+        assert!(facts("latin", b"caf\xe9\n").opening.is_empty());
+        assert!(facts("blank", b"").opening.is_empty());
+        // An unknown extension is still not read.
+        assert!(facts("data.bin", b"plain enough\n").opening.is_empty());
+
+        // A pipe is never opened: that would wait for a writer.
+        let pipe = dir.path().join("pipe");
+        let name = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read(&entry(pipe)).opening.is_empty());
     }
 }
