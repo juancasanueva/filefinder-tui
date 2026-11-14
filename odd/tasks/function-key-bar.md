@@ -27,7 +27,7 @@ Branch: `feat/function-key-bar` (from `main` bb2bda4). Delivery strategy: `excep
 - [x] **T1** S1–S5 — the bar, its keys and clicks, two panes only. Route: delegated (Writer trigger b, context backstop: the parent session is far past 150k tokens); independent verifier (Risk item 1). Commit: f11b4ec (509 tests).
 - [x] **T2** S2 S3 — the review's advisories: F8 never a permanent delete; select what landed in the pane that was the destination when the work started; the bar muted under overlays; redo of F9/F10 tested; the bar's slot maths without u16 overflow. Route: delegated (Writer trigger b, context backstop); independent verifier (Risk items 1 and 4). Commit: 75c57a6 (516 tests).
 - [x] **T3** S2 S3 — regression tests for L11's three gaps: the bar muted under a dialog and Quick Look; landing when the destination tab was closed, the split closed or the pane left the folder; F6's landing and source cursor after Tab and a tab switch. Route: delegated (Writer trigger b, context backstop). Commit: 06222aa (523 tests).
-- [x] **T4** S2 — the bar moved into the panes' area, above the status line, spanning only the two panes. Route: delegated (Writer trigger b, context backstop). Commit: see L15.
+- [x] **T4** S2 — the bar moved into the panes' area, above the status line, spanning only the two panes. Route: delegated (Writer trigger b, context backstop). Commit: da4e7a5 (525 tests).
 
 ## Log
 
