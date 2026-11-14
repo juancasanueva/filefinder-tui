@@ -17,7 +17,7 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 - **Compress and Extract**, in the menu (`m`). Compress writes zip, tar, tar.gz, tar.bz2 or tar.xz (and 7z when [7-Zip](https://www.7-zip.org/) is installed as `7zz` or `7z`), named after the item without its extension, or after the folder several are in. Extract unpacks a zip, tar, tar.gz/.tgz, tar.bz2, tar.xz (or 7z) into a new folder beside it named after it without its ending. A name in use is never written over: the next free copy name is taken (`pack copy.tar.gz`, `pack copy 2.tar.gz`, `pack copy`). An archive holding a name from the root, one with `..`, or a link that leads out of its folder is refused with nothing written; one that is damaged or needs a password says so and leaves nothing behind; Escape stops either. Undo moves what was made to the Trash.
 - **Two panes** with Ctrl+Opt+4, `|` or Alt+1 to move things between folders (`y`/`x` in one, `p` or `M` in the other); the same key goes back to the view you came from.
 - **Filter and Find**, both typed on the bottom row. The filter (`/`) narrows the folder you are looking at as you type: part of a name in any case, or a `*` / `?` pattern; close matches (a letter or two off, depending on how long the text is) show only when nothing matches exactly. Tab widens it to every folder below. Find (`f` or Ctrl+F) walks the folders below and ranks what it finds: the whole name, then its start, the start of a word, the letters in order, and typos last. Tab looks in this folder, home, or everywhere; Ctrl+G looks inside files instead, through [ripgrep](https://github.com/BurntSushi/ripgrep) when it is installed. Go to a path with `:`.
-- **Settings** (`,` or the gear after the view buttons), in a card laid out like flea's: a rail with View and About on the left, the rows on the right. View holds what the keys already change — Last-used view, Preview pane, Places panel, Detail column, Sort by, Order, Show hidden files — each row doing what its key does and remembered the same way; About has the version, where the look comes from, the key sheet and a link to report an issue. Tab moves between the rail and the rows, `j`/`k` between rows, `h`/`l` (or Enter) change a choice, Space (or Enter) a check, Esc or a click outside closes it.
+- **Settings** (`,` or the gear after the view buttons), in a card laid out like flea's: a rail with View and About on the left, the rows on the right. View holds what the keys already change — Last-used view, Preview pane, Places panel, Detail column, Sort by, Order, Show hidden files, and Space previews in (the terminal, or macOS Quick Look) — each row doing what its key does and remembered the same way; About has the version, where the look comes from, the key sheet and a link to report an issue. Tab moves between the rail and the rows, `j`/`k` between rows, `h`/`l` (or Enter) change a choice, Space (or Enter) a check, Esc or a click outside closes it.
 - **Mouse friendly**, by flea's rules: click, double-click, right-click for the menu, Ctrl+click for one more, Shift+click for a range, the wheel to move.
 
 ## Requirements
@@ -83,7 +83,7 @@ flea's own terminal keys. Digits are never counts.
 | Ctrl+G | In Find's field: names or what files hold (needs `rg`) |
 | `tag:red` | In Find's field: only what carries that tag |
 | `o` | Show what Find found under the cursor in its own folder |
-| Space | Quick Look, in the terminal (see below) |
+| Space | Quick Look, in the terminal (see below), or in macOS's Quick Look window as before the flea port: Settings › View › Space previews in |
 | `.` | Show hidden files (remembered) |
 | `s` / `S` | Next sort key (name, size, modified, kind) / reverse the sort |
 | `I` | The columns view's detail column: size, modified, mode (`drwx------`), owner |
@@ -137,7 +137,7 @@ In the Trash it offers Restore, Delete Permanently… and Empty Trash…. `j` / 
 
 ### Quick Look
 
-Space opens a card over the window with the item's name, one fact (a picture's size, a text's lines) and the picture, a PDF's first page, an app's icon, the text with line numbers (coloured like the preview's), or a folder's items. `j` / `k` and ↓ / ↑ move the list's cursor and the card follows; `+` / `-` zoom the picture and `0` fits it; PgDn / PgUp scroll the text; Escape or Space closes, and so does a click on its `×` or outside it. macOS's own Quick Look window is in the menu: Open With › Quick Look.
+Space (unless Settings say macOS Quick Look) opens a card over the window with the item's name, one fact (a picture's size, a text's lines) and the picture, a PDF's first page, an app's icon, the text with line numbers (coloured like the preview's), or a folder's items. `j` / `k` and ↓ / ↑ move the list's cursor and the card follows; `+` / `-` zoom the picture and `0` fits it; PgDn / PgUp scroll the text; Escape or Space closes, and so does a click on its `×` or outside it. macOS's own Quick Look window is in the menu: Open With › Quick Look.
 
 ### The mouse
 

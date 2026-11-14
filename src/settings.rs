@@ -40,6 +40,7 @@ pub enum Setting {
     SortBy,
     Order,
     Hidden,
+    Space,
     Version,
     BasedOn,
     Keys,
@@ -62,7 +63,9 @@ pub enum Kind {
 impl Setting {
     pub fn kind(self) -> Kind {
         match self {
-            Setting::View | Setting::Detail | Setting::SortBy | Setting::Order => Kind::Choice,
+            Setting::View | Setting::Detail | Setting::SortBy | Setting::Order | Setting::Space => {
+                Kind::Choice
+            }
             Setting::Preview | Setting::Places | Setting::Hidden => Kind::Check,
             Setting::Keys | Setting::Issue => Kind::Action,
             Setting::Version | Setting::BasedOn => Kind::Fact,
@@ -197,6 +200,12 @@ pub fn rows(app: &App, section: Section) -> Vec<Row> {
                 "Show hidden files",
                 Value::Check(app.show_hidden),
             ),
+            Row::Heading("OPENING"),
+            item(
+                Setting::Space,
+                "Space previews in",
+                Value::Choice(app.space_look.label()),
+            ),
         ],
         Section::About => vec![
             item(
@@ -241,8 +250,8 @@ pub fn wrap(index: usize, step: isize, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Focus;
     use crate::app::testing::{click_preview, fixture, launch, launch_one_pane, press};
+    use crate::app::{Focus, SpaceLook};
     use ratatui::crossterm::event::KeyCode;
     use std::path::PathBuf;
 
@@ -282,7 +291,8 @@ mod tests {
                 Setting::Detail,
                 Setting::SortBy,
                 Setting::Order,
-                Setting::Hidden
+                Setting::Hidden,
+                Setting::Space
             ]
         );
         // Last-used view: `l` and `h` step it, going round to Dual pane.
@@ -314,11 +324,14 @@ mod tests {
         assert_eq!((app.sort.key, app.sort.reversed), (SortKey::Size, false));
         press(&mut app, &[KeyCode::Char('j'), KeyCode::Enter]);
         assert_eq!((app.sort.key, app.sort.reversed), (SortKey::Size, true));
-        // Show hidden files, the last row: `j` stays on it.
+        // Show hidden files.
         press(&mut app, &[KeyCode::Char('j'), KeyCode::Char(' ')]);
         assert!(app.show_hidden);
+        // Space previews in, the last row: `j` stays on it.
+        press(&mut app, &[KeyCode::Char('j'), KeyCode::Char('l')]);
+        assert_eq!(app.space_look, SpaceLook::QuickLook);
         press(&mut app, &[KeyCode::Char('j')]);
-        assert_eq!(app.settings.map(|s| s.cursor), Some(6));
+        assert_eq!(app.settings.map(|s| s.cursor), Some(7));
         assert_eq!(app.settings.map(|s| s.saved), Some(true));
         // All of it is there at the next launch, hidden files included.
         let again = launch(&f.home, Some(state.path()));
@@ -327,9 +340,66 @@ mod tests {
         assert_eq!(again.detail, Detail::Modified);
         assert_eq!((again.sort.key, again.sort.reversed), (SortKey::Size, true));
         assert!(again.show_hidden);
+        assert_eq!(again.space_look, SpaceLook::QuickLook);
         // `.` is remembered as well now.
         press(&mut app, &[KeyCode::Esc, KeyCode::Char('.')]);
         assert!(!launch(&f.home, Some(state.path())).show_hidden);
+    }
+
+    #[test]
+    fn space_previews_in_the_terminal_or_in_macos_quick_look_as_chosen() {
+        let mut f = fixture();
+        let notes = f.home.join("notes.txt");
+        // At first, as since the flea port: the card in the terminal.
+        assert_eq!(f.app.space_look, SpaceLook::Terminal);
+        press(&mut f.app, &[KeyCode::End, KeyCode::Char(' ')]);
+        assert!(f.app.look.is_some());
+        assert!(f.system.previewed.borrow().is_empty());
+        press(&mut f.app, &[KeyCode::Esc]);
+        // The row says so, under its own heading, and `l` changes it.
+        let view = rows(&f.app, Section::View);
+        let at = view
+            .iter()
+            .position(|row| *row == Row::Heading("OPENING"))
+            .unwrap();
+        assert_eq!(
+            view[at + 1],
+            Row::Item {
+                setting: Setting::Space,
+                label: "Space previews in",
+                value: Value::Choice("The terminal"),
+                caption: None,
+            }
+        );
+        press(&mut f.app, &[KeyCode::Char(',')]);
+        for _ in 0..7 {
+            press(&mut f.app, &[KeyCode::Char('j')]);
+        }
+        press(&mut f.app, &[KeyCode::Char('l')]);
+        let view = rows(&f.app, Section::View);
+        assert!(view.contains(&Row::Item {
+            setting: Setting::Space,
+            label: "Space previews in",
+            value: Value::Choice("macOS Quick Look"),
+            caption: None,
+        }));
+        // Then Space is what it was before the port: macOS's window, and
+        // again closes it.
+        press(&mut f.app, &[KeyCode::Esc, KeyCode::Char(' ')]);
+        assert!(f.app.look.is_none());
+        assert_eq!(*f.system.previewed.borrow(), [notes.clone()]);
+        press(&mut f.app, &[KeyCode::Char(' ')]);
+        assert_eq!(*f.system.previewed.borrow(), [notes.clone(), notes]);
+        // And back.
+        press(&mut f.app, &[KeyCode::Char(',')]);
+        for _ in 0..7 {
+            press(&mut f.app, &[KeyCode::Char('j')]);
+        }
+        press(
+            &mut f.app,
+            &[KeyCode::Char('h'), KeyCode::Esc, KeyCode::Char(' ')],
+        );
+        assert!(f.app.look.is_some());
     }
 
     #[test]

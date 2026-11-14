@@ -1,14 +1,14 @@
 //! What is remembered between launches: the view, the size of the tiles,
 //! whether the preview pane shows, the sort, the list's detail column,
-//! whether the places panel shows, whether hidden items show, and where
-//! what is in the trash came from.
+//! whether the places panel shows, whether hidden items show, where Space
+//! shows an item, and where what is in the trash came from.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::app::{Detail, TileSize, ViewMode};
+use crate::app::{Detail, SpaceLook, TileSize, ViewMode};
 use crate::model::{SortKey, SortMode};
 
 const FILE: &str = "state";
@@ -27,6 +27,8 @@ pub struct Saved {
     pub places: bool,
     /// Whether hidden items show: `.`.
     pub hidden: bool,
+    /// Where Space shows the item under the cursor.
+    pub space: SpaceLook,
 }
 
 impl Default for Saved {
@@ -39,6 +41,7 @@ impl Default for Saved {
             detail: Detail::Size,
             places: true,
             hidden: false,
+            space: SpaceLook::Terminal,
         }
     }
 }
@@ -75,6 +78,8 @@ pub fn load(dir: &Path) -> Saved {
             ("places", "off") => saved.places = false,
             ("hidden", "on") => saved.hidden = true,
             ("hidden", "off") => saved.hidden = false,
+            ("space", "terminal") => saved.space = SpaceLook::Terminal,
+            ("space", "quicklook") => saved.space = SpaceLook::QuickLook,
             _ => {}
         }
     }
@@ -101,11 +106,15 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
     let detail = saved.detail.label().to_lowercase();
     let places = if saved.places { "on" } else { "off" };
     let hidden = if saved.hidden { "on" } else { "off" };
+    let space = match saved.space {
+        SpaceLook::Terminal => "terminal",
+        SpaceLook::QuickLook => "quicklook",
+    };
     fs::create_dir_all(dir)?;
     fs::write(
         dir.join(FILE),
         format!(
-            "view={view}\ntiles={tiles}\npreview={preview}\nsort={sort}\nreverse={reverse}\ndetail={detail}\nplaces={places}\nhidden={hidden}\n"
+            "view={view}\ntiles={tiles}\npreview={preview}\nsort={sort}\nreverse={reverse}\ndetail={detail}\nplaces={places}\nhidden={hidden}\nspace={space}\n"
         ),
     )
 }
@@ -197,6 +206,7 @@ mod tests {
                 detail: Detail::Size,
                 places: true,
                 hidden: false,
+                space: SpaceLook::Terminal,
             }
         );
     }
@@ -217,11 +227,12 @@ mod tests {
             detail: Detail::Mode,
             places: true,
             hidden: true,
+            space: SpaceLook::QuickLook,
         };
         save(&folder, saved).unwrap();
         assert_eq!(
             fs::read_to_string(folder.join("state")).unwrap(),
-            "view=columns\ntiles=small\npreview=off\nsort=modified\nreverse=on\ndetail=mode\nplaces=on\nhidden=on\n"
+            "view=columns\ntiles=small\npreview=off\nsort=modified\nreverse=on\ndetail=mode\nplaces=on\nhidden=on\nspace=quicklook\n"
         );
         assert_eq!(load(&folder), saved);
         let shown = Saved {
@@ -250,6 +261,7 @@ mod tests {
                 detail: Detail::Size,
                 places: true,
                 hidden: false,
+                space: SpaceLook::Terminal,
             }
         );
     }
@@ -265,7 +277,7 @@ mod tests {
         save(dir.path(), hidden).unwrap();
         let text = fs::read_to_string(dir.path().join("state")).unwrap();
         assert!(
-            text.ends_with("detail=size\nplaces=off\nhidden=off\n"),
+            text.ends_with("detail=size\nplaces=off\nhidden=off\nspace=terminal\n"),
             "{text}"
         );
         assert_eq!(load(dir.path()), hidden);

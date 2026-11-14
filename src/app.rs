@@ -75,6 +75,25 @@ pub enum Focus {
 }
 
 /// What the list's right-hand column shows: `I` goes round them.
+/// Where Space shows the item under the cursor: the card in the terminal
+/// (flea's), or macOS's Quick Look window (as before the port). A setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SpaceLook {
+    #[default]
+    Terminal,
+    QuickLook,
+}
+
+impl SpaceLook {
+    /// As the settings say it.
+    pub fn label(self) -> &'static str {
+        match self {
+            SpaceLook::Terminal => "The terminal",
+            SpaceLook::QuickLook => "macOS Quick Look",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Detail {
     Size,
@@ -1217,6 +1236,8 @@ pub struct App {
     pub tip: Option<Spot>,
     /// The settings card, while it is open: `,` or the gear.
     pub settings: Option<crate::settings::Settings>,
+    /// Where Space shows the item under the cursor: a setting.
+    pub space_look: SpaceLook,
     /// How many lines the shortcuts are scrolled down; drawing keeps it in range.
     pub help_scroll: usize,
     /// Lines of shortcuts shown last time, for Page Up and Page Down.
@@ -1304,6 +1325,7 @@ impl App {
             help_visible: false,
             tip: None,
             settings: None,
+            space_look: saved.space,
             help_scroll: 0,
             help_rows: 1,
             dialog: None,
@@ -1659,7 +1681,11 @@ impl App {
                 self.help_visible = true;
                 self.help_scroll = 0;
             }
-            KeyCode::Char(' ') if plain => self.open_look(),
+            // The card in the terminal, or macOS's window: a setting.
+            KeyCode::Char(' ') if plain => match self.space_look {
+                SpaceLook::Terminal => self.open_look(),
+                SpaceLook::QuickLook => self.preview_selected(),
+            },
             KeyCode::Char('.') if plain => self.toggle_hidden(),
             KeyCode::Char('/') if plain => self.open_filter(),
             KeyCode::Char('f') if plain => self.search(),
@@ -4102,6 +4128,7 @@ impl App {
                 detail: self.detail,
                 places: self.places_visible,
                 hidden: self.show_hidden,
+                space: self.space_look,
             };
             // A view that isn't remembered is no reason to interrupt.
             let _ = state::save(dir, saved);
@@ -4193,6 +4220,13 @@ impl App {
             }
             Setting::Order => self.set_sort(self.sort.reverse()),
             Setting::Hidden => self.toggle_hidden(),
+            Setting::Space => {
+                self.space_look = match self.space_look {
+                    SpaceLook::Terminal => SpaceLook::QuickLook,
+                    SpaceLook::QuickLook => SpaceLook::Terminal,
+                };
+                self.remember();
+            }
             Setting::Keys => {
                 self.settings = None;
                 self.help_visible = true;
@@ -5523,7 +5557,7 @@ mod tests {
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
-            "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\n"
+            "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\nspace=terminal\n"
         );
         app.handle_key(ctrl(KeyCode::Char('3')));
         assert_eq!(app.view(), ViewMode::Grid);
@@ -5653,7 +5687,7 @@ mod tests {
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
-            "view=list\ntiles=large\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\n"
+            "view=list\ntiles=large\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\nspace=terminal\n"
         );
         assert_eq!(launch(&f.home, Some(state.path())).tile, Large);
     }
