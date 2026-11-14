@@ -1,5 +1,7 @@
 # filefinder-tui
 
+**Website**: [filefinder-tui.vercel.app](https://filefinder-tui.vercel.app/)
+
 A keyboard-first terminal file manager for macOS, written in Rust with [ratatui](https://ratatui.rs/). It has a header with the path, the tabs, the view and settings buttons and the sort order; then the places panel on the left, the files in the middle (a list with columns, two lists side by side, Miller columns or a grid of thumbnails) and a preview on the right; and a footer with the counts, what just happened and the free space. Colours are a quiet grey palette on your terminal's own background.
 
 Nothing runs in the background. Folders are read when you open them, and thumbnails are made when a tile needs one.
