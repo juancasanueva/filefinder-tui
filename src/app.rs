@@ -4344,7 +4344,13 @@ impl App {
                 }
                 return;
             }
-            Setting::Version | Setting::License | Setting::BasedOn => return,
+            Setting::Repo => {
+                if self.system.open(Path::new(settings::REPO)).is_err() {
+                    self.fail("Couldn't open the repository's page.".to_string());
+                }
+                return;
+            }
+            Setting::Version | Setting::License => return,
         }
         if let Some(open) = &mut self.settings {
             open.saved = true;

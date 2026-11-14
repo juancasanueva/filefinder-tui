@@ -438,7 +438,8 @@ mod tests {
         let (gx, gy) = find_in(&drawn, &f.app, TAGLINE).expect("the tagline");
         assert_eq!((gy, drawn[(gx, gy)].fg), (ny + 1, theme::MUTED));
         assert!(row_of(&drawn, &f.app, "Version").contains(env!("CARGO_PKG_VERSION")));
-        assert!(row_of(&drawn, &f.app, "Based on").contains("flea by GM · MIT"));
+        assert!(find_in(&drawn, &f.app, "Based on").is_none());
+        assert!(row_of(&drawn, &f.app, "GitHub").contains("juancasanueva/filefinder-tui"));
         assert!(row_of(&drawn, &f.app, "License").contains("MIT, © 2026 Juan Casanueva"));
         assert!(row_of(&drawn, &f.app, "Keyboard sheet").contains('?'));
         assert!(row_of(&drawn, &f.app, "Report an issue").contains("Open"));

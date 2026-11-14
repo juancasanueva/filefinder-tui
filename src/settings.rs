@@ -11,6 +11,8 @@ pub const NAME: &str = "filefinder-tui";
 pub const TAGLINE: &str = "A keyboard-first terminal file manager for macOS";
 /// The license, as the LICENSE file grants it.
 pub const LICENSE: &str = "MIT, © 2026 Juan Casanueva";
+/// The repository, where "GitHub" goes.
+pub const REPO: &str = "https://github.com/juancasanueva/filefinder-tui";
 /// Where "Report an issue" goes.
 pub const ISSUES: &str = "https://github.com/juancasanueva/filefinder-tui/issues";
 
@@ -47,7 +49,7 @@ pub enum Setting {
     Space,
     Version,
     License,
-    BasedOn,
+    Repo,
     Keys,
     Issue,
 }
@@ -74,8 +76,8 @@ impl Setting {
             Setting::Preview | Setting::Places | Setting::Hidden | Setting::Column(_) => {
                 Kind::Check
             }
-            Setting::Keys | Setting::Issue => Kind::Action,
-            Setting::Version | Setting::License | Setting::BasedOn => Kind::Fact,
+            Setting::Keys | Setting::Issue | Setting::Repo => Kind::Action,
+            Setting::Version | Setting::License => Kind::Fact,
         }
     }
 }
@@ -242,9 +244,9 @@ pub fn rows(app: &App, section: Section) -> Vec<Row> {
                 Value::Text(LICENSE.to_string()),
             ),
             item(
-                Setting::BasedOn,
-                "Based on",
-                Value::Text("flea by GM · MIT".to_string()),
+                Setting::Repo,
+                "GitHub",
+                Value::Text(REPO.trim_start_matches("https://github.com/").to_string()),
             ),
             item(
                 Setting::Keys,
@@ -524,7 +526,15 @@ mod tests {
         reach(&mut f.app, Setting::Issue);
         press(&mut f.app, &[KeyCode::Enter]);
         assert_eq!(*f.system.opened.borrow(), [PathBuf::from(ISSUES)]);
-        // The license and the rest say something, and Enter does nothing.
+        // GitHub opens the repository's page.
+        reach(&mut f.app, Setting::Repo);
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(
+            *f.system.opened.borrow(),
+            [PathBuf::from(ISSUES), PathBuf::from(REPO)]
+        );
+        assert_eq!(REPO, "https://github.com/juancasanueva/filefinder-tui");
+        // The license says something, and Enter does nothing.
         reach(&mut f.app, Setting::License);
         press(&mut f.app, &[KeyCode::Enter]);
         assert!(f.app.settings.is_some() && !f.app.help_visible);
