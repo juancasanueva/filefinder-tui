@@ -15,20 +15,21 @@ use crate::app::{Action, HitMap, Menu, MenuRow, Spot};
 use crate::icons;
 use crate::theme;
 
-// flea's marks for the menu's verbs: Nerd Font Codicons.
-const OPEN: &str = "\u{eaf7}";
-const WINDOW: &str = "\u{eb7f}";
-const EYE: &str = "\u{ea70}";
-const EYE_CLOSED: &str = "\u{eae7}";
-const ARCHIVE: &str = "\u{ea98}";
-const FILE: &str = "\u{ea7b}";
-const TAG: &str = "\u{ea66}";
-const COPY: &str = "\u{ebcc}";
-const EDIT: &str = "\u{ea73}";
-const FILES: &str = "\u{eaf0}";
-const TRASH: &str = "\u{ea81}";
-const RESTORE: &str = "\u{eae2}";
-const CHEVRON: &str = "\u{eab6}";
+// The marks for the menu's verbs: filled Material Design glyphs, like the
+// rest of the app's icons.
+const OPEN: &str = "\u{f03cc}";
+const WINDOW: &str = "\u{f0614}";
+const EYE: &str = "\u{f0208}";
+const EYE_CLOSED: &str = "\u{f0209}";
+const ARCHIVE: &str = "\u{f003c}";
+const FILE: &str = "\u{f0214}";
+const TAG: &str = "\u{f04f9}";
+const COPY: &str = "\u{f018f}";
+const EDIT: &str = "\u{f03eb}";
+const FILES: &str = "\u{f0222}";
+const TRASH: &str = "\u{f0a79}";
+const RESTORE: &str = "\u{f099b}";
+const CHEVRON: &str = "\u{f0142}";
 
 /// The `›` at the end of a row that opens a submenu.
 pub fn chevron() -> &'static str {

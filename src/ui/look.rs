@@ -200,7 +200,8 @@ fn bar(entry: &crate::model::Entry, fact: &str, width: usize) -> Line<'static> {
     let mut spans = Vec::new();
     match name.strip_prefix(&mark) {
         Some(rest) if !mark.is_empty() => {
-            spans.push(Span::styled(mark.clone(), theme::base()));
+            let tint = theme::base().fg(theme::ink(icons::tint(entry)));
+            spans.push(Span::styled(mark.clone(), tint));
             spans.push(Span::styled(rest.to_string(), theme::title()));
         }
         _ => spans.push(Span::styled(name, theme::title())),

@@ -6575,7 +6575,7 @@ mod tests {
         assert!(names(&f.app).is_empty());
         let drawn = crate::ui::testing::screen(&mut f.app, 100, 20);
         assert!(drawn.iter().any(|row| row.contains("NOTHING MATCHES txt")));
-        assert!(drawn.iter().any(|row| row.contains('\u{ea6d}')));
+        assert!(drawn.iter().any(|row| row.contains(crate::icons::SEARCH)));
         assert!(bottom_row(&mut f.app).starts_with("Filter txt  0 of 2 shown"));
     }
 

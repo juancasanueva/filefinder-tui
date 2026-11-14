@@ -24,7 +24,7 @@ const HEAD_ROWS: u16 = 3;
 /// The most facts under a picture.
 const FACTS: usize = 3;
 /// The glyph before several selected items.
-const FILES: &str = "\u{eaf0}";
+const FILES: &str = "\u{f0222}";
 
 /// Draws the pane, which is a spot for the mouse.
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
@@ -142,7 +142,8 @@ fn name_line(entry: &Entry, width: usize) -> Line<'static> {
     // Only the name is bold, not the glyph or the space after it.
     match name.strip_prefix(&mark) {
         Some(rest) if !mark.is_empty() => {
-            spans.push(Span::styled(mark.clone(), theme::base()));
+            let tint = theme::base().fg(theme::ink(icons::tint(entry)));
+            spans.push(Span::styled(mark.clone(), tint));
             spans.push(Span::styled(rest.to_string(), theme::title()));
         }
         _ => spans.push(Span::styled(name, theme::title())),
@@ -452,7 +453,7 @@ mod tests {
         let drawn = buffer(&mut f.app, 120, 30);
         assert_eq!(
             row(&drawn, 2).trim(),
-            format!("{} 2 items selected", "\u{eaf0}")
+            format!("{} 2 items selected", "\u{f0222}")
         );
         assert!(drawn[(77, 2)].modifier.contains(Modifier::BOLD));
         assert_eq!(row(&drawn, 3).trim(), "Combined · 7 B");

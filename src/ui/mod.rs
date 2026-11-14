@@ -574,15 +574,16 @@ mod tests {
         assert_eq!(drawn[(26, 2)].symbol(), "▎");
         assert_eq!(drawn[(26, 2)].fg, theme::ACCENT);
         assert_eq!(drawn[(27, 2)].symbol(), icons::FOLDER);
-        assert_eq!(drawn[(27, 2)].fg, theme::FOREGROUND, "lifted");
+        assert_eq!(drawn[(27, 2)].fg, theme::ICON_FOLDER, "a folder's colour");
         assert_eq!(find(&drawn, "Trip", 26..73), Some((29, 2)));
         assert_eq!(find(&drawn, "No items", 26..73), Some((63, 2)));
         for x in 26..73 {
             assert_eq!(drawn[(x, 2)].bg, theme::CURSOR, "{x}");
         }
-        // a.jpg: no fill, the glyph and the size in the metadata ink.
+        // a.jpg: no fill, the glyph in a picture's colour, the size in the
+        // metadata ink.
         assert_eq!(drawn[(26, 3)].symbol(), " ");
-        assert_eq!(drawn[(27, 3)].fg, theme::MUTED);
+        assert_eq!(drawn[(27, 3)].fg, theme::ICON_IMAGE);
         assert_eq!(find(&drawn, "a.jpg", 26..73), Some((29, 3)));
         assert_eq!(drawn[(29, 3)].fg, theme::FOREGROUND);
         assert_eq!(find(&drawn, "3 B", 26..73), Some((68, 3)));

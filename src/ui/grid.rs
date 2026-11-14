@@ -204,7 +204,7 @@ pub(super) fn folder_card(frame: &mut Frame, thumb: Rect) {
 /// of its kind in the middle and its extension in the bottom right corner.
 pub(super) fn stand_in(frame: &mut Frame, thumb: Rect, visible: Rect, entry: &Entry) {
     frame.render_widget(Block::new().style(card()), visible);
-    let mut mark = |row: u16, text: String, alignment: Alignment| {
+    let mut mark = |row: u16, text: String, alignment: Alignment, style: Style| {
         let line = Rect {
             y: thumb.y + row,
             height: 1,
@@ -212,19 +212,26 @@ pub(super) fn stand_in(frame: &mut Frame, thumb: Rect, visible: Rect, entry: &En
             ..thumb
         };
         if let Some(line) = clip(line, visible) {
-            let text = Paragraph::new(text).style(card()).alignment(alignment);
+            let text = Paragraph::new(text).style(style).alignment(alignment);
             frame.render_widget(text, line);
         }
     };
     let glyph = icons::of(entry);
+    let tint = card().fg(theme::ink(icons::tint(entry)));
     mark(
         thumb.height.saturating_sub(1) / 2,
         glyph.to_string(),
         Alignment::Center,
+        tint,
     );
     if let Some(extension) = model::extension(&entry.name) {
         let label = fit(&extension.to_uppercase(), thumb.width as usize - 2);
-        mark(thumb.height.saturating_sub(1), label, Alignment::Right);
+        mark(
+            thumb.height.saturating_sub(1),
+            label,
+            Alignment::Right,
+            card(),
+        );
     }
 }
 

@@ -44,6 +44,16 @@ pub const SYMLINK: Color = Color::Rgb(0x94, 0xe2, 0xd5);
 pub const EXECUTABLE: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 /// Text behind a card.
 pub const DIMMED: Color = Color::Rgb(0x6d, 0x70, 0x70);
+
+// The glyph in front of a name takes a colour by what the item is, from the
+// same palette as the tags, so that kinds stand apart at a glance.
+pub const ICON_FOLDER: Color = TAGS[4];
+pub const ICON_IMAGE: Color = TAGS[5];
+pub const ICON_VIDEO: Color = TAGS[0];
+pub const ICON_AUDIO: Color = TAGS[2];
+pub const ICON_ARCHIVE: Color = TAGS[1];
+pub const ICON_CODE: Color = TAGS[3];
+pub const ICON_PDF: Color = TAGS[0];
 /// Without a theme the accent is the foreground itself.
 pub const ACCENT: Color = FOREGROUND;
 

@@ -105,11 +105,7 @@ fn place_row(place: &places::Place, width: usize, cursor: bool, here: bool) -> L
     } else {
         Span::styled(" ", text(theme::FOREGROUND))
     };
-    let glyph_ink = if cursor || here {
-        theme::FOREGROUND
-    } else {
-        theme::MUTED
-    };
+    let glyph_ink = icons::place_tint(place.kind);
     let glyph = fit(&format!("{} ", icons::place(place.kind)), width - 1);
     let room = width - 1 - glyph.width();
     let name = fit(&place.name, room);
@@ -147,6 +143,24 @@ mod tests {
             .iter()
             .map(|line| row(line).trim().to_string())
             .collect()
+    }
+
+    #[test]
+    fn glyphs_take_the_colour_of_their_kind_in_the_panel_and_the_list() {
+        theme::set_depth(theme::Depth::Truecolor);
+        let mut f = fixture();
+        let drawn = buffer(&mut f.app, 120, 30);
+        // The panel: Home and Pictures by what they hold, the Trash muted.
+        let glyph_at = |drawn: &Buffer, name: &str, columns: std::ops::Range<u16>| {
+            let (x, y) = find(drawn, name, columns).unwrap_or_else(|| panic!("{name}"));
+            drawn[(x - 2, y)].fg
+        };
+        assert_eq!(glyph_at(&drawn, "Home", 0..25), theme::ICON_FOLDER);
+        assert_eq!(glyph_at(&drawn, "Pictures", 0..25), theme::ICON_IMAGE);
+        assert_eq!(glyph_at(&drawn, "Trash", 0..25), theme::MUTED);
+        // The list: a folder blue, a text file muted, away from the cursor.
+        assert_eq!(glyph_at(&drawn, "Pictures", 26..73), theme::ICON_FOLDER);
+        assert_eq!(glyph_at(&drawn, "notes.txt", 26..73), theme::MUTED);
     }
 
     /// The fixture with Movies, a file called Music, and two volumes: a
@@ -194,9 +208,9 @@ mod tests {
             for x in 1..7 {
                 assert_eq!(drawn[(x, 2)].fg, theme::MUTED, "{x}");
             }
-            // The names in the foreground, the glyphs muted.
+            // The names in the foreground, the glyphs in their kind's colour.
             assert_eq!(drawn[(3, 4)].fg, theme::FOREGROUND);
-            assert_eq!(drawn[(1, 4)].fg, theme::MUTED);
+            assert_eq!(drawn[(1, 4)].fg, theme::ICON_FOLDER);
             // The line right of it, all the way down and into the rules.
             for y in 2..28 {
                 assert_eq!(drawn[(25, y)].symbol(), "│", "{view:?} {y}");
@@ -217,7 +231,11 @@ mod tests {
             assert_eq!(drawn[(x, 5)].bg, theme::SELECTED, "{x}");
         }
         assert_eq!(drawn[(0, 5)].symbol(), " ", "no edge without the keyboard");
-        assert_eq!(drawn[(1, 5)].fg, theme::FOREGROUND, "its glyph lifted");
+        assert_eq!(
+            drawn[(1, 5)].fg,
+            theme::ICON_IMAGE,
+            "its glyph keeps its colour"
+        );
         // Home holds it too, but less deeply.
         assert_eq!(drawn[(5, 3)].bg, Color::Reset);
         // In the trash, the trash; nowhere near a place, none.
@@ -291,7 +309,7 @@ mod tests {
         assert!(!app.places_visible);
         assert_eq!(app.focus, Focus::List);
         let drawn = buffer(&mut app, 120, 30);
-        assert_eq!(cells(&drawn, 2, 0..12), "▎\u{ec5e} notes.txt");
+        assert_eq!(cells(&drawn, 2, 0..12), "▎\u{f0219} notes.txt");
         assert_eq!(find(&drawn, "PLACES", 0..120), None);
         // The list runs to the preview's line; the panel's line is gone.
         assert_eq!(drawn[(25, 1)].symbol(), "─");

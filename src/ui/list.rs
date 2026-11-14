@@ -74,7 +74,7 @@ pub fn row(
     };
     let mut spans = vec![
         edge,
-        Span::styled(format!("{} ", icons::of(entry)), text(meta)),
+        Span::styled(format!("{} ", icons::of(entry)), text(icons::tint(entry))),
     ];
     spans.extend(bold_match(&name, query, text(ink)));
     if marks.is_some() {
@@ -317,17 +317,17 @@ mod tests {
         let line = row(&link, 24, None, Look::default(), "", None);
         assert_eq!(
             text(&line),
-            format!(" {} link → a.jpg{}", "\u{eaee}", " ".repeat(9))
+            format!(" {} link → a.jpg{}", "\u{f1177}", " ".repeat(9))
         );
         let found = entry(dir.path(), "a.jpg");
         let line = row(&found, 24, None, Look::default(), "", Some("Trip/Day"));
         assert_eq!(
             text(&line),
-            format!(" {} a.jpg Trip/Day{}", "\u{eaea}", " ".repeat(7))
+            format!(" {} a.jpg Trip/Day{}", "\u{f021f}", " ".repeat(7))
         );
         // Cut short with the name kept whole.
         let line = row(&found, 14, None, Look::default(), "", Some("Trip/Day"));
-        assert_eq!(text(&line), format!(" {} a.jpg Tri… ", "\u{eaea}"));
+        assert_eq!(text(&line), format!(" {} a.jpg Tri… ", "\u{f021f}"));
     }
 
     fn tag(path: &Path, labels: &[&str]) {
