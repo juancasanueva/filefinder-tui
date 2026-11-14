@@ -6,6 +6,7 @@ use std::path::Path;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
@@ -23,8 +24,10 @@ const VIEWS: [ViewMode; 4] = [
     ViewMode::Grid,
     ViewMode::Dual,
 ];
-/// The cells the buttons take: four glyphs, one space apart.
-const BUTTONS_WIDTH: usize = 7;
+/// The cells a button takes: its glyph with a cell of fill on each side.
+const CHIP_WIDTH: u16 = 3;
+/// The cells the buttons take: four chips, a cell apart.
+const BUTTONS_WIDTH: usize = 4 * CHIP_WIDTH as usize + 3;
 /// The cells of path the buttons always leave; with fewer they are dropped,
 /// before the sort label is.
 const PATH_BEFORE_BUTTONS: usize = 24;
@@ -140,13 +143,23 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     );
 }
 
-/// The four view buttons from `x`, one space apart: the view showing on the
-/// tab fill in the foreground, the others muted. Each is a spot for the mouse.
+/// The four view buttons from `x`: chips of three cells a cell apart, the
+/// glyph in the middle on a fill, so that they read as buttons and are easy
+/// to hit. The view showing is on the cursor's fill, the others on the
+/// tab's. Each whole chip is a spot for the mouse.
 fn draw_buttons(frame: &mut Frame, app: &App, x: u16, y: u16, hits: &mut HitMap) {
     for (slot, view) in VIEWS.into_iter().enumerate() {
-        let rect = Rect::new(x + 2 * slot as u16, y, 1, 1);
-        let style = theme::tab_label(view == app.view());
-        frame.render_widget(Paragraph::new(icons::view(view)).style(style), rect);
+        let rect = Rect::new(x + (CHIP_WIDTH + 1) * slot as u16, y, CHIP_WIDTH, 1);
+        let fill = if view == app.view() {
+            theme::CURSOR
+        } else {
+            theme::TAB
+        };
+        let style = Style::new()
+            .fg(theme::ink(theme::FOREGROUND))
+            .bg(theme::ink(fill));
+        let chip = format!(" {} ", icons::view(view));
+        frame.render_widget(Paragraph::new(chip).style(style), rect);
         hits.add(rect, Spot::View(view));
     }
 }
@@ -327,7 +340,7 @@ mod tests {
         let mut f = fixture();
         let one = screen(&mut f.app, 120, 30);
         let buttons = format!(
-            "{} {} {} {}",
+            " {}   {}   {}   {} ",
             crate::icons::VIEW_LIST,
             crate::icons::VIEW_COLUMNS,
             crate::icons::VIEW_GRID,
@@ -335,7 +348,7 @@ mod tests {
         );
         assert_eq!(
             one[0].trim_end(),
-            format!(" ~{}{buttons}  Name ▴", " ".repeat(102))
+            format!(" ~{}{buttons}  Name ▴", " ".repeat(94))
         );
         press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
         let drawn = buffer(&mut f.app, 120, 30);
@@ -345,25 +358,25 @@ mod tests {
             header,
             format!(
                 " ~/Pictures{} 1 ~  2 Pictures   {buttons}  Name ▴ ",
-                " ".repeat(74)
+                " ".repeat(66)
             )
         );
         // The tab showing on the tab fill in the foreground, the other muted.
-        for x in 85..90 {
+        for x in 77..82 {
             assert_eq!(
                 (drawn[(x, 0)].fg, drawn[(x, 0)].bg),
                 (theme::MUTED, Color::Reset),
                 "{x}"
             );
         }
-        for x in 90..102 {
+        for x in 82..94 {
             assert_eq!(
                 (drawn[(x, 0)].fg, drawn[(x, 0)].bg),
                 (theme::FOREGROUND, theme::TAB),
                 "{x}"
             );
         }
-        assert_eq!(drawn[(102, 0)].bg, Color::Reset);
+        assert_eq!(drawn[(94, 0)].bg, Color::Reset);
         assert_eq!(drawn[(113, 0)].fg, theme::MUTED, "the sort label");
 
         // At the root the label is a slash; closed down to one, no strip.
@@ -409,56 +422,59 @@ mod tests {
     }
 
     #[test]
-    fn the_view_buttons_sit_before_the_sort_label_with_the_current_one_lit() {
+    fn the_view_buttons_are_chips_before_the_sort_label_with_the_current_one_lit() {
         use crate::app::ViewMode;
         use crate::app::testing::ctrl;
         use crate::icons;
         let mut f = fixture();
-        let buttons = [
-            (104, ViewMode::List, icons::VIEW_LIST),
-            (106, ViewMode::Columns, icons::VIEW_COLUMNS),
-            (108, ViewMode::Grid, icons::VIEW_GRID),
-            (110, ViewMode::Dual, icons::VIEW_DUAL),
+        // Each a chip of three cells, the glyph in the middle, one cell apart.
+        let chips = [
+            (96, ViewMode::List, icons::VIEW_LIST),
+            (100, ViewMode::Columns, icons::VIEW_COLUMNS),
+            (104, ViewMode::Grid, icons::VIEW_GRID),
+            (108, ViewMode::Dual, icons::VIEW_DUAL),
         ];
-        for (code, lit) in [('1', 104), ('2', 106), ('3', 108), ('4', 110)] {
+        for (code, lit) in [('1', 96), ('2', 100), ('3', 104), ('4', 108)] {
             f.app.handle_key(ctrl(KeyCode::Char(code)));
             let drawn = buffer(&mut f.app, 120, 30);
-            for (x, view, glyph) in buttons {
-                assert_eq!(drawn[(x, 0)].symbol(), glyph, "{view:?}");
-                let style = (drawn[(x, 0)].fg, drawn[(x, 0)].bg);
-                if x == lit {
-                    assert_eq!(style, (theme::FOREGROUND, theme::TAB), "{code} {view:?}");
-                } else {
-                    assert_eq!(style, (theme::MUTED, Color::Reset), "{code} {view:?}");
+            for (x, view, glyph) in chips {
+                assert_eq!(drawn[(x + 1, 0)].symbol(), glyph, "{view:?}");
+                for cell in x..x + 3 {
+                    let style = (drawn[(cell, 0)].fg, drawn[(cell, 0)].bg);
+                    if x == lit {
+                        assert_eq!(style, (theme::FOREGROUND, theme::CURSOR), "{code} {cell}");
+                    } else {
+                        assert_eq!(style, (theme::FOREGROUND, theme::TAB), "{code} {cell}");
+                    }
                 }
             }
-            // One space apart, two cells before the sort label.
-            for x in [105, 107, 109, 111, 112] {
+            // A cell between the chips, two before the sort label.
+            for x in [99, 103, 107, 111, 112] {
                 assert_eq!(drawn[(x, 0)].symbol(), " ", "{x}");
+                assert_eq!(drawn[(x, 0)].bg, Color::Reset, "{x}");
             }
             assert_eq!(find(&drawn, "Name ▴", 100..120), Some((113, 0)));
             if code == '4' {
                 f.app.handle_key(ctrl(KeyCode::Char('4')));
             }
         }
-        // With tabs, the strip ends two cells before the buttons.
+        // With tabs, the strip ends two cells before the chips.
         f.app.handle_key(ctrl(KeyCode::Char('1')));
         press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
         let header = screen(&mut f.app, 120, 30).remove(0);
-        let glyphs: String = [icons::VIEW_LIST, icons::VIEW_COLUMNS, icons::VIEW_GRID]
-            .iter()
-            .map(|glyph| format!("{glyph} "))
-            .collect();
         let wanted = format!(
-            " ~/Pictures{} 1 ~  2 Pictures   {glyphs}{}  Name ▴ ",
-            " ".repeat(74),
+            " ~/Pictures{} 1 ~  2 Pictures    {}   {}   {}   {}   Name ▴ ",
+            " ".repeat(66),
+            icons::VIEW_LIST,
+            icons::VIEW_COLUMNS,
+            icons::VIEW_GRID,
             icons::VIEW_DUAL
         );
         assert_eq!(header, wanted);
     }
 
     #[test]
-    fn a_click_on_a_view_button_does_what_ctrl_1_to_4_do() {
+    fn a_click_anywhere_on_a_chip_does_what_ctrl_1_to_4_do() {
         use crate::app::ViewMode;
         let mut f = fixture();
         let click = |app: &mut crate::app::App, column| {
@@ -470,19 +486,20 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             });
         };
-        click(&mut f.app, 108);
+        // The grid chip's left edge, its glyph, its right edge.
+        click(&mut f.app, 104);
         assert_eq!(f.app.view(), ViewMode::Grid);
-        click(&mut f.app, 110);
+        click(&mut f.app, 108);
         assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Dual, 2));
         // Again, like Ctrl+4: back to the view the two panes came from.
         click(&mut f.app, 110);
         assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Grid, 1));
-        click(&mut f.app, 106);
+        click(&mut f.app, 101);
         assert_eq!(f.app.view(), ViewMode::Columns);
-        click(&mut f.app, 104);
+        click(&mut f.app, 98);
         assert_eq!(f.app.view(), ViewMode::List);
-        // Between the buttons, nothing.
-        click(&mut f.app, 107);
+        // Between the chips, nothing.
+        click(&mut f.app, 103);
         assert_eq!(f.app.view(), ViewMode::List);
     }
 
@@ -494,17 +511,17 @@ mod tests {
             let header = screen(app, width, 10).remove(0);
             header.contains(icons::VIEW_LIST)
         };
-        // Room for them and 24 cells of path: 6 + 2 + 7 + 2 + 24 inside.
-        assert!(has_buttons(&mut f.app, 43));
-        assert!(!has_buttons(&mut f.app, 42));
+        // Room for them and 24 cells of path: 6 + 2 + 15 + 2 + 24 inside.
+        assert!(has_buttons(&mut f.app, 51));
+        assert!(!has_buttons(&mut f.app, 50));
         assert_eq!(
             screen(&mut f.app, 42, 10)[0],
             format!(" ~{}Name ▴ ", " ".repeat(33))
         );
         // A longer sort label needs more.
         press(&mut f.app, &[KeyCode::Char('s'), KeyCode::Char('s')]);
-        assert!(!has_buttons(&mut f.app, 46));
-        assert!(has_buttons(&mut f.app, 47));
+        assert!(!has_buttons(&mut f.app, 54));
+        assert!(has_buttons(&mut f.app, 55));
     }
 
     #[test]
@@ -520,17 +537,17 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             });
         };
-        click(&mut f.app, 86);
+        click(&mut f.app, 78);
         assert_eq!(
             (f.app.current, f.app.pane().cwd.clone()),
             (0, f.home.clone())
         );
         buffer(&mut f.app, 120, 30);
-        click(&mut f.app, 101);
+        click(&mut f.app, 93);
         assert_eq!(f.app.current, 1);
         // Between the labels and the view buttons, nothing.
         buffer(&mut f.app, 120, 30);
-        click(&mut f.app, 103);
+        click(&mut f.app, 95);
         assert_eq!(f.app.current, 1);
     }
 }
