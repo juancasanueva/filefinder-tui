@@ -1402,7 +1402,8 @@ impl App {
             .map(keys::load)
             .unwrap_or_default();
         let mut app = Self {
-            tabs: vec![Tab::new(config.home.clone(), saved.view)],
+            // Every launch opens one pane in the list, whatever view was used last.
+            tabs: vec![Tab::new(config.home.clone(), ViewMode::List)],
             current: 0,
             home: config.home,
             focus: Focus::List,
@@ -1485,10 +1486,6 @@ impl App {
         }
         app.read_tags_in_use();
         app.read_places();
-        // The app opens in two panes on the start folder, the left one with
-        // the keyboard; the view remembered is the one Ctrl+4 goes back to.
-        app.split();
-        app.tab_mut().active = 0;
         if let Some(first) = key_problems.first() {
             let more = key_problems.len() - 1;
             app.fail(match more {
@@ -4113,8 +4110,8 @@ impl App {
             return;
         }
         let was = self.current;
-        let view = self.tab().single_view();
-        self.tabs.push(Tab::new(folder.clone(), view));
+        // A new tab starts in the list, whatever view this one is in.
+        self.tabs.push(Tab::new(folder.clone(), ViewMode::List));
         self.current = self.tabs.len() - 1;
         if self.show_folder(&folder, None) {
             self.focus = Focus::List;
@@ -5962,7 +5959,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_starts_as_the_list_and_ctrl_1_2_3_switch_and_remember_it() {
+    fn the_view_starts_as_the_list_and_ctrl_1_2_3_switch_it_and_save_it() {
         let f = fixture();
         let state = tempfile::tempdir().unwrap();
         let mut app = launch_one_pane(&f.home, Some(state.path()));
@@ -5975,9 +5972,9 @@ mod tests {
         app.handle_key(ctrl(KeyCode::Char('2')));
         assert_eq!(app.view(), ViewMode::Columns);
         assert_eq!(
-            launch_one_pane(&f.home, Some(state.path())).view(),
-            ViewMode::Columns,
-            "the next launch keeps the same view under its two panes"
+            launch(&f.home, Some(state.path())).view(),
+            ViewMode::List,
+            "the next launch opens in the list all the same"
         );
         app.handle_key(ctrl(KeyCode::Char('1')));
         assert_eq!(app.view(), ViewMode::List);
@@ -5988,10 +5985,8 @@ mod tests {
         );
         app.handle_key(ctrl(KeyCode::Char('3')));
         assert_eq!(app.view(), ViewMode::Grid);
-        assert_eq!(
-            launch_one_pane(&f.home, Some(state.path())).view(),
-            ViewMode::Grid
-        );
+        assert_eq!(state::load(state.path()).view, ViewMode::Grid);
+        assert_eq!(launch(&f.home, Some(state.path())).view(), ViewMode::List);
     }
 
     #[test]
@@ -7900,38 +7895,40 @@ mod tests {
     }
 
     #[test]
-    fn the_app_opens_in_two_panes_and_ctrl_4_returns_to_the_remembered_view() {
+    fn the_app_opens_in_one_pane_in_the_list_whatever_view_was_used_last() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().canonicalize().unwrap();
         fs::create_dir(home.join("Pictures")).unwrap();
         let state = tempfile::tempdir().unwrap();
 
-        // A first start, nothing remembered: two panes, both on the start
-        // folder, the left one with the keyboard; one pane is the list.
+        // A first start, nothing remembered: one pane, the list, on the
+        // start folder with the keyboard.
         let mut app = launch(&home, Some(state.path()));
-        assert_eq!(app.view(), ViewMode::Dual);
-        assert_eq!(app.panes().len(), 2);
-        assert!(app.panes().iter().all(|pane| pane.cwd == home));
+        assert_eq!((app.view(), app.panes().len()), (ViewMode::List, 1));
+        assert_eq!(app.pane().cwd, home);
         assert_eq!((app.focus, app.active()), (Focus::List, 0));
-        assert_eq!(app.tab().single_view(), ViewMode::List);
         assert!(
             !state.path().join("state").exists(),
             "starting saves nothing"
         );
 
-        // The grid remembered: still two panes, and Ctrl+4 goes to the grid.
-        app.handle_key(ctrl(KeyCode::Char('4')));
+        // The grid used last, then two panes: the next start is the list.
         app.handle_key(ctrl(KeyCode::Char('3')));
+        app.handle_key(ctrl(KeyCode::Char('4')));
+        assert_eq!(app.view(), ViewMode::Dual);
         assert_eq!(state::load(state.path()).view, ViewMode::Grid);
         let mut again = launch(&home, Some(state.path()));
-        assert_eq!((again.view(), again.panes().len()), (ViewMode::Dual, 2));
+        assert_eq!((again.view(), again.panes().len()), (ViewMode::List, 1));
         assert_eq!(
             state::load(state.path()).view,
             ViewMode::Grid,
             "kept as it was"
         );
+        // Ctrl+4 splits it, and again goes back to the list.
         again.handle_key(ctrl(KeyCode::Char('4')));
-        assert_eq!((again.view(), again.panes().len()), (ViewMode::Grid, 1));
+        assert_eq!((again.view(), again.panes().len()), (ViewMode::Dual, 2));
+        again.handle_key(ctrl(KeyCode::Char('4')));
+        assert_eq!((again.view(), again.panes().len()), (ViewMode::List, 1));
     }
 
     #[test]
@@ -11648,13 +11645,12 @@ mod tab_tests {
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
         f.app.handle_key(ctrl(KeyCode::Char('3')));
         press(&mut f.app, &[KeyCode::Right, KeyCode::Char('v')]);
-        // The second opens in the same folder and view, nothing marked and
-        // no history; it goes home in the list.
+        // The second opens in the same folder, in the list, nothing marked
+        // and no history; it goes home.
         press(&mut f.app, &[KeyCode::Char('t')]);
-        assert_eq!(f.app.view(), ViewMode::Grid);
+        assert_eq!(f.app.view(), ViewMode::List);
         assert_eq!(f.app.pane().selection().count(), 1);
         assert!(!f.app.pane().is_marked(1));
-        f.app.handle_key(ctrl(KeyCode::Char('1')));
         press(&mut f.app, &[KeyCode::Char('h')]);
         assert_eq!(f.app.pane().cwd, f.home);
 
@@ -11696,9 +11692,9 @@ mod tab_tests {
         f.app.handle_key(ctrl(KeyCode::Char('2')));
         f.app.handle_key(ctrl(KeyCode::Char('4')));
         assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Dual, 2));
-        // A new tab from two panes opens with one, in the view they came from.
+        // A new tab from two panes opens with one, in the list.
         press(&mut f.app, &[KeyCode::Char('t')]);
-        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Columns, 1));
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::List, 1));
         f.app.handle_key(ctrl(KeyCode::Char('3')));
         f.app.handle_key(key(KeyCode::Char('|')));
         assert_eq!(f.app.view(), ViewMode::Dual);
