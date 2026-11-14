@@ -162,6 +162,7 @@ pub fn tint_of(name: &str, is_dir: bool, is_link: bool, mode: u32) -> Color {
 // The places panel's glyphs, Material Design: a house, a monitor, a folder
 // of text, a folder with a download arrow, of music, of pictures, a film, a
 // briefcase, a bin and a hard disk.
+pub const PLACE_APPLICATIONS: &str = "\u{f003b}";
 pub const PLACE_HOME: &str = "\u{f02dc}";
 pub const PLACE_DESKTOP: &str = "\u{f0379}";
 pub const PLACE_DOCUMENTS: &str = "\u{f0c82}";
@@ -172,6 +173,7 @@ pub const PLACE_MOVIES: &str = "\u{f0381}";
 pub const PLACE_PROJECTS: &str = "\u{f00d6}";
 pub const PLACE_TRASH: &str = "\u{f0a79}";
 pub const PLACE_DRIVE: &str = "\u{f02ca}";
+pub const PLACE_CLOUD: &str = "\u{f015f}";
 
 /// The glyph in front of a place's name in the panel.
 pub fn place(kind: Kind) -> &'static str {
@@ -185,6 +187,7 @@ pub fn place_in(set: IconSet, kind: Kind) -> &'static str {
         (IconSet::Plain, Kind::Home) => "~",
         (IconSet::Plain, Kind::Trash) => "×",
         (IconSet::Plain, _) => "›",
+        (IconSet::Nerd, Kind::Applications) => PLACE_APPLICATIONS,
         (IconSet::Nerd, Kind::Home) => PLACE_HOME,
         (IconSet::Nerd, Kind::Desktop) => PLACE_DESKTOP,
         (IconSet::Nerd, Kind::Documents) => PLACE_DOCUMENTS,
@@ -195,6 +198,7 @@ pub fn place_in(set: IconSet, kind: Kind) -> &'static str {
         (IconSet::Nerd, Kind::Projects) => PLACE_PROJECTS,
         (IconSet::Nerd, Kind::Trash) => PLACE_TRASH,
         (IconSet::Nerd, Kind::Drive) => PLACE_DRIVE,
+        (IconSet::Nerd, Kind::Cloud) => PLACE_CLOUD,
     }
 }
 
@@ -202,12 +206,14 @@ pub fn place_in(set: IconSet, kind: Kind) -> &'static str {
 /// colour of what they hold, the trash and the drives muted.
 pub fn place_tint(kind: Kind) -> Color {
     match kind {
-        Kind::Home | Kind::Desktop | Kind::Documents | Kind::Downloads => theme::ICON_FOLDER,
+        Kind::Applications | Kind::Home | Kind::Desktop | Kind::Documents | Kind::Downloads => {
+            theme::ICON_FOLDER
+        }
         Kind::Music => theme::ICON_AUDIO,
         Kind::Pictures => theme::ICON_IMAGE,
         Kind::Movies => theme::ICON_VIDEO,
         Kind::Projects => theme::ICON_CODE,
-        Kind::Trash | Kind::Drive => theme::MUTED,
+        Kind::Trash | Kind::Drive | Kind::Cloud => theme::MUTED,
     }
 }
 
@@ -340,6 +346,7 @@ mod tests {
         use crate::app::ViewMode;
         use crate::places::Kind;
         for (kind, nerd, plain, tint) in [
+            (Kind::Applications, "\u{f003b}", "›", theme::ICON_FOLDER),
             (Kind::Home, "\u{f02dc}", "~", theme::ICON_FOLDER),
             (Kind::Desktop, "\u{f0379}", "›", theme::ICON_FOLDER),
             (Kind::Documents, "\u{f0c82}", "›", theme::ICON_FOLDER),
@@ -350,6 +357,7 @@ mod tests {
             (Kind::Projects, "\u{f00d6}", "›", theme::ICON_CODE),
             (Kind::Trash, "\u{f0a79}", "×", theme::MUTED),
             (Kind::Drive, "\u{f02ca}", "›", theme::MUTED),
+            (Kind::Cloud, "\u{f015f}", "›", theme::MUTED),
         ] {
             assert_eq!(place_in(IconSet::Nerd, kind), nerd, "{kind:?}");
             assert_eq!(place_in(IconSet::Plain, kind), plain, "{kind:?}");

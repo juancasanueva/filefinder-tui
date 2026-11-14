@@ -55,6 +55,7 @@ fn main() -> io::Result<()> {
         thumbs: Some(Thumbs::new(picker, Arc::new(thumbnailer))),
         trash_dir: home.join(".Trash"),
         volumes_dir: PathBuf::from("/Volumes"),
+        applications_dir: PathBuf::from("/Applications"),
         home: home.clone(),
         start,
         date_style: DateStyle::from_env(),

@@ -1,7 +1,8 @@
-//! What the places panel lists, flea's way: PLACES (Home, the usual
-//! folders in it that exist, then the Trash) and DEVICES (the mounted
-//! volumes but the system's own). Read on start, on F5 and when the
-//! keyboard enters the panel; never while drawing.
+//! What the places panel lists, flea's way: PLACES (Applications when it
+//! exists, Home, the usual folders in it that exist, then the Trash) and
+//! DEVICES (the system's own volume, iCloud Drive when it is on, then the
+//! other mounted volumes). Read on start, on F5 and when the keyboard
+//! enters the panel; never while drawing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ pub const KNOWN: [(&str, Kind); 7] = [
 /// What a place is, which decides its glyph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    Applications,
     Home,
     Desktop,
     Documents,
@@ -29,8 +31,10 @@ pub enum Kind {
     Movies,
     Projects,
     Trash,
-    /// A mounted volume.
+    /// A mounted volume, the system's own among them.
     Drive,
+    /// iCloud Drive.
+    Cloud,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,12 +52,20 @@ pub struct Section {
 }
 
 /// Every section that has something to list, in order.
-pub fn read(home: &Path, trash: &Path, volumes: &Path) -> Vec<Section> {
-    let mut places = vec![Place {
+pub fn read(applications: &Path, home: &Path, trash: &Path, volumes: &Path) -> Vec<Section> {
+    let mut places = Vec::new();
+    if applications.is_dir() {
+        places.push(Place {
+            name: "Applications".to_string(),
+            path: applications.to_path_buf(),
+            kind: Kind::Applications,
+        });
+    }
+    places.push(Place {
         name: "Home".to_string(),
         path: home.to_path_buf(),
         kind: Kind::Home,
-    }];
+    });
     for (name, kind) in KNOWN {
         let path = home.join(name);
         if path.is_dir() {
@@ -76,7 +88,7 @@ pub fn read(home: &Path, trash: &Path, volumes: &Path) -> Vec<Section> {
         },
         Section {
             heading: "DEVICES",
-            places: drives(volumes),
+            places: devices(home, volumes),
         },
     ];
     sections
@@ -85,28 +97,49 @@ pub fn read(home: &Path, trash: &Path, volumes: &Path) -> Vec<Section> {
         .collect()
 }
 
-/// Every mounted volume but the system's own, which is listed among the
-/// volumes as a link to `/`; by name. None when the folder can't be read.
-fn drives(volumes: &Path) -> Vec<Place> {
+/// Where iCloud Drive keeps its files in the home folder.
+const ICLOUD_DRIVE: &str = "Library/Mobile Documents/com~apple~CloudDocs";
+
+/// The system's own volume, which opens `/`; iCloud Drive when its folder
+/// is there; then the other mounted volumes by name.
+fn devices(home: &Path, volumes: &Path) -> Vec<Place> {
+    let (mut system, mut drives) = drives(volumes);
+    let icloud = home.join(ICLOUD_DRIVE);
+    if icloud.is_dir() {
+        system.push(Place {
+            name: "iCloud Drive".to_string(),
+            path: icloud,
+            kind: Kind::Cloud,
+        });
+    }
+    system.append(&mut drives);
+    system
+}
+
+/// The mounted volumes: the system's own, listed among them as a link to
+/// `/` and given `/` as its path, then the others by name. None when the
+/// folder can't be read.
+fn drives(volumes: &Path) -> (Vec<Place>, Vec<Place>) {
     let Ok(children) = fs::read_dir(volumes) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    let mut drives: Vec<Place> = children
+    let root = Path::new("/");
+    let (system, mut drives): (Vec<Place>, Vec<Place>) = children
         .flatten()
         .filter_map(|child| {
             let name = child.file_name().to_string_lossy().into_owned();
             let path = child.path();
-            let system = fs::canonicalize(&path).is_ok_and(|real| real == Path::new("/"));
-            let shown = !name.starts_with('.') && path.is_dir() && !system;
-            shown.then_some(Place {
+            let shown = !name.starts_with('.') && path.is_dir();
+            let system = fs::canonicalize(&path).is_ok_and(|real| real == root);
+            shown.then(|| Place {
                 name,
-                path,
+                path: if system { root.to_path_buf() } else { path },
                 kind: Kind::Drive,
             })
         })
-        .collect();
+        .partition(|place| place.path == root);
     drives.sort_by_key(|place| place.name.to_lowercase());
-    drives
+    (system, drives)
 }
 
 /// The places of every section, in the order they are drawn.
@@ -139,8 +172,10 @@ mod tests {
     }
 
     #[test]
-    fn places_list_home_the_usual_folders_that_exist_and_the_trash_then_the_devices() {
+    fn places_list_applications_home_the_usual_folders_that_exist_and_the_trash_then_the_devices() {
         let dir = tempfile::tempdir().unwrap();
+        let applications = dir.path().join("Applications");
+        fs::create_dir_all(&applications).unwrap();
         let home = dir.path().join("home");
         for name in ["Projects", "Downloads", "Desktop", "Library", "Movies"] {
             fs::create_dir_all(home.join(name)).unwrap();
@@ -154,13 +189,16 @@ mod tests {
         // The system's own volume is a link to `/`.
         std::os::unix::fs::symlink("/", volumes.join("Macintosh HD")).unwrap();
         let trash = home.join(".Trash");
-        let sections = read(&home, &trash, &volumes);
+        let icloud = home.join("Library/Mobile Documents/com~apple~CloudDocs");
+        fs::create_dir_all(&icloud).unwrap();
+        let sections = read(&applications, &home, &trash, &volumes);
         assert_eq!(
             names(&sections),
             [
                 (
                     "PLACES",
                     vec![
+                        "Applications",
                         "Home",
                         "Desktop",
                         "Downloads",
@@ -169,14 +207,31 @@ mod tests {
                         "Trash"
                     ]
                 ),
-                ("DEVICES", vec!["Archive", "backup"]),
+                (
+                    "DEVICES",
+                    vec!["Macintosh HD", "iCloud Drive", "Archive", "backup"]
+                ),
             ]
         );
-        assert_eq!(sections[0].places[5].path, trash);
-        assert_eq!(sections[0].places[5].kind, Kind::Trash);
-        // No volumes: no DEVICES heading.
-        let sections = read(&home, &trash, &dir.path().join("none"));
+        assert_eq!(sections[0].places[0].path, applications);
+        assert_eq!(sections[0].places[0].kind, Kind::Applications);
+        assert_eq!(sections[0].places[6].path, trash);
+        assert_eq!(sections[0].places[6].kind, Kind::Trash);
+        // The system's own volume opens the root, iCloud Drive its folder.
+        assert_eq!(sections[1].places[0].path, Path::new("/"));
+        assert_eq!(sections[1].places[0].kind, Kind::Drive);
+        assert_eq!(sections[1].places[1].path, icloud);
+        assert_eq!(sections[1].places[1].kind, Kind::Cloud);
+        // No volumes: DEVICES lists iCloud Drive alone.
+        let sections = read(&applications, &home, &trash, &dir.path().join("none"));
+        assert_eq!(names(&sections)[1].1, ["iCloud Drive"]);
+        // No volumes and no iCloud Drive: no DEVICES heading.
+        fs::remove_dir(&icloud).unwrap();
+        let sections = read(&applications, &home, &trash, &dir.path().join("none"));
         assert_eq!(names(&sections).len(), 1);
+        // No applications folder: PLACES starts at Home.
+        let sections = read(&dir.path().join("none"), &home, &trash, &volumes);
+        assert_eq!(names(&sections)[0].1[0], "Home");
     }
 
     #[test]
@@ -184,7 +239,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
         fs::create_dir_all(home.join("Pictures/Trip")).unwrap();
-        let sections = read(&home, &home.join(".Trash"), &home.join("none"));
+        let sections = read(
+            &home.join("none"),
+            &home,
+            &home.join(".Trash"),
+            &home.join("none"),
+        );
         assert_eq!(current(&sections, &home.join("Pictures/Trip")), Some(1));
         assert_eq!(current(&sections, &home), Some(0));
         assert_eq!(current(&sections, &home.join(".Trash")), Some(2));

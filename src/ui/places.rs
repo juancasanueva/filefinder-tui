@@ -188,6 +188,7 @@ mod tests {
             glyph("Trash", icons::PLACE_TRASH),
             String::new(),
             "DEVICES".to_string(),
+            glyph("Macintosh HD", icons::PLACE_DRIVE),
             glyph("Backup", icons::PLACE_DRIVE),
         ];
         let views = [
@@ -199,8 +200,8 @@ mod tests {
         for view in views {
             f.app.handle_key(ctrl(view));
             let rows = panel(&mut f);
-            assert_eq!(rows[..9], wanted, "{view:?}");
-            assert!(rows[9..].iter().all(String::is_empty), "{view:?}");
+            assert_eq!(rows[..10], wanted, "{view:?}");
+            assert!(rows[10..].iter().all(String::is_empty), "{view:?}");
             let drawn = buffer(&mut f.app, 120, 30);
             // Headings start where the glyphs do, in the muted ink.
             assert_eq!(find(&drawn, "PLACES", 0..25), Some((1, 2)));

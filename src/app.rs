@@ -1138,6 +1138,8 @@ pub struct Config {
     pub trash_dir: PathBuf,
     /// Where the mounted volumes are, which the panel lists under DEVICES.
     pub volumes_dir: PathBuf,
+    /// The applications folder, first under PLACES when it exists.
+    pub applications_dir: PathBuf,
     /// How many colours the terminal shows.
     pub depth: Depth,
 }
@@ -1213,6 +1215,7 @@ pub struct App {
     trashed: Vec<Trashed>,
     trash_dir: PathBuf,
     volumes_dir: PathBuf,
+    applications_dir: PathBuf,
     state_dir: Option<PathBuf>,
     system: Box<dyn System>,
     /// Where the last frame drew what a click can land on.
@@ -1278,6 +1281,7 @@ impl App {
             trashed,
             trash_dir: config.trash_dir,
             volumes_dir: config.volumes_dir,
+            applications_dir: config.applications_dir,
             state_dir: config.state_dir,
             system,
             hits: HitMap::default(),
@@ -1840,7 +1844,12 @@ impl App {
 
     /// Reads what the panel lists again, keeping its cursor among them.
     fn read_places(&mut self) {
-        self.places = places::read(&self.home, &self.trash_dir, &self.volumes_dir);
+        self.places = places::read(
+            &self.applications_dir,
+            &self.home,
+            &self.trash_dir,
+            &self.volumes_dir,
+        );
         let last = places::flat(&self.places).count().saturating_sub(1);
         self.places_cursor = self.places_cursor.min(last);
     }
@@ -4575,6 +4584,8 @@ pub mod testing {
             thumbs,
             trash_dir: trash.clone(),
             volumes_dir: volumes.clone(),
+            // No applications there: PLACES starts at Home.
+            applications_dir: home.join(".no-applications"),
             depth: Depth::Truecolor,
         };
         let mut app = App::new(config, Box::new(system.clone()));
@@ -4604,6 +4615,8 @@ pub mod testing {
             trash_dir: home.join(".Trash"),
             // No volumes there: DEVICES lists nothing.
             volumes_dir: home.join(".no-volumes"),
+            // No applications there: PLACES starts at Home.
+            applications_dir: home.join(".no-applications"),
             depth: Depth::Truecolor,
         };
         App::new(config, Box::new(FakeSystem::new()))
@@ -4742,6 +4755,7 @@ mod tests {
             thumbs: None,
             trash_dir: f.trash.clone(),
             volumes_dir: f.volumes.clone(),
+            applications_dir: f.home.join(".no-applications"),
             depth: Depth::Truecolor,
         };
         let app = App::new(config, Box::new(FakeSystem::default()));
