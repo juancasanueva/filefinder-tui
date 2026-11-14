@@ -174,6 +174,7 @@ pub const PLACE_PROJECTS: &str = "\u{f00d6}";
 pub const PLACE_TRASH: &str = "\u{f0a79}";
 pub const PLACE_DRIVE: &str = "\u{f02ca}";
 pub const PLACE_CLOUD: &str = "\u{f015f}";
+pub const PLACE_TAG: &str = "\u{f04f9}";
 
 /// The glyph in front of a place's name in the panel.
 pub fn place(kind: Kind) -> &'static str {
@@ -199,6 +200,7 @@ pub fn place_in(set: IconSet, kind: Kind) -> &'static str {
         (IconSet::Nerd, Kind::Trash) => PLACE_TRASH,
         (IconSet::Nerd, Kind::Drive) => PLACE_DRIVE,
         (IconSet::Nerd, Kind::Cloud) => PLACE_CLOUD,
+        (IconSet::Nerd, Kind::Tag(_)) => PLACE_TAG,
     }
 }
 
@@ -214,6 +216,7 @@ pub fn place_tint(kind: Kind) -> Color {
         Kind::Movies => theme::ICON_VIDEO,
         Kind::Projects => theme::ICON_CODE,
         Kind::Trash | Kind::Drive | Kind::Cloud => theme::MUTED,
+        Kind::Tag(index) => theme::TAGS[index.min(theme::TAGS.len() - 1)],
     }
 }
 
@@ -358,6 +361,8 @@ mod tests {
             (Kind::Trash, "\u{f0a79}", "×", theme::MUTED),
             (Kind::Drive, "\u{f02ca}", "›", theme::MUTED),
             (Kind::Cloud, "\u{f015f}", "›", theme::MUTED),
+            (Kind::Tag(0), "\u{f04f9}", "›", theme::TAGS[0]),
+            (Kind::Tag(6), "\u{f04f9}", "›", theme::TAGS[6]),
         ] {
             assert_eq!(place_in(IconSet::Nerd, kind), nerd, "{kind:?}");
             assert_eq!(place_in(IconSet::Plain, kind), plain, "{kind:?}");

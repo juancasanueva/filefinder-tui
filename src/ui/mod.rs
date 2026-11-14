@@ -342,7 +342,15 @@ pub fn empty_text(pane: &Pane, caption: usize) -> String {
         (_, Some(filter)) => filter.is_running(),
         _ => false,
     };
-    match pane.matching() {
+    // Find of nothing but `tag:` terms says what it asked for.
+    let asked = pane
+        .search()
+        .map(|search| search.input.text().trim().to_string());
+    let query = match pane.matching() {
+        query if query.is_empty() => asked.unwrap_or_default(),
+        query => query,
+    };
+    match query {
         query if query.is_empty() => CAPTIONS[caption % CAPTIONS.len()].to_string(),
         // Still looking: it may find some yet.
         _ if running => String::new(),

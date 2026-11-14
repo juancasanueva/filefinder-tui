@@ -24,7 +24,7 @@ use crate::places::{self, Section};
 use crate::search::{Hit, Looking, Reach, Walk};
 use crate::state::{self, Saved, Trashed};
 use crate::syntax::Highlighter;
-use crate::system::{System, Volume};
+use crate::system::{Grep, System, Volume};
 use crate::theme::Depth;
 use crate::thumbs::{Facts, Thumbs};
 
@@ -936,6 +936,24 @@ impl Pane {
         copies
             .filter(|entry| entry.path == path)
             .for_each(|entry| entry.tags = tags);
+        // Find asked for tags this item no longer carries: it isn't found.
+        if let Listing::Search(search) = &mut self.listing {
+            let (wanted, _) = find_terms(&search.input.text());
+            if !wanted.is_empty() && !crate::tags::carries(&crate::tags::labels(path), &wanted) {
+                search.hits.retain(|hit| hit.entry.path != path);
+                self.rank();
+            }
+        }
+    }
+
+    /// Whether the filter or Find has something to look for, `tag:`
+    /// terms alone included.
+    fn asks(&self) -> bool {
+        match &self.listing {
+            Listing::Filter(filter) => !filter.input.text().is_empty(),
+            Listing::Search(search) => !search.input.text().is_empty(),
+            Listing::Folder => false,
+        }
     }
 
     /// The search that is open in the pane.
@@ -1163,6 +1181,8 @@ pub struct App {
     pub preview_visible: bool,
     /// What the places panel lists, as last read.
     pub places: Vec<Section>,
+    /// The colour tags some file carries, as Spotlight said last.
+    tags_in_use: u8,
     /// Whether the places panel shows left of the files: Ctrl+B.
     pub places_visible: bool,
     /// The place the panel's cursor is on, among them all.
@@ -1254,6 +1274,7 @@ impl App {
             show_hidden: false,
             preview_visible: saved.preview,
             places: Vec::new(),
+            tags_in_use: 0,
             places_visible: saved.places,
             places_cursor: 0,
             places_offset: 0,
@@ -1314,6 +1335,7 @@ impl App {
             let home = app.home.clone();
             app.show_folder(&home, None);
         }
+        app.read_tags_in_use();
         app.read_places();
         // The app opens in two panes on the start folder, the left one with
         // the keyboard; the view remembered is the one Ctrl+4 goes back to.
@@ -1814,7 +1836,7 @@ impl App {
     /// stays as it is. With nothing typed there is nothing to keep.
     fn commit(&mut self, field: Field) {
         self.field = None;
-        if !self.pane().matching().is_empty() {
+        if self.pane().asks() {
             self.pane_mut().hold();
             return;
         }
@@ -1846,7 +1868,7 @@ impl App {
         }
         self.read_places();
         self.focus = Focus::Places;
-        if let Some(current) = places::current(&self.places, &self.pane().cwd) {
+        if let Some(current) = self.current_place() {
             self.places_cursor = current;
         }
     }
@@ -1858,9 +1880,30 @@ impl App {
             &self.home,
             &self.trash_dir,
             &self.volumes_dir,
+            self.tags_in_use,
         );
         let last = places::flat(&self.places).count().saturating_sub(1);
         self.places_cursor = self.places_cursor.min(last);
+    }
+
+    /// The place the panel lifts: the deepest one holding the active
+    /// pane's folder.
+    /// A tag's row while Find lists what carries that tag alone.
+    pub fn current_place(&self) -> Option<usize> {
+        let asked = self.pane().search().map(|search| search.input.text());
+        let tag_row = asked.and_then(|asked| {
+            places::flat(&self.places).position(|place| {
+                matches!(place.kind, places::Kind::Tag(_))
+                    && asked.trim().eq_ignore_ascii_case(&tag_query(&place.name))
+            })
+        });
+        tag_row.or_else(|| places::current(&self.places, &self.pane().cwd))
+    }
+
+    /// Asks Spotlight which colour tags some file carries, for the panel;
+    /// at start, on F5 and after this app changes tags, never per frame.
+    fn read_tags_in_use(&mut self) {
+        self.tags_in_use = self.system.tags_in_use().unwrap_or(0);
     }
 
     /// Enter, `l` or a click on a place: the active pane goes there, as a
@@ -1870,8 +1913,21 @@ impl App {
         let Some(place) = places::flat(&self.places).nth(index) else {
             return;
         };
-        let path = place.path.clone();
         self.places_cursor = index;
+        if let places::Kind::Tag(_) = place.kind {
+            // What carries the tag, anywhere, with the keyboard in the results.
+            let query = tag_query(&place.name);
+            self.search();
+            if let Listing::Search(search) = &mut self.pane_mut().listing {
+                search.input = Input::new(&query);
+                search.scope = Scope::Everywhere;
+            }
+            self.run_search();
+            self.field = None;
+            self.focus = Focus::List;
+            return;
+        }
+        let path = place.path.clone();
         if self.go_to(&path, None) {
             self.focus = Focus::List;
         }
@@ -2294,6 +2350,8 @@ impl App {
                     panes.for_each(|pane| pane.retagged(&path, tags));
                 }
                 self.history.record(change);
+                self.read_tags_in_use();
+                self.read_places();
                 self.receipt(said, undoable);
             }
             Err(error) => self.fail(error.to_string()),
@@ -2742,9 +2800,16 @@ impl App {
             Some(root) => Reach::volume(root),
             None => Reach::everywhere(&self.home),
         };
-        let grep = (search.contents && query.is_some())
-            .then(|| self.system.grep(&reach.roots(), &words, self.show_hidden))
-            .flatten();
+        let grep = if query.is_none() && search.scope == Scope::Everywhere {
+            // Only tags, anywhere: Spotlight knows where they are. A folder
+            // or home is walked, exact where Spotlight doesn't index.
+            let spotlight = self.system.spotlight(&tags, None);
+            spotlight.map(|grep| shown_only(grep, None, self.show_hidden))
+        } else if search.contents {
+            self.system.grep(&reach.roots(), &words, self.show_hidden)
+        } else {
+            None
+        };
         let looking = match grep {
             Some(grep) => Looking::Contents { grep, tags },
             None => Looking::Names { query, tags },
@@ -3992,6 +4057,7 @@ impl App {
     /// panel again.
     fn refresh(&mut self) {
         self.volumes.clear();
+        self.read_tags_in_use();
         self.read_places();
         self.reload();
     }
@@ -4146,6 +4212,32 @@ fn window_key(key: KeyEvent) -> bool {
 
 /// Find's text cut into the `tag:` terms it asks for and the rest; with no
 /// such term, the rest is the text just as it was typed.
+/// What Find asks for to list what carries one tag.
+fn tag_query(name: &str) -> String {
+    format!("tag:{}", name.to_lowercase())
+}
+
+/// What finds paths, keeping back hidden ones below `root` (anywhere,
+/// without one) unless hidden items show.
+fn shown_only(grep: Grep, root: Option<PathBuf>, show_hidden: bool) -> Grep {
+    if show_hidden {
+        return grep;
+    }
+    Box::new(move |found, stop| {
+        let mut shown = |path: PathBuf| {
+            let below = root
+                .as_deref()
+                .and_then(|root| path.strip_prefix(root).ok());
+            let hidden = below
+                .unwrap_or(&path)
+                .components()
+                .any(|part| part.as_os_str().to_string_lossy().starts_with('.'));
+            hidden || found(path)
+        };
+        grep(&mut shown, stop)
+    })
+}
+
 fn find_terms(text: &str) -> (Vec<String>, String) {
     match crate::tags::split_query(text) {
         (tags, _) if tags.is_empty() => (tags, text.to_string()),
@@ -4291,7 +4383,7 @@ fn read_error(path: &Path, error: &io::Error) -> String {
 #[cfg(test)]
 pub mod testing {
     use super::*;
-    use crate::system::{Archiver, Grep, Lister, Unpacker};
+    use crate::system::{Archiver, Lister, Unpacker};
     use crate::thumbs::testing::FakeThumbnailer;
     use std::cell::{Cell, RefCell};
     use std::fs;
@@ -4334,6 +4426,15 @@ pub mod testing {
         /// When set, the next search of contents hands over what comes
         /// through here, as it comes, until the other end goes.
         pub grep_feed: Rc<RefCell<Option<mpsc::Receiver<PathBuf>>>>,
+        /// What the stand-in for Spotlight finds, whatever tags it is asked
+        /// for; `None` when there is no Spotlight.
+        pub spotlight_finds: Rc<RefCell<Option<Vec<PathBuf>>>>,
+        /// Every Spotlight search asked for: the tags and where.
+        pub spotlit: Rc<RefCell<Vec<(Vec<String>, Option<PathBuf>)>>>,
+        /// The tags the stand-in for Spotlight says are in use.
+        pub in_use: Rc<Cell<Option<u8>>>,
+        /// How many times the tags in use were asked for.
+        pub in_use_asked: Rc<Cell<usize>>,
     }
 
     /// The stand-in for the editor: what it does to the file.
@@ -4491,6 +4592,25 @@ pub mod testing {
 
         fn can_grep(&self) -> bool {
             self.grep_finds.borrow().is_some()
+        }
+
+        fn spotlight(&self, tags: &[String], root: Option<&Path>) -> Option<Grep> {
+            let finds = self.spotlight_finds.borrow().clone()?;
+            let asked = (tags.to_vec(), root.map(Path::to_path_buf));
+            self.spotlit.borrow_mut().push(asked);
+            Some(Box::new(move |found, _stop| {
+                for path in finds {
+                    if !found(path) {
+                        break;
+                    }
+                }
+                Ok(())
+            }))
+        }
+
+        fn tags_in_use(&self) -> Option<u8> {
+            self.in_use_asked.set(self.in_use_asked.get() + 1);
+            self.in_use.get()
         }
     }
 
@@ -9666,6 +9786,192 @@ mod tests {
         type_text(&mut f.app, "tag:work");
         finish_search(&mut f.app);
         assert_eq!(found(&f.app), ["a.jpg"]);
+    }
+
+    /// The fixture with Spotlight: a.txt and Pictures/a.jpg red, c.txt blue,
+    /// and a hidden red file. The stand-in for Spotlight also names c.txt
+    /// (no longer red), the hidden one and one that has gone.
+    fn spotlit() -> Fixture {
+        let f = several();
+        let red = [f.home.join("a.txt"), f.home.join("Pictures").join("a.jpg")];
+        for path in &red {
+            tag(path.clone(), &["Red\n6"]);
+        }
+        tag(f.home.join("c.txt"), &["Blue\n4"]);
+        let hidden = f.home.join(".secret.txt");
+        fs::write(&hidden, "s").unwrap();
+        tag(hidden.clone(), &["Red\n6"]);
+        let mut finds = red.to_vec();
+        finds.extend([f.home.join("c.txt"), hidden, f.home.join("gone.txt")]);
+        *f.system.spotlight_finds.borrow_mut() = Some(finds);
+        f
+    }
+
+    #[test]
+    fn a_find_of_only_tags_everywhere_asks_spotlight_and_keeps_what_still_carries_them() {
+        let mut f = spotlit();
+        let found = |app: &App| {
+            let mut found = names(app);
+            found.sort();
+            found
+        };
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        type_text(&mut f.app, "tag:red");
+        finish_search(&mut f.app);
+        // In a folder (or home) the walk looks, exact where Spotlight
+        // doesn't index.
+        assert!(f.system.spotlit.borrow().is_empty());
+        assert_eq!(found(&f.app), ["a.jpg", "a.txt"]);
+        // Everywhere: Spotlight, over the whole Mac; c.txt isn't red any
+        // more, one has gone. (The test's home is in a hidden temporary
+        // folder, so hidden items show for this part.)
+        f.app.show_hidden = true;
+        while f.app.pane().search().unwrap().scope != Scope::Everywhere {
+            press(&mut f.app, &[KeyCode::Tab]);
+        }
+        finish_search(&mut f.app);
+        assert_eq!(f.system.spotlit.borrow().last().unwrap().1, None);
+        assert_eq!(found(&f.app), [".secret.txt", "a.jpg", "a.txt"]);
+        f.app.show_hidden = false;
+        while f.app.pane().search().unwrap().scope != Scope::Folder {
+            press(&mut f.app, &[KeyCode::Tab]);
+        }
+        finish_search(&mut f.app);
+        // With words as well, the walk looks as before (typed words first,
+        // so no step of it is tags alone).
+        clear_field(&mut f.app);
+        let asked = f.system.spotlit.borrow().len();
+        type_text(&mut f.app, "a tag:red");
+        finish_search(&mut f.app);
+        assert_eq!(f.system.spotlit.borrow().len(), asked);
+        assert_eq!(found(&f.app), ["a.jpg", "a.txt"]);
+    }
+
+    #[test]
+    fn what_spotlight_finds_under_a_hidden_folder_shows_only_with_hidden_items() {
+        let paths = ["/a/b.txt", "/a/.c/d.txt", "/a/.e.txt", "/root/x/.y"];
+        let through = |root: Option<&str>, show_hidden: bool| {
+            let grep: Grep = Box::new(move |found, _stop| {
+                for path in paths {
+                    if !found(PathBuf::from(path)) {
+                        break;
+                    }
+                }
+                Ok(())
+            });
+            let mut seen = Vec::new();
+            let stop = AtomicBool::new(false);
+            super::shown_only(grep, root.map(PathBuf::from), show_hidden)(
+                &mut |path| {
+                    seen.push(path.display().to_string());
+                    true
+                },
+                &stop,
+            )
+            .unwrap();
+            seen
+        };
+        assert_eq!(through(None, false), ["/a/b.txt"]);
+        assert_eq!(through(None, true), paths);
+        // Below a hidden root only what is hidden below it counts.
+        assert_eq!(through(Some("/a/.c"), false), ["/a/b.txt", "/a/.c/d.txt"]);
+    }
+
+    #[test]
+    fn enter_keeps_a_find_of_only_tags_and_nothing_found_says_so() {
+        let mut f = spotlit();
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        type_text(&mut f.app, "tag:red");
+        finish_search(&mut f.app);
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert!(f.app.field.is_none(), "the keyboard is in the results");
+        assert!(f.app.pane().results().is_some());
+        assert_eq!(names(&f.app).len(), 2);
+
+        *f.system.spotlight_finds.borrow_mut() = Some(Vec::new());
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        clear_field(&mut f.app);
+        type_text(&mut f.app, "tag:green");
+        finish_search(&mut f.app);
+        assert!(names(&f.app).is_empty());
+        assert_eq!(
+            crate::ui::empty_text(f.app.pane(), 0),
+            "NOTHING MATCHES tag:green"
+        );
+    }
+
+    #[test]
+    fn an_item_that_loses_the_tag_leaves_the_results() {
+        let mut f = spotlit();
+        press(&mut f.app, &[KeyCode::Char('f')]);
+        type_text(&mut f.app, "tag:red");
+        finish_search(&mut f.app);
+        press(&mut f.app, &[KeyCode::Enter]);
+        let at = names(&f.app)
+            .iter()
+            .position(|name| name == "a.txt")
+            .unwrap();
+        f.app.pane_mut().cursor = at;
+        // `T` then 1 takes Red off a.txt.
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('1')]);
+        assert!(crate::tags::labels(&f.home.join("a.txt")).is_empty());
+        assert_eq!(names(&f.app), ["a.jpg"]);
+    }
+
+    #[test]
+    fn the_panel_lists_the_tags_in_use_and_one_opens_find_for_it() {
+        let mut f = spotlit();
+        // The test's home is in a hidden temporary folder: hidden items show.
+        f.app.show_hidden = true;
+        f.system
+            .in_use
+            .set(Some(crate::tags::mask(&["Red".into(), "Blue".into()])));
+        f.app.handle_key(key(KeyCode::F(5)));
+        let rows: Vec<String> = places::flat(&f.app.places)
+            .map(|place| place.name.clone())
+            .collect();
+        let red = rows
+            .iter()
+            .position(|name| name == "Red")
+            .expect("a Red row");
+        assert_eq!(rows[red + 1], "Blue");
+        f.app.open_place(red);
+        finish_search(&mut f.app);
+        let search = f.app.pane().search().expect("Find");
+        assert_eq!(search.input.text(), "tag:red");
+        assert_eq!(search.scope, Scope::Everywhere);
+        assert_eq!(f.system.spotlit.borrow().last().unwrap().1, None);
+        assert_eq!(f.app.focus, Focus::List);
+        assert!(f.app.field.is_none());
+        let mut found = names(&f.app);
+        found.sort();
+        assert_eq!(found, [".secret.txt", "a.jpg", "a.txt"]);
+        // Its row is the current place while they show.
+        assert_eq!(f.app.current_place(), Some(red));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.pane().search().is_none());
+        assert_ne!(f.app.current_place(), Some(red));
+    }
+
+    #[test]
+    fn the_tags_in_use_are_asked_at_start_on_f5_and_after_tagging_only() {
+        let mut f = spotlit();
+        let start = f.system.in_use_asked.get();
+        f.app.handle_key(key(KeyCode::F(5)));
+        assert_eq!(f.system.in_use_asked.get(), start + 1);
+        // Entering the panel uses what is known.
+        press(&mut f.app, &[KeyCode::Tab]);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.system.in_use_asked.get(), start + 1);
+        f.system
+            .in_use
+            .set(Some(crate::tags::mask(&["Green".into()])));
+        press(&mut f.app, &[KeyCode::Char('T'), KeyCode::Char('4')]);
+        assert_eq!(f.system.in_use_asked.get(), start + 2);
+        let rows: Vec<String> = places::flat(&f.app.places)
+            .map(|place| place.name.clone())
+            .collect();
+        assert!(rows.contains(&"Green".to_string()));
     }
 }
 

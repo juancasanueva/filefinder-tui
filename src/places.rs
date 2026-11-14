@@ -1,5 +1,6 @@
 //! What the places panel lists, flea's way: PLACES (Applications when it
-//! exists, Home, the usual folders in it that exist, then the Trash) and
+//! exists, Home, the usual folders in it that exist, then the Trash),
+//! TAGS (the colour tags some file carries, in Finder's order) and
 //! DEVICES (the system's own volume, iCloud Drive when it is on, then the
 //! other mounted volumes). Read on start, on F5 and when the keyboard
 //! enters the panel; never while drawing.
@@ -35,6 +36,9 @@ pub enum Kind {
     Drive,
     /// iCloud Drive.
     Cloud,
+    /// A colour tag, by its place in `tags::NAMES`: opening it finds what
+    /// carries it.
+    Tag(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,7 +56,13 @@ pub struct Section {
 }
 
 /// Every section that has something to list, in order.
-pub fn read(applications: &Path, home: &Path, trash: &Path, volumes: &Path) -> Vec<Section> {
+pub fn read(
+    applications: &Path,
+    home: &Path,
+    trash: &Path,
+    volumes: &Path,
+    tags: u8,
+) -> Vec<Section> {
     let mut places = Vec::new();
     if applications.is_dir() {
         places.push(Place {
@@ -87,6 +97,10 @@ pub fn read(applications: &Path, home: &Path, trash: &Path, volumes: &Path) -> V
             places,
         },
         Section {
+            heading: "TAGS",
+            places: tag_places(tags),
+        },
+        Section {
             heading: "DEVICES",
             places: devices(home, volumes),
         },
@@ -94,6 +108,21 @@ pub fn read(applications: &Path, home: &Path, trash: &Path, volumes: &Path) -> V
     sections
         .into_iter()
         .filter(|section| !section.places.is_empty())
+        .collect()
+}
+
+/// The colour tags in `tags`, a mask with Red's bit first, in Finder's
+/// order. They hold no folder: their path is empty.
+fn tag_places(tags: u8) -> Vec<Place> {
+    crate::tags::NAMES
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| tags & (1 << index) != 0)
+        .map(|(index, name)| Place {
+            name: (*name).to_string(),
+            path: PathBuf::new(),
+            kind: Kind::Tag(index),
+        })
         .collect()
 }
 
@@ -152,6 +181,7 @@ pub fn flat(sections: &[Section]) -> impl Iterator<Item = &Place> {
 pub fn current(sections: &[Section], folder: &Path) -> Option<usize> {
     flat(sections)
         .enumerate()
+        .filter(|(_, place)| !matches!(place.kind, Kind::Tag(_)))
         .filter(|(_, place)| folder.starts_with(&place.path))
         .max_by_key(|(_, place)| place.path.components().count())
         .map(|(index, _)| index)
@@ -191,7 +221,7 @@ mod tests {
         let trash = home.join(".Trash");
         let icloud = home.join("Library/Mobile Documents/com~apple~CloudDocs");
         fs::create_dir_all(&icloud).unwrap();
-        let sections = read(&applications, &home, &trash, &volumes);
+        let sections = read(&applications, &home, &trash, &volumes, 0);
         assert_eq!(
             names(&sections),
             [
@@ -223,14 +253,14 @@ mod tests {
         assert_eq!(sections[1].places[1].path, icloud);
         assert_eq!(sections[1].places[1].kind, Kind::Cloud);
         // No volumes: DEVICES lists iCloud Drive alone.
-        let sections = read(&applications, &home, &trash, &dir.path().join("none"));
+        let sections = read(&applications, &home, &trash, &dir.path().join("none"), 0);
         assert_eq!(names(&sections)[1].1, ["iCloud Drive"]);
         // No volumes and no iCloud Drive: no DEVICES heading.
         fs::remove_dir(&icloud).unwrap();
-        let sections = read(&applications, &home, &trash, &dir.path().join("none"));
+        let sections = read(&applications, &home, &trash, &dir.path().join("none"), 0);
         assert_eq!(names(&sections).len(), 1);
         // No applications folder: PLACES starts at Home.
-        let sections = read(&dir.path().join("none"), &home, &trash, &volumes);
+        let sections = read(&dir.path().join("none"), &home, &trash, &volumes, 0);
         assert_eq!(names(&sections)[0].1[0], "Home");
     }
 
@@ -244,10 +274,47 @@ mod tests {
             &home,
             &home.join(".Trash"),
             &home.join("none"),
+            0,
         );
         assert_eq!(current(&sections, &home.join("Pictures/Trip")), Some(1));
         assert_eq!(current(&sections, &home), Some(0));
         assert_eq!(current(&sections, &home.join(".Trash")), Some(2));
         assert_eq!(current(&sections, Path::new("/")), None);
+        // Tag rows hold no folder: never the current place.
+        let sections = read(
+            &home.join("none"),
+            &home,
+            &home.join(".Trash"),
+            &home.join("none"),
+            1,
+        );
+        assert_eq!(current(&sections, Path::new("/")), None);
+        assert_eq!(current(&sections, &home), Some(0));
+    }
+
+    #[test]
+    fn tags_in_use_list_between_places_and_devices_in_finder_s_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let volumes = dir.path().join("Volumes");
+        fs::create_dir_all(volumes.join("backup")).unwrap();
+        let none = dir.path().join("none");
+        // Blue, Red and Gray in use: listed Red, Blue, Gray.
+        let mask = crate::tags::mask(&["Blue".into(), "Red".into(), "Gray".into()]);
+        let sections = read(&none, &home, &home.join(".Trash"), &volumes, mask);
+        assert_eq!(
+            names(&sections),
+            [
+                ("PLACES", vec!["Home", "Trash"]),
+                ("TAGS", vec!["Red", "Blue", "Gray"]),
+                ("DEVICES", vec!["backup"]),
+            ]
+        );
+        let kinds: Vec<Kind> = sections[1].places.iter().map(|place| place.kind).collect();
+        assert_eq!(kinds, [Kind::Tag(0), Kind::Tag(4), Kind::Tag(6)]);
+        // No tag in use: no TAGS heading.
+        let sections = read(&none, &home, &home.join(".Trash"), &volumes, 0);
+        assert_eq!(names(&sections).len(), 2);
     }
 }

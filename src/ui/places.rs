@@ -68,7 +68,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
         }
     }
     app.places_offset = offset;
-    let current = places::current(&app.places, &app.pane().cwd);
+    let current = app.current_place();
     let all: Vec<&places::Place> = places::flat(&app.places).collect();
     let width = area.width as usize;
     let mut drawn = Vec::new();

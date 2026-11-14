@@ -69,6 +69,15 @@ pub trait System {
 
     /// Whether ripgrep is installed, so that `grep` gives something.
     fn can_grep(&self) -> bool;
+
+    /// What Spotlight finds carrying every one of `tags`, below `root`, or
+    /// anywhere on the Mac without one; `None` without Spotlight, or for a
+    /// tag it can't be asked about.
+    fn spotlight(&self, tags: &[String], root: Option<&Path>) -> Option<Grep>;
+
+    /// The colour tags Spotlight knows some file carries, Red's bit first;
+    /// `None` without Spotlight.
+    fn tags_in_use(&self) -> Option<u8>;
 }
 
 /// A volume as the footer names it: its file-system type and the space left.
@@ -229,6 +238,60 @@ impl System for MacSystem {
 
     fn can_grep(&self) -> bool {
         ripgrep().is_some()
+    }
+
+    fn spotlight(&self, tags: &[String], root: Option<&Path>) -> Option<Grep> {
+        let query = spotlight_query(tags)?;
+        if !Path::new(MDFIND).is_file() {
+            return None;
+        }
+        let mut command = Command::new(MDFIND);
+        if let Some(root) = root {
+            command.arg("-onlyin").arg(root);
+        }
+        command.arg(query);
+        Some(Box::new(move |found, stop| {
+            stream_lines(&mut command, found, stop)
+        }))
+    }
+
+    fn tags_in_use(&self) -> Option<u8> {
+        if !Path::new(MDFIND).is_file() {
+            return None;
+        }
+        // The seven asked at once: about a tenth of a second in all.
+        let asked: Vec<Option<Child>> = crate::tags::NAMES
+            .iter()
+            .map(|name| {
+                spotlight_query(&[name.to_string()]).and_then(|query| spotlight_count(&query))
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut mask = 0;
+        for (index, child) in asked.into_iter().enumerate() {
+            let Some(mut child) = child else { continue };
+            let done = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status.success(),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                }
+            };
+            let mut said = String::new();
+            if done && let Some(mut output) = child.stdout.take() {
+                let _ = io::Read::read_to_string(&mut output, &mut said);
+            }
+            if said.trim().parse::<usize>().is_ok_and(|count| count > 0) {
+                mask |= 1 << index;
+            }
+        }
+        Some(mask)
     }
 }
 
@@ -637,8 +700,79 @@ pub fn quiet(command: &mut Command) -> &mut Command {
         .stderr(Stdio::null())
 }
 
+/// Spotlight's own search command.
+const MDFIND: &str = "/usr/bin/mdfind";
+
+/// The Spotlight query for what carries every one of `tags`, any case;
+/// `None` for no tags, or for one with a quote, a backslash or a wildcard,
+/// which would say something else to Spotlight.
+fn spotlight_query(tags: &[String]) -> Option<String> {
+    let odd = |tag: &String| tag.is_empty() || tag.contains(['\'', '"', '\\', '*']);
+    if tags.is_empty() || tags.iter().any(odd) {
+        return None;
+    }
+    let asks: Vec<String> = tags
+        .iter()
+        .map(|tag| format!("kMDItemUserTags == '{tag}'c"))
+        .collect();
+    Some(asks.join(" && "))
+}
+
+/// `mdfind -count` for `query`, started: it prints how many files match.
+fn spotlight_count(query: &str) -> Option<Child> {
+    Command::new(MDFIND)
+        .arg("-count")
+        .arg(query)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_spotlight_query_asks_for_every_tag_in_any_case_and_refuses_odd_names() {
+        let tags = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            super::spotlight_query(&tags(&["red", "Work"])).as_deref(),
+            Some("kMDItemUserTags == 'red'c && kMDItemUserTags == 'Work'c")
+        );
+        for odd in ["it's", "a\\b", "all*", "say \"hi\""] {
+            assert_eq!(super::spotlight_query(&tags(&[odd])), None, "{odd}");
+        }
+        assert_eq!(super::spotlight_query(&[]), None);
+    }
+
+    #[test]
+    fn spotlight_says_which_tags_are_in_use_on_a_mac() {
+        if !std::path::Path::new(super::MDFIND).is_file() {
+            eprintln!("no mdfind: nothing to check");
+            return;
+        }
+        let system = super::MacSystem::new(false);
+        assert!(super::System::tags_in_use(&system).is_some());
+        // Asked about a folder that isn't there: a search that finds nothing.
+        let nowhere = std::path::Path::new("/nowhere-at-all");
+        let grep = super::System::spotlight(&system, &["red".to_string()], Some(nowhere));
+        let mut found = Vec::new();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        grep.expect("a search")(
+            &mut |path| {
+                found.push(path);
+                true
+            },
+            &stop,
+        )
+        .unwrap();
+        assert!(found.is_empty());
+    }
     use super::*;
     use std::ffi::OsStr;
 
