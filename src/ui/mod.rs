@@ -191,6 +191,11 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
     if let Some(dialog) = &app.dialog {
         card::draw_dialog(frame, dialog, area, hits);
     }
+    // Over everything, while nothing else has the pointer's attention.
+    let overlay = app.menu.is_some() || app.help_visible || app.look.is_some();
+    if !overlay && app.dialog.is_none() {
+        topbar::tip(frame, app, hits);
+    }
 }
 
 /// The only thing a window too small for anything else shows, word-wrapped

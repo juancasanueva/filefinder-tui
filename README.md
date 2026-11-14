@@ -142,6 +142,7 @@ Space opens a card over the window with the item's name, one fact (a picture's s
 - A click puts the cursor on an item and clears the selection; a second click within 400 ms opens it (among what Find found, shows it in its folder, like `o`).
 - Ctrl-click (or Cmd-click where the terminal sends it) marks or unmarks one item; Shift-click selects the range from the cursor.
 - A right click opens the menu for the item, or for the selection when the item is in it.
+- Resting the pointer on a view button in the header opens a tooltip under it with the view's name and keys (`Grid view  ctrl-3`); it closes when the pointer leaves, on a click or on a key.
 - A click on a title in the list's header (Name, Size, Kind, Modified) sorts by it; a click on the title already sorted by turns the order round. User and Permissions don't sort.
 - The wheel moves the cursor a row; over the preview, the shortcuts or Quick Look it scrolls them.
 - A click on a tab's label shows that tab; one on a view button switches the view; one on a place opens it. The wheel over the places panel scrolls it.

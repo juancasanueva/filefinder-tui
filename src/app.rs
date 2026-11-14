@@ -1202,6 +1202,9 @@ pub struct App {
     /// How many colours the terminal shows.
     pub depth: Depth,
     pub help_visible: bool,
+    /// The view button the pointer rests on, which says what it does under
+    /// it until the pointer leaves, a key or a click.
+    pub tip: Option<ViewMode>,
     /// How many lines the shortcuts are scrolled down; drawing keeps it in range.
     pub help_scroll: usize,
     /// Lines of shortcuts shown last time, for Page Up and Page Down.
@@ -1287,6 +1290,7 @@ impl App {
             previewed: None,
             depth: config.depth,
             help_visible: false,
+            tip: None,
             help_scroll: 0,
             help_rows: 1,
             dialog: None,
@@ -1483,6 +1487,7 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.tip = None;
         // A key is the user taking over: the cursor is no longer moved to
         // what a search under way was asked to find again, and one in the
         // files stays on its item as better ones arrive.
@@ -1704,6 +1709,7 @@ impl App {
             }
             MouseEventKind::Down(button) => {
                 self.trash_armed = None;
+                self.tip = None;
                 self.click(button, spot, mouse.modifiers);
             }
             _ => {}
@@ -1719,6 +1725,10 @@ impl App {
     /// The mouse moved over a menu's line or a card's button: the keyboard
     /// goes there, as the arrows would take it.
     fn hover(&mut self, spot: Option<Spot>) {
+        self.tip = match spot {
+            Some(Spot::View(view)) => Some(view),
+            _ => None,
+        };
         match (spot, &mut self.menu, &mut self.dialog) {
             (Some(Spot::MenuRow(row)), Some(menu), _) => {
                 if matches!(menu.rows.get(row), Some(MenuRow::Item { .. })) {

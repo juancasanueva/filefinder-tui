@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::{fit, pad};
@@ -164,6 +164,53 @@ fn draw_buttons(frame: &mut Frame, app: &App, x: u16, y: u16, hits: &mut HitMap)
     }
 }
 
+/// What a view button's tooltip says: the view, and its keys.
+fn tip_text(view: ViewMode) -> (&'static str, &'static str) {
+    match view {
+        ViewMode::List => ("List view", "ctrl-1"),
+        ViewMode::Columns => ("Columns view", "ctrl-2"),
+        ViewMode::Grid => ("Grid view", "ctrl-3"),
+        ViewMode::Dual => ("Dual pane", "ctrl-4"),
+    }
+}
+
+/// The tooltip of the view button the pointer rests on: a framed line just
+/// under the button, its middle under the button's where the window lets
+/// it, the view in the foreground and its keys muted. Nothing when the
+/// button isn't showing.
+pub fn tip(frame: &mut Frame, app: &App, hits: &HitMap) {
+    let Some(view) = app.tip else { return };
+    let Some(button) = hits.rect_of(&Spot::View(view)) else {
+        return;
+    };
+    let screen = frame.area();
+    let (label, keys) = tip_text(view);
+    let inside = (label.width() + 2 + keys.width() + 2) as u16;
+    let width = inside + 2;
+    if width > screen.width || screen.height < button.y + 4 {
+        return;
+    }
+    let middle = button.x + button.width / 2;
+    let x = middle
+        .saturating_sub(width / 2)
+        .min(screen.right() - width)
+        .max(screen.x);
+    let outer = Rect::new(x, button.y + 1, width, 3);
+    frame.render_widget(Clear, outer);
+    let rule = "─".repeat(inside as usize);
+    let lines = vec![
+        Line::from(Span::styled(format!("┌{rule}┐"), theme::frame())),
+        Line::from(vec![
+            Span::styled("│", theme::frame()),
+            Span::styled(format!(" {label}  "), theme::base()),
+            Span::styled(format!("{keys} "), theme::muted()),
+            Span::styled("│", theme::frame()),
+        ]),
+        Line::from(Span::styled(format!("└{rule}┘"), theme::frame())),
+    ];
+    frame.render_widget(Paragraph::new(lines), outer);
+}
+
 /// The label fitted to `width` with its arrow kept in the last cell.
 fn sort_cells(sort: &str, width: usize) -> String {
     match sort.rsplit_once(' ') {
@@ -261,6 +308,64 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::style::Color;
+
+    #[test]
+    fn a_view_button_says_what_it_does_while_the_pointer_rests_on_it() {
+        use crate::app::ViewMode;
+        use crate::icons;
+        let mut f = fixture();
+        let at = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drawn = buffer(&mut f.app, 120, 30);
+        let tips = [
+            (ViewMode::List, "List view", "ctrl-1"),
+            (ViewMode::Columns, "Columns view", "ctrl-2"),
+            (ViewMode::Grid, "Grid view", "ctrl-3"),
+            (ViewMode::Dual, "Dual pane", "ctrl-4"),
+        ];
+        for (view, label, keys) in tips {
+            let (x, y) = find(&drawn, icons::view(view), 0..120).expect("the button");
+            assert_eq!(y, 0);
+            f.app.handle_mouse(at(MouseEventKind::Moved, x, 0));
+            let shown = buffer(&mut f.app, 120, 30);
+            // In a frame just under the button: its name, then its keys muted.
+            let text = format!("{label}  {keys}");
+            let (tx, ty) = find(&shown, &text, 0..120).expect(label);
+            assert_eq!(ty, 2, "{label}");
+            assert_eq!(shown[(tx - 2, 1)].symbol(), "┌", "{label}");
+            assert_eq!(shown[(tx - 2, 3)].symbol(), "└", "{label}");
+            assert!(
+                tx - 2 <= x && x < tx + text.len() as u16 + 2,
+                "{label} under its button"
+            );
+            assert_eq!(shown[(tx, 2)].fg, theme::FOREGROUND);
+            let key_x = tx + label.len() as u16 + 2;
+            assert_eq!(shown[(key_x, 2)].fg, theme::MUTED);
+        }
+        let gone = |app: &mut crate::app::App| {
+            let shown = buffer(app, 120, 30);
+            find(&shown, "  ctrl-", 0..120).is_none()
+        };
+        let (x, _) = find(&drawn, icons::view(ViewMode::Grid), 0..120).unwrap();
+        // The pointer leaving takes it away.
+        f.app.handle_mouse(at(MouseEventKind::Moved, x, 10));
+        assert!(gone(&mut f.app), "after leaving");
+        // So does a key.
+        f.app.handle_mouse(at(MouseEventKind::Moved, x, 0));
+        assert!(!gone(&mut f.app));
+        press(&mut f.app, &[KeyCode::Down]);
+        assert!(gone(&mut f.app), "after a key");
+        // And a click, which switches the view.
+        f.app.handle_mouse(at(MouseEventKind::Moved, x, 0));
+        f.app
+            .handle_mouse(at(MouseEventKind::Down(MouseButton::Left), x, 0));
+        assert_eq!(f.app.view(), ViewMode::Grid);
+        assert!(gone(&mut f.app), "after a click");
+    }
 
     #[test]
     fn the_path_shows_home_as_a_tilde_with_the_parent_muted_and_the_folder_in_the_foreground() {
