@@ -1777,16 +1777,22 @@ impl App {
         let Some(chord) = Chord::of(key) else {
             return;
         };
-        if !self.run_chord(chord, armed)
+        if !self.run_chord(chord, armed, false)
             && let Some(unshifted) = chord.unshifted()
         {
-            self.run_chord(unshifted, armed);
+            self.run_chord(unshifted, armed, true);
         }
     }
 
     /// Runs the first command on a chord that can run here; false if none.
-    fn run_chord(&mut self, chord: Chord, armed: Option<Instant>) -> bool {
-        let commands: Vec<Command> = self.keymap.commands(chord).collect();
+    /// Run for a key whose Shift ran nothing, the two panes' commands are
+    /// left out: Shift+F8 is not F8.
+    fn run_chord(&mut self, chord: Chord, armed: Option<Instant>, unshifted: bool) -> bool {
+        let commands: Vec<Command> = self
+            .keymap
+            .commands(chord)
+            .filter(|command| !(unshifted && command.two_panes()))
+            .collect();
         commands
             .into_iter()
             .any(|command| self.run_command(command, armed))

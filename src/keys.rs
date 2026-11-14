@@ -1,6 +1,6 @@
 //! The browsing commands' keys: what each command is called in the keys
 //! file, the keys it has until the user says otherwise, and the file
-//! itself, `keys` in the state folder, which the app writes with every
+//! itself, `keys.toml` in the state folder, which the app writes with every
 //! command and its default keys when it is missing and reads at launch.
 
 use std::collections::HashMap;
@@ -11,7 +11,7 @@ use std::path::Path;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The keys file's name in the state folder.
-pub const FILE: &str = "keys";
+pub const FILE: &str = "keys.toml";
 
 /// A browsing command a key can run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -392,23 +392,22 @@ pub const COMMANDS: &[(Command, &str, &str, &str, &str)] = &[
 /// What the file says above the commands.
 const HEADER: &str = "\
 # filefinder-tui keys: the browsing commands and the keys that run them.
-# Edit this file and restart filefinder-tui to use your keys.
+# Edit this file and restart filefinder-tui to use your keys. It is TOML.
 #
-# One command per line:  name = key, key, ...
-# A key is one character (M is Shift+m) or a name: up down left right home
-# end pageup pagedown enter esc tab backspace delete insert space comma hash
-# menu f1 to f24. Put ctrl-, alt- (or opt-) and shift- before it:
-# ctrl-shift-z.
+# One command per line:  name = [\"key\", \"key\", ...]
+# A key is one character (\"M\" is Shift+m) or a name: up down left right
+# home end pageup pagedown enter esc tab backspace delete insert space menu
+# f1 to f24. Put ctrl-, alt- (or opt-) and shift- before it: \"ctrl-shift-z\".
 # A key with Shift that runs nothing here runs what the key without Shift
-# does (shift-enter opens), except for a plain letter: M is not m.
-# A # after a space starts a comment.
-# `name =` with nothing after it leaves the command without keys; a command
-# left out of this file keeps its default keys.
+# does (shift-enter opens), except for a plain letter (\"M\" is not \"m\")
+# and the two panes' commands below.
+# `name = []` leaves the command without keys; a command left out of this
+# file keeps its default keys.
 # When commands share a key, the first one that can run does, in the order
 # the app writes them below (moving lines around changes nothing): left
 # moves the cursor in the grid and goes to the parent folder elsewhere.
 # The places panel, the preview, Quick Look, menus, prompts, the find and
-# filter fields and `,` (settings) keep their own keys.
+# filter fields and \",\" (settings) keep their own keys.
 ";
 
 impl Command {
@@ -437,9 +436,9 @@ impl Command {
         self.entry().3
     }
 
-    /// Whether it runs only sometimes (in the grid, or while two panes
-    /// show), so a key it shares with another command is no clash.
-    pub fn conditional(self) -> bool {
+    /// Whether it is one of the function key bar's, which run only while
+    /// two panes show.
+    pub fn two_panes(self) -> bool {
         matches!(
             self,
             Command::PaneCopy
@@ -448,11 +447,17 @@ impl Command {
                 | Command::PaneTrash
                 | Command::PaneNewMarkdown
                 | Command::PaneNewText
-                | Command::ExtendRight
-                | Command::ExtendLeft
-                | Command::GridLeft
-                | Command::GridRight
         )
+    }
+
+    /// Whether it runs only sometimes (in the grid, or while two panes
+    /// show), so a key it shares with another command is no clash.
+    pub fn conditional(self) -> bool {
+        self.two_panes()
+            || matches!(
+                self,
+                Command::ExtendRight | Command::ExtendLeft | Command::GridLeft | Command::GridRight
+            )
     }
 
     /// Whether it is the window's rather than the files': its keys reach
@@ -535,8 +540,6 @@ const NAMES: &[(&str, KeyCode)] = &[
     ("insert", KeyCode::Insert),
     ("ins", KeyCode::Insert),
     ("space", KeyCode::Char(' ')),
-    ("comma", KeyCode::Char(',')),
-    ("hash", KeyCode::Char('#')),
     ("menu", KeyCode::Menu),
 ];
 
@@ -586,7 +589,8 @@ impl Chord {
 
     /// Reads a key as the file spells it.
     pub fn parse(text: &str) -> Option<Chord> {
-        let mut rest = text.trim();
+        // `" "` is the space bar, which trimming would lose.
+        let mut rest = if text == " " { text } else { text.trim() };
         let (mut ctrl, mut alt, mut shift) = (false, false, false);
         // A single character is the key itself, even `-`.
         while rest.chars().count() > 1 {
@@ -656,18 +660,6 @@ impl Chord {
     }
 }
 
-/// A line up to its comment: a `#` at its start or after a space.
-fn without_comment(line: &str) -> &str {
-    let mut before = ' ';
-    for (at, c) in line.char_indices() {
-        if c == '#' && before.is_whitespace() {
-            return &line[..at];
-        }
-        before = c;
-    }
-    line
-}
-
 /// Reads keys as the file spells them, one after another with commas.
 fn chords(text: &str) -> Vec<Chord> {
     text.split(',').filter_map(Chord::parse).collect()
@@ -690,39 +682,60 @@ impl Default for Keymap {
 }
 
 impl Keymap {
-    /// The keymap a keys file sets, and what in it could not be read, line
-    /// by line. A command the file leaves out keeps its default keys.
+    /// The keymap a keys file sets, and what in it could not be read, each
+    /// named by its line. A command the file leaves out keeps its default
+    /// keys, as does one whose keys can't be read; a file that isn't TOML
+    /// leaves every command its defaults.
     pub fn read(text: &str) -> (Keymap, Vec<String>) {
         let mut keymap = Keymap::default();
-        let mut problems = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            let number = index + 1;
-            let line = without_comment(line).trim();
-            if line.is_empty() {
-                continue;
+        let table = match text.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(error) => {
+                let at = error.span().map_or(0, |span| span.start);
+                let said = error.message().trim_end_matches('\n');
+                return (
+                    keymap,
+                    vec![format!("{} {said}", where_(line_at(text, at)))],
+                );
             }
-            let Some((name, keys)) = line.split_once('=') else {
-                problems.push(format!("keys line {number}: no \"=\" (name = key, key)"));
+        };
+        let mut problems = Vec::new();
+        // The file's order, so its problems are said top to bottom.
+        let mut entries: Vec<(&String, &toml::Value)> = table.iter().collect();
+        entries.sort_by_key(|(name, _)| line_of(text, name));
+        for (name, value) in entries {
+            let at = where_(line_of(text, name));
+            let Some(command) = Command::named(name) else {
+                problems.push(match value {
+                    toml::Value::Table(_) => {
+                        format!("{at} [{name}]: commands go at the top, outside any section")
+                    }
+                    _ => format!("{at} unknown command \"{name}\""),
+                });
                 continue;
             };
-            let name = name.trim();
-            let Some(command) = Command::named(name) else {
-                problems.push(format!("keys line {number}: unknown command \"{name}\""));
+            let written: Option<Vec<&str>> = match value {
+                toml::Value::String(key) => Some(vec![key.as_str()]),
+                toml::Value::Array(keys) => keys.iter().map(toml::Value::as_str).collect(),
+                _ => None,
+            };
+            let Some(written) = written else {
+                problems.push(format!(
+                    "{at} {name} takes a list of keys, like [\"y\", \"ctrl-c\"]"
+                ));
                 continue;
             };
             let mut read = Vec::new();
-            let mut written = 0;
-            for key in keys.split(',').map(str::trim).filter(|key| !key.is_empty()) {
-                written += 1;
+            for key in &written {
                 match Chord::parse(key) {
                     Some(chord) if !read.contains(&chord) => read.push(chord),
                     Some(_) => {}
-                    None => problems.push(format!("keys line {number}: unknown key \"{key}\"")),
+                    None => problems.push(format!("{at} unknown key \"{key}\"")),
                 }
             }
             // Keys that were all unreadable keep the defaults rather than
             // leave the command without one.
-            if written == 0 || !read.is_empty() {
+            if written.is_empty() || !read.is_empty() {
                 keymap.keys.insert(command, read);
             }
         }
@@ -738,7 +751,7 @@ impl Keymap {
             for chord in self.keys(*command) {
                 match owner.get(chord) {
                     Some(first) => said.push(format!(
-                        "keys: {} is both {} and {}; {} wins",
+                        "{FILE}: {} is both {} and {}; {} wins",
                         chord.spell(),
                         first.name(),
                         command.name(),
@@ -835,6 +848,40 @@ impl Keymap {
     }
 }
 
+/// Where in the file a problem is: `keys.toml line 4`, or just the file.
+fn where_(line: Option<usize>) -> String {
+    match line {
+        Some(line) => format!("{FILE} line {line}:"),
+        None => format!("{FILE}:"),
+    }
+}
+
+/// The line, from 1, a byte of the file is on.
+fn line_at(text: &str, at: usize) -> Option<usize> {
+    let at = at.min(text.len());
+    Some(text[..at].matches('\n').count() + 1)
+}
+
+/// The line a command's name is written on, bare or quoted, before its `=`
+/// or as a section's heading.
+fn line_of(text: &str, name: &str) -> Option<usize> {
+    let names = |line: &str| {
+        let line = line.trim_start().trim_start_matches('[').trim_start();
+        [name.to_string(), format!("\"{name}\""), format!("'{name}'")]
+            .iter()
+            .any(|written| {
+                line.strip_prefix(written.as_str())
+                    .is_some_and(|rest| matches!(rest.trim_start().chars().next(), Some('=' | ']')))
+            })
+    };
+    text.lines().position(names).map(|index| index + 1)
+}
+
+/// A key as TOML writes a string.
+fn quoted(key: &str) -> String {
+    toml::Value::String(key.to_string()).to_string()
+}
+
 /// The keys file with every command at its default keys.
 pub fn default_file() -> String {
     let mut text = HEADER.to_string();
@@ -842,7 +889,8 @@ pub fn default_file() -> String {
         if !group.is_empty() {
             text.push_str(&format!("\n# {group}\n"));
         }
-        let line = format!("{name} = {defaults}");
+        let keys: Vec<String> = defaults.split(", ").map(quoted).collect();
+        let line = format!("{name} = [{}]", keys.join(", "));
         text.push_str(&format!("{line:<39} # {does}\n"));
     }
     text
@@ -862,7 +910,7 @@ pub fn load(dir: &Path) -> (Keymap, Vec<String>) {
         }
         Err(error) => (
             Keymap::default(),
-            vec![format!("keys: can't read {}: {error}", path.display())],
+            vec![format!("{FILE}: can't read {}: {error}", path.display())],
         ),
     }
 }
@@ -911,7 +959,9 @@ mod tests {
         assert_eq!(chord("shift-f10"), press(KeyCode::F(10), shift));
         assert_eq!(chord("PageDown"), press(KeyCode::PageDown, none));
         assert_eq!(chord("space"), press(KeyCode::Char(' '), none));
-        assert_eq!(chord("comma"), press(KeyCode::Char(','), none));
+        assert_eq!(chord(" "), chord("space"));
+        assert_eq!(chord(","), press(KeyCode::Char(','), none));
+        assert_eq!(chord("#"), press(KeyCode::Char('#'), none));
         assert_eq!(chord("-"), press(KeyCode::Char('-'), none));
         assert_eq!(chord("ctrl--"), press(KeyCode::Char('-'), ctrl));
         assert_eq!(
@@ -946,7 +996,8 @@ mod tests {
             "shift-f10",
             "pagedown",
             "space",
-            "comma",
+            ",",
+            "#",
             "-",
             "ctrl--",
             "shift-down",
@@ -980,16 +1031,18 @@ mod tests {
 
     #[test]
     fn the_file_changes_only_the_commands_it_names() {
-        let text = "# mine\n\ncopy = c # mine too\nQUIT = ctrl-q, q\nfind = ctrl-#, hash\n";
+        let text = "# mine\n\ncopy = [\"c\"] # mine too\nQUIT = [\"ctrl-q\", \"q\"]\n\
+                    find = [\"ctrl-#\", \"#\", \",\"]\nhelp = \"F1\"\n";
         let (keymap, problems) = Keymap::read(text);
         assert_eq!(problems, Vec::<String>::new());
         assert_eq!(keymap.keys(Command::Copy), &[chord("c")]);
         assert_eq!(keymap.keys(Command::Quit), &[chord("ctrl-q"), chord("q")]);
         assert_eq!(
             keymap.keys(Command::Find),
-            &[chord("ctrl-#"), chord("hash")]
+            &[chord("ctrl-#"), chord("#"), chord(",")]
         );
-        assert_eq!(chord("hash").spell(), "hash");
+        // One key may be a string on its own.
+        assert_eq!(keymap.keys(Command::Help), &[chord("f1")]);
         assert!(!keymap.is_default(Command::Copy));
         assert!(keymap.is_default(Command::Cut));
         assert_eq!(keymap.spell(Command::Quit), "ctrl-q / q");
@@ -1001,8 +1054,8 @@ mod tests {
     }
 
     #[test]
-    fn nothing_after_the_equals_leaves_a_command_without_keys() {
-        let (keymap, problems) = Keymap::read("quit =\n");
+    fn an_empty_list_leaves_a_command_without_keys() {
+        let (keymap, problems) = Keymap::read("quit = []\n");
         assert_eq!(problems, Vec::<String>::new());
         assert_eq!(keymap.keys(Command::Quit), &[]);
         assert_eq!(keymap.spell(Command::Quit), "unbound");
@@ -1010,25 +1063,42 @@ mod tests {
 
     #[test]
     fn what_cannot_be_read_is_named_by_its_line_and_keeps_the_defaults() {
-        let text = "copy = c, ctrl-foo\nfoo = x\njust words\ncut = nope\n";
+        let text = "copy = [\"c\", \"ctrl-foo\"]\n\"foo\" = [\"x\"]\n\
+                    cut = [\"nope\"]\npaste = 3\nundo = [\"z\", 4]\n[moving]\ndown = [\"n\"]\n";
         let (keymap, problems) = Keymap::read(text);
         assert_eq!(
             problems,
             [
-                "keys line 1: unknown key \"ctrl-foo\"",
-                "keys line 2: unknown command \"foo\"",
-                "keys line 3: no \"=\" (name = key, key)",
-                "keys line 4: unknown key \"nope\"",
+                "keys.toml line 1: unknown key \"ctrl-foo\"",
+                "keys.toml line 2: unknown command \"foo\"",
+                "keys.toml line 3: unknown key \"nope\"",
+                "keys.toml line 4: paste takes a list of keys, like [\"y\", \"ctrl-c\"]",
+                "keys.toml line 5: undo takes a list of keys, like [\"y\", \"ctrl-c\"]",
+                "keys.toml line 6: [moving]: commands go at the top, outside any section",
             ]
         );
         assert_eq!(keymap.keys(Command::Copy), &[chord("c")]);
-        assert!(keymap.is_default(Command::Cut));
+        for command in [Command::Cut, Command::Paste, Command::Undo, Command::Down] {
+            assert!(keymap.is_default(command), "{}", command.name());
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_toml_keeps_every_default_and_names_the_line() {
+        let text = "copy = [\"c\"]\n\nquit = ctrl-q\n";
+        let (keymap, problems) = Keymap::read(text);
+        assert_eq!(keymap, Keymap::default());
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("keys.toml line 3: "),
+            "{problems:?}"
+        );
     }
 
     #[test]
     fn two_commands_on_one_key_are_said_and_the_first_wins() {
-        let (keymap, problems) = Keymap::read("quit = y\n");
-        assert_eq!(problems, ["keys: y is both copy and quit; copy wins"]);
+        let (keymap, problems) = Keymap::read("quit = [\"y\"]\n");
+        assert_eq!(problems, ["keys.toml: y is both copy and quit; copy wins"]);
         assert_eq!(keymap.commands(chord("y")).next(), Some(Command::Copy));
         // Left in the grid and elsewhere is no clash.
         assert_eq!(Keymap::default().clashes(), Vec::<String>::new());
@@ -1039,8 +1109,9 @@ mod tests {
         let defaults = Keymap::default();
         assert_eq!(defaults.show(&[Command::Copy], "y / ctrl-c"), "y / ctrl-c");
         assert_eq!(defaults.first(Command::PaneCopy, "F5"), "F5");
-        let text = "copy = c, ctrl-shift-c\npane_copy = shift-f3, f4\ntrash = Z, ctrl-k\n\
-                    trash_now =\nmenu = shift-f11\nquit =\nredo = ctrl-y\n";
+        let text = "copy = [\"c\", \"ctrl-shift-c\"]\npane_copy = [\"shift-f3\", \"f4\"]\n\
+                    trash = [\"Z\", \"ctrl-k\"]\ntrash_now = []\nmenu = [\"shift-f11\"]\n\
+                    quit = []\nredo = [\"ctrl-y\"]\n";
         let (keymap, _) = Keymap::read(text);
         assert_eq!(
             keymap.show(&[Command::Copy], "y / ctrl-c"),
@@ -1074,8 +1145,8 @@ mod tests {
         assert_eq!((keymap, problems), (Keymap::default(), Vec::new()));
         let written = fs::read_to_string(state.join(FILE)).expect("the file");
         assert_eq!(written, default_file());
-        assert!(written.contains("\ncopy = y, ctrl-c"));
-        fs::write(state.join(FILE), "copy = c\n").expect("edited");
+        assert!(written.contains("\ncopy = [\"y\", \"ctrl-c\"]"));
+        fs::write(state.join(FILE), "copy = [\"c\"]\n").expect("edited");
         let (keymap, _) = load(&state);
         assert_eq!(keymap.keys(Command::Copy), &[chord("c")]);
     }
@@ -1088,7 +1159,10 @@ mod tests {
         let (keymap, problems) = load(dir.path());
         assert_eq!(keymap, Keymap::default());
         assert_eq!(problems.len(), 1);
-        assert!(problems[0].starts_with("keys: can't read"), "{problems:?}");
+        assert!(
+            problems[0].starts_with("keys.toml: can't read"),
+            "{problems:?}"
+        );
     }
 }
 
@@ -1123,7 +1197,11 @@ mod app_tests {
     fn the_keys_file_changes_what_the_keys_do_and_leaves_the_rest() {
         let f = fixture();
         let state = tempfile::tempdir().expect("a folder");
-        fs::write(state.path().join(FILE), "quit = ctrl-q\ndown = n\n").expect("written");
+        fs::write(
+            state.path().join(FILE),
+            "quit = [\"ctrl-q\"]\ndown = [\"n\"]\n",
+        )
+        .expect("written");
         let mut app = launch_one_pane(&f.home, Some(state.path()));
         press(&mut app, &[KeyCode::Char('q')]);
         assert!(!app.should_quit, "q no longer quits");
@@ -1143,12 +1221,16 @@ mod app_tests {
     fn what_the_keys_file_gets_wrong_is_said_at_launch_and_keeps_the_defaults() {
         let f = fixture();
         let state = tempfile::tempdir().expect("a folder");
-        fs::write(state.path().join(FILE), "foo = x\nquit = nope\n").expect("written");
+        fs::write(
+            state.path().join(FILE),
+            "foo = [\"x\"]\nquit = [\"nope\"]\n",
+        )
+        .expect("written");
         let mut app = launch_one_pane(&f.home, Some(state.path()));
         let message = app.message.as_ref().expect("a message");
         assert_eq!(
             message.text,
-            "keys line 1: unknown command \"foo\" (and 1 more)"
+            "keys.toml line 1: unknown command \"foo\" (and 1 more)"
         );
         assert!(message.is_error);
         press(&mut app, &[KeyCode::Char('q')]);
@@ -1180,7 +1262,7 @@ mod app_tests {
     fn the_key_sheet_footer_and_bar_show_the_keys_the_file_gives() {
         let f = fixture();
         let state = tempfile::tempdir().expect("a folder");
-        let text = "copy = c\nhelp = F1\npane_copy = f3\n";
+        let text = "copy = [\"c\"]\nhelp = [\"F1\"]\npane_copy = [\"f3\"]\n";
         let mut app = with_keys(&f.home, state.path(), text);
         let rows = screen(&mut app, 120, 30);
         assert!(rows[29].contains("F1 keys"), "{}", rows[29]);
@@ -1204,10 +1286,36 @@ mod app_tests {
     }
 
     #[test]
+    fn shift_with_a_bar_key_runs_nothing_but_shift_f2_still_renames() {
+        let f = fixture();
+        let mut app = launch_one_pane(&f.home, None);
+        split(&mut app);
+        let before = names(&app);
+        for number in 5..=9 {
+            app.handle_key(shift(KeyCode::F(number)));
+            assert!(app.prompt.is_none(), "shift-f{number} asks nothing");
+        }
+        crate::app::testing::finish_work(&mut app);
+        assert_eq!(
+            names(&app),
+            before,
+            "nothing copied, moved, made or trashed"
+        );
+        assert!(
+            f.trash
+                .read_dir()
+                .map_or(true, |mut it| it.next().is_none()),
+            "shift-f8 trashed nothing"
+        );
+        app.handle_key(shift(KeyCode::F(2)));
+        assert!(app.prompt.is_some(), "shift-f2 renames, as before");
+    }
+
+    #[test]
     fn the_trash_tip_names_the_keys_the_file_gives() {
         let f = fixture();
         let state = tempfile::tempdir().expect("a folder");
-        let mut app = with_keys(&f.home, state.path(), "trash = Z\ntrash_now =\n");
+        let mut app = with_keys(&f.home, state.path(), "trash = [\"Z\"]\ntrash_now = []\n");
         app.handle_key(shift(KeyCode::Char('Z')));
         let message = app.message.as_ref().expect("the tip");
         assert_eq!(message.text, "Press Z again to move it to Trash.");

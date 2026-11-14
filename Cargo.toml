@@ -11,6 +11,7 @@ libc = "0.2"
 ratatui = "0.30.2"
 # Without the default `chafa` feature, which needs a system library.
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm", "image-defaults"] }
+toml = "1.2.1"
 unicode-width = "0.2.3"
 
 [dev-dependencies]

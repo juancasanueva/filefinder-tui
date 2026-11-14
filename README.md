@@ -129,19 +129,20 @@ Rename, Folder name and Go to ask on the bottom row. A paste that meets names al
 
 ### Changing the keys
 
-The browsing commands' keys live in `~/.config/filefinder-tui/keys`. The first launch writes it with every command and its default keys; edit it and restart the app. Each line is one command and its keys:
+The browsing commands' keys live in `~/.config/filefinder-tui/keys.toml`, a TOML file. The first launch writes it with every command and its default keys; edit it and restart the app. Each line is one command and the list of its keys:
 
-```
-copy = y, ctrl-c            # Copy
-quit = ctrl-q               # q no longer quits
-trash_now =                 # Delete runs nothing
+```toml
+copy = ["y", "ctrl-c"]      # Copy
+quit = ["ctrl-q"]           # q no longer quits
+help = "f1"                 # one key may be a string on its own
+trash_now = []              # Delete runs nothing
 ```
 
-- A key is one character (`M` is Shift+m) or a name: `up down left right home end pageup pagedown enter esc tab backspace delete insert space comma hash menu f1`–`f24`. Put `ctrl-`, `alt-` (or `opt-`) and `shift-` before it: `ctrl-shift-z`.
-- A command left out of the file keeps its default keys; `name =` with nothing after it leaves it without keys. A `#` after a space starts a comment.
-- A key with Shift that runs nothing runs what the key without Shift does (Shift+Enter opens), except a plain letter: `M` is not `m`.
+- A key is one character (`"M"` is Shift+m, `" "` the space bar) or a name: `up down left right home end pageup pagedown enter esc tab backspace delete insert space menu f1`–`f24`. Put `ctrl-`, `alt-` (or `opt-`) and `shift-` before it: `"ctrl-shift-z"`.
+- A command left out of the file keeps its default keys; an empty list leaves it without keys. Commands go at the top level, not in `[sections]`.
+- A key with Shift that runs nothing runs what the key without Shift does (Shift+Enter opens), except a plain letter (`M` is not `m`) and the `pane_` commands (Shift+F8 is not F8).
 - When commands share a key, the first one that can run here does, in the order the app writes the file (rearranging the lines changes nothing): Left moves in the grid and goes to the parent folder elsewhere; `pane_copy` and the other `pane_` commands run only while two panes show.
-- A line the app can't read (an unknown command or key, no `=`) is named in red at launch and that command keeps its defaults; two commands that always run sharing a key are named too, and the first one wins.
+- What the app can't read is named in red at launch, with its line: an unknown command or key, or keys that aren't a list of strings; that command keeps its defaults. A file that isn't valid TOML leaves every key at its default. Two commands that always run sharing a key are named too, and the first one wins.
 - The `?` sheet, the footer's `? keys`, the function key bar and the view buttons' tooltips show your keys for any command you changed.
 - The places panel, the preview, Quick Look, menus, prompts, the find and filter fields and `,` (settings) keep their own keys. From the places panel, the window's commands (views, tabs, focus, `?`, quit, sort and the like) still run on their keys.
 
@@ -177,7 +178,7 @@ The mouse is tracked for presses and drags, and every move only while a menu or 
 
 ## Where it keeps things
 
-- `~/.config/filefinder-tui/`: the chosen view, tile size, sort, detail column and whether the preview, the places panel and hidden files show (`state`), where trashed items came from (`trashed`), and the browsing commands' keys (`keys`).
+- `~/.config/filefinder-tui/`: the chosen view, tile size, sort, detail column and whether the preview, the places panel and hidden files show (`state`), where trashed items came from (`trashed`), and the browsing commands' keys (`keys.toml`).
 - `~/Library/Caches/filefinder-tui/`: Quick Look thumbnails.
 - The Trash is `~/.Trash`. Restore works for items this app moved there.
 
