@@ -18,9 +18,7 @@ use crate::theme;
 pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let count = FnKey::ALL.len() as u16;
     for (index, command) in (0..count).zip(FnKey::ALL) {
-        let from = area.width * index / count;
-        let to = area.width * (index + 1) / count;
-        let slot = Rect::new(area.x + from, area.y, to - from, 1);
+        let slot = slot(area, index, count);
         let key = format!("F{}", command.number());
         // A cell of air at the end, so a cut label never runs into the next.
         let room = (slot.width as usize).saturating_sub(1);
@@ -40,6 +38,17 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         frame.render_widget(Paragraph::new(line), slot);
         hits.add(slot, Spot::FnKey(command));
     }
+}
+
+/// The part `index` of `count` equal parts of the row, side by side.
+/// Worked out in `u32`, so no width is too wide for it.
+fn slot(area: Rect, index: u16, count: u16) -> Rect {
+    let width = u32::from(area.width);
+    let edge = |index: u16| width * u32::from(index) / u32::from(count);
+    let (from, to) = (edge(index), edge(index + 1));
+    // Never more than the width, which is a u16.
+    let narrow = |value: u32| u16::try_from(value).unwrap_or(u16::MAX);
+    Rect::new(area.x + narrow(from), area.y, narrow(to - from), 1)
 }
 
 #[cfg(test)]
@@ -82,6 +91,21 @@ mod tests {
             row: at.1,
             modifiers: KeyModifiers::NONE,
         });
+    }
+
+    #[test]
+    fn on_a_very_wide_window_the_parts_cover_the_row_side_by_side() {
+        let area = ratatui::layout::Rect::new(0, 3, 10_000, 1);
+        let parts: Vec<_> = (0..7).map(|index| super::slot(area, index, 7)).collect();
+        assert_eq!(parts[0].x, 0);
+        for pair in parts.windows(2) {
+            assert_eq!(pair[0].x + pair[0].width, pair[1].x);
+        }
+        assert_eq!(parts[6].x + parts[6].width, 10_000);
+        for part in &parts {
+            assert_eq!((part.y, part.height), (3, 1));
+            assert!((1428..=1429).contains(&part.width), "{part:?}");
+        }
     }
 
     #[test]

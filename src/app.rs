@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -705,9 +705,16 @@ struct Work {
     label: String,
     cancel: Arc<AtomicBool>,
     results: Receiver<Report>,
-    /// The folder of another pane where what lands is to be selected:
-    /// F5 and F6.
-    select_in: Option<PathBuf>,
+    /// The pane F5 or F6 sends to, where what lands is to be selected.
+    landing: Option<Landing>,
+}
+
+/// The pane F5 or F6 sends to, as it was when the work started: the tab it
+/// is in, which of that tab's panes, and the folder it showed.
+struct Landing {
+    tab: u64,
+    pane: usize,
+    folder: PathBuf,
 }
 
 impl Drop for Work {
@@ -1209,21 +1216,29 @@ impl Pane {
 /// One tab: a whole way of browsing, with its view and its pane or two,
 /// each with its folder, history, cursor, marks and listing.
 pub struct Tab {
+    /// Which tab this is, whatever its place in the strip.
+    id: u64,
     pub panes: Vec<Pane>,
     /// The pane that has the keyboard.
     pub active: usize,
     pub view: ViewMode,
     /// The view two panes were opened from, where Ctrl+4 returns.
     before: ViewMode,
+    /// What F5 or F6 brought into one of its panes while it wasn't
+    /// showing, to be selected once it shows and has listed it.
+    landed: Option<(Landing, Vec<PathBuf>)>,
 }
 
 impl Tab {
     fn new(cwd: PathBuf, view: ViewMode) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
             panes: vec![Pane::new(cwd, Vec::new())],
             active: 0,
             view,
             before: view,
+            landed: None,
         }
     }
 
@@ -1523,13 +1538,19 @@ impl App {
     }
 
     /// Whether a command of the function key bar can run now: never while
-    /// a prompt, the paste question or a field has the keyboard; Rename
-    /// for one item, Copy and Move for a selection and a folder in the
-    /// other pane, Delete for a selection, and the new folder and the new
-    /// files in a folder.
+    /// a prompt, the paste question or a field has the keyboard, nor while
+    /// a menu, a card, the key sheet, the settings or Quick Look is open;
+    /// Rename for one item, Copy and Move for a selection and a folder in
+    /// the other pane, Delete for a selection outside the Trash, and the
+    /// new folder and the new files in a folder.
     pub fn can_run(&self, command: FnKey) -> bool {
         let typing = self.prompt.is_some() || self.question.is_some() || self.field.is_some();
-        if typing || !self.shows_fn_bar() {
+        let over = self.menu.is_some()
+            || self.dialog.is_some()
+            || self.help_visible
+            || self.settings.is_some()
+            || self.look.is_some();
+        if typing || over || !self.shows_fn_bar() {
             return false;
         }
         let selected = self.pane().selection().count();
@@ -1538,7 +1559,8 @@ impl App {
             FnKey::Copy | FnKey::Move => {
                 selected > 0 && self.other_pane().is_some_and(Pane::is_folder)
             }
-            FnKey::Trash => selected > 0,
+            // Never a delete for good: in the Trash there is nothing to do.
+            FnKey::Trash => selected > 0 && !self.in_trash(),
             FnKey::NewFolder | FnKey::NewMarkdown | FnKey::NewText => self.pane().is_folder(),
         }
     }
@@ -1564,7 +1586,7 @@ impl App {
             FnKey::Copy => self.send_to_other_pane(false),
             FnKey::Move => self.send_to_other_pane(true),
             FnKey::NewFolder => self.ask_new_folder(),
-            FnKey::Trash => self.delete_key(),
+            FnKey::Trash => self.trash(),
             FnKey::NewMarkdown => self.new_file("md"),
             FnKey::NewText => self.new_file("txt"),
         }
@@ -3533,6 +3555,16 @@ impl App {
         let what = ops::count(paths.len());
         let trash = self.trash_dir.clone();
         let into = folder.clone();
+        // F5 and F6 send to the pane without the keyboard now; it may have
+        // it, or not show, by the time the work is done.
+        let active = self.active();
+        let landing = (0..self.panes().len())
+            .find(|index| across && *index != active)
+            .map(|pane| Landing {
+                tab: self.tab().id,
+                pane,
+                folder,
+            });
         if moving {
             if !across {
                 // What moves is no longer where it was taken from.
@@ -3546,8 +3578,8 @@ impl App {
                 ops::transfer(&paths, &into, false, collide, &trash, cancel)
             });
         }
-        if across && let Some(work) = &mut self.work {
-            work.select_in = Some(folder);
+        if let Some(work) = &mut self.work {
+            work.landing = landing;
         }
     }
 
@@ -3847,7 +3879,7 @@ impl App {
                     label,
                     cancel,
                     results,
-                    select_in: None,
+                    landing: None,
                 });
             }
             Err(_) => self.fail("The file work couldn't be started.".to_string()),
@@ -3860,14 +3892,18 @@ impl App {
         let had_menu = self.menu.is_some();
         match work.results.try_recv() {
             Ok(report) => {
-                let select_in = self.work.take().and_then(|work| work.select_in.clone());
+                let landing = self.work.take().and_then(|mut work| work.landing.take());
                 // The items listed again: a first `d` armed before is about
                 // what may no longer be under the cursor.
                 self.trash_armed = None;
                 let landed = report.change.landed();
-                self.settle(report, None);
-                if let Some(folder) = select_in {
-                    self.select_in_others(&folder, landed);
+                match landing {
+                    // Selected where it was sent, and nowhere else.
+                    Some(landing) => {
+                        self.settle_wanting(report, &[], None);
+                        self.select_landed(landing, landed);
+                    }
+                    None => self.settle(report, None),
                 }
             }
             Err(TryRecvError::Empty) => {}
@@ -3887,12 +3923,18 @@ impl App {
     /// Takes in what a command over several items did: logs it for undo,
     /// lists the folder again and says how it went.
     fn settle(&mut self, report: Report, neighbour: Option<PathBuf>) {
+        let landed = report.change.landed();
+        self.settle_wanting(report, &landed, neighbour);
+    }
+
+    /// As `settle`, the active pane's cursor put on the first of `wanted`
+    /// it lists, else where it was, else on `neighbour`.
+    fn settle_wanting(&mut self, report: Report, wanted: &[PathBuf], neighbour: Option<PathBuf>) {
         let (text, is_error) = outcome(&report);
         let undoable = !is_error && !report.change.steps.is_empty();
-        let landed = report.change.landed();
         self.keep_trash_records(Some(&report.change));
         self.history.record(report.change);
-        self.relist(&landed, neighbour);
+        self.relist(wanted, neighbour);
         if is_error {
             self.fail(text);
         } else {
@@ -3949,14 +3991,32 @@ impl App {
         }
     }
 
-    /// The cursor of each other pane showing `folder` on the first of
-    /// these it lists, after F5 or F6 into it.
-    fn select_in_others(&mut self, folder: &Path, landed: Vec<PathBuf>) {
-        let active = self.active();
-        for (index, pane) in self.tab_mut().panes.iter_mut().enumerate() {
-            if index != active && pane.is_folder() && pane.cwd == folder {
-                pane.want(landed.clone());
-            }
+    /// After F5 or F6: the cursor of the pane it was sent to on the first
+    /// of what landed, when its tab is still open. A tab that isn't
+    /// showing takes it in when it shows again, having listed it.
+    fn select_landed(&mut self, landing: Landing, landed: Vec<PathBuf>) {
+        let Some(tab) = self.tabs.iter().position(|tab| tab.id == landing.tab) else {
+            return;
+        };
+        if tab == self.current {
+            self.land(landing, landed);
+        } else {
+            self.tabs[tab].landed = Some((landing, landed));
+        }
+    }
+
+    /// In the tab showing: the cursor of the pane F5 or F6 sent to on the
+    /// first of what landed that it lists, when that pane is still there
+    /// and still shows the folder. Under an open menu the active pane
+    /// stays on what the menu was opened for.
+    fn land(&mut self, landing: Landing, landed: Vec<PathBuf>) {
+        if landing.pane == self.active() && self.menu.is_some() {
+            return;
+        }
+        let shows = |pane: &&mut Pane| pane.is_folder() && pane.cwd == landing.folder;
+        let pane = self.tab_mut().panes.get_mut(landing.pane);
+        if let Some(pane) = pane.filter(shows) {
+            pane.want(landed);
         }
     }
 
@@ -4055,6 +4115,9 @@ impl App {
         self.last_click = None;
         for index in 0..self.panes().len() {
             self.relist_pane(index);
+        }
+        if let Some((landing, landed)) = self.tab_mut().landed.take() {
+            self.land(landing, landed);
         }
     }
 
@@ -12248,6 +12311,197 @@ mod fn_key_tests {
         press(&mut f.app, &[KeyCode::F(2)]);
         let prompt = f.app.prompt.as_ref().expect("the rename prompt");
         assert_eq!(prompt.asking, Asking::Rename(f.home.join("notes.txt")));
+    }
+
+    fn left_click(app: &mut App, at: (u16, u16)) {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.0,
+            row: at.1,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    /// A click on an item of the bar, as the last frame drew it.
+    fn click_bar(app: &mut App, command: FnKey) {
+        crate::ui::testing::buffer(app, 120, 30);
+        let rect = app.hits.rect_of(&Spot::FnKey(command)).expect("on the bar");
+        left_click(app, (rect.x + rect.width / 2, rect.y));
+    }
+
+    /// The colours the bar's row is drawn in, from a 120 by 30 frame.
+    fn bar_colours(app: &mut App) -> Vec<ratatui::style::Color> {
+        let drawn = crate::ui::testing::buffer(app, 120, 30);
+        (0..120).map(|x| drawn[(x, 29)].fg).collect()
+    }
+
+    fn message(app: &App) -> Option<String> {
+        app.message.as_ref().map(|message| message.text.clone())
+    }
+
+    #[test]
+    fn f8_in_the_trash_does_nothing_and_its_item_is_muted() {
+        let mut f = two_panes();
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::F(8)]);
+        assert_eq!(read(f.trash.join("notes.txt")), "hello");
+        // The left pane in the Trash, on what was moved there.
+        let trash = f.trash.clone();
+        f.app.navigate(&trash);
+        select(&mut f.app, "notes.txt");
+        assert!(!f.app.can_run(FnKey::Trash));
+        // F8 Delete all muted; the other items as before.
+        let drawn = crate::ui::testing::buffer(&mut f.app, 120, 30);
+        let (x, y) = crate::ui::testing::find(&drawn, "F8 Delete", 0..120).expect("F8");
+        assert_eq!(y, 29);
+        for dx in 0.."F8 Delete".len() as u16 {
+            assert_eq!(drawn[(x + dx, y)].fg, crate::theme::MUTED, "cell {dx}");
+        }
+        let (x, _) = crate::ui::testing::find(&drawn, "F5 Copy", 0..120).expect("F5");
+        assert_eq!(drawn[(x, y)].fg, crate::theme::ink(crate::theme::ACCENT));
+        // The key and a click on the item: no card, no message, nothing moved.
+        let said = message(&f.app);
+        press(&mut f.app, &[KeyCode::F(8)]);
+        click_bar(&mut f.app, FnKey::Trash);
+        assert!(f.app.dialog.is_none());
+        assert_eq!(message(&f.app), said);
+        assert_eq!(f.app.working(), None);
+        assert_eq!(read(f.trash.join("notes.txt")), "hello");
+        assert_eq!(pane_names(&f.app, 0), ["notes.txt"]);
+        // The Delete key still asks to delete it for good.
+        press(&mut f.app, &[KeyCode::Delete]);
+        assert!(matches!(f.app.dialog, Some(Dialog::Delete { .. })));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(read(f.trash.join("notes.txt")), "hello");
+    }
+
+    #[test]
+    fn what_f5_brought_is_selected_in_the_pane_it_was_sent_to_after_tab() {
+        let mut f = two_panes();
+        let documents = f.home.join("Documents");
+        fs::write(documents.join("a.txt"), "a").unwrap();
+        press(&mut f.app, &[KeyCode::Tab]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::BackTab]);
+        select(&mut f.app, "notes.txt");
+        let left = f.app.panes()[0].cursor;
+        press(&mut f.app, &[KeyCode::F(5), KeyCode::Tab]);
+        assert_eq!(f.app.active(), 1);
+        finish_work(&mut f.app);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        assert_eq!(under(&f.app, 1), Some("notes.txt"));
+        assert_eq!(f.app.panes()[0].cursor, left);
+        assert_eq!(under(&f.app, 0), Some("notes.txt"));
+    }
+
+    #[test]
+    fn what_f5_brought_is_selected_only_in_the_pane_it_was_sent_to() {
+        let mut f = two_panes();
+        let documents = f.home.join("Documents");
+        fs::write(documents.join("a.txt"), "a").unwrap();
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::F(5)]);
+        // Before it lands, the left pane goes into Documents too.
+        select(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(under(&f.app, 0), Some("a.txt"));
+        finish_work(&mut f.app);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        assert_eq!(pane_names(&f.app, 0), ["a.txt", "notes.txt"]);
+        assert_eq!(under(&f.app, 0), Some("a.txt"), "the left pane stays");
+        assert_eq!(under(&f.app, 1), Some("notes.txt"));
+    }
+
+    #[test]
+    fn what_f5_brought_is_not_selected_in_a_tab_opened_meanwhile() {
+        let mut f = two_panes();
+        let documents = f.home.join("Documents");
+        fs::write(documents.join("a.txt"), "a").unwrap();
+        press(&mut f.app, &[KeyCode::Tab]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::BackTab]);
+        select(&mut f.app, "notes.txt");
+        let left = f.app.panes()[0].cursor;
+        press(&mut f.app, &[KeyCode::F(5)]);
+        // A new tab on Documents before it lands.
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Char('t')]);
+        assert_eq!(f.app.current, 1);
+        assert_eq!(f.app.pane().cwd, documents);
+        assert_eq!(under(&f.app, 0), Some("a.txt"));
+        finish_work(&mut f.app);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        assert_eq!(pane_names(&f.app, 0), ["a.txt", "notes.txt"]);
+        assert_eq!(under(&f.app, 0), Some("a.txt"), "the new tab's pane stays");
+        // Back in the first tab: there it is selected, the left pane as it was.
+        press(&mut f.app, &[KeyCode::Char('1')]);
+        assert_eq!(f.app.current, 0);
+        assert_eq!(under(&f.app, 1), Some("notes.txt"));
+        assert_eq!(f.app.panes()[0].cursor, left);
+    }
+
+    #[test]
+    fn while_a_menu_or_the_settings_are_open_the_bar_is_muted_and_its_clicks_run_nothing() {
+        let mut f = two_panes();
+        select(&mut f.app, "notes.txt");
+        assert!(FnKey::ALL.iter().all(|command| f.app.can_run(*command)));
+        let accent = crate::theme::ink(crate::theme::ACCENT);
+        assert!(bar_colours(&mut f.app).contains(&accent));
+
+        // The menu.
+        f.app.handle_key(shift(KeyCode::F(10)));
+        assert!(f.app.menu.is_some());
+        assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
+        assert!(!bar_colours(&mut f.app).contains(&accent));
+        // A click on the bar only closes it, as one anywhere outside it does.
+        click_bar(&mut f.app, FnKey::NewMarkdown);
+        assert!(f.app.menu.is_none() && f.app.prompt.is_none());
+        assert!(!f.home.join("new.md").exists());
+
+        // The settings card.
+        press(&mut f.app, &[KeyCode::Char(',')]);
+        assert!(f.app.settings.is_some());
+        assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
+        assert!(!bar_colours(&mut f.app).contains(&accent));
+        click_bar(&mut f.app, FnKey::NewMarkdown);
+        assert!(f.app.settings.is_none() && f.app.prompt.is_none());
+        assert!(!f.home.join("new.md").exists());
+
+        // The key sheet.
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        assert!(f.app.help_visible);
+        assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
+        assert!(!bar_colours(&mut f.app).contains(&accent));
+        click_bar(&mut f.app, FnKey::Trash);
+        assert!(!f.app.help_visible);
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+
+        // Nothing open: lit again.
+        assert!(bar_colours(&mut f.app).contains(&accent));
+    }
+
+    #[test]
+    fn redo_of_f9_brings_back_an_empty_file_and_of_f7_a_folder() {
+        let mut f = two_panes();
+        let made = f.home.join("new.md");
+        press(&mut f.app, &[KeyCode::F(9), KeyCode::Esc]);
+        assert!(made.is_file());
+        press(&mut f.app, &[KeyCode::Char('z')]);
+        assert!(!made.exists());
+        f.app.handle_key(ctrl(KeyCode::Char('y')));
+        assert!(made.is_file(), "a file, not a folder");
+        assert_eq!(read(made.clone()), "");
+        assert!(!said(&f.app).1);
+        assert!(pane_names(&f.app, 0).contains(&"new.md"));
+
+        let folder = f.home.join("New Folder");
+        press(&mut f.app, &[KeyCode::F(7), KeyCode::Enter]);
+        assert!(folder.is_dir());
+        press(&mut f.app, &[KeyCode::Char('z')]);
+        assert!(!folder.exists());
+        f.app.handle_key(ctrl(KeyCode::Char('y')));
+        assert!(folder.is_dir());
+        assert!(made.is_file());
     }
 }
 
