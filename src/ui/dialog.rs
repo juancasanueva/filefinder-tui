@@ -1,6 +1,6 @@
 //! Dialogs: a name being typed, and the question before deleting for good
-//! or emptying the trash. They look like the `?` overlay: a dark panel with
-//! a hairline border.
+//! or emptying the trash. They look like the `?` overlay: a frame in the
+//! card's rule.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -67,9 +67,9 @@ fn panel(frame: &mut Frame, area: Rect, rows: u16, hits: &mut HitMap) -> Rect {
     };
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(theme::rule())
+        .border_style(theme::card_rule())
         .padding(Padding::new(3, 3, air, air))
-        .style(theme::panel());
+        .style(theme::base());
     let inner = block.inner(outer);
     frame.render_widget(Clear, outer);
     frame.render_widget(block, outer);
@@ -89,7 +89,7 @@ fn name(frame: &mut Frame, area: Rect, title: &str, input: &Input, hits: &mut Hi
     let [title_row, _, field, _, hint] = Layout::vertical([Constraint::Length(1); 5]).areas(inner);
     frame.render_widget(Span::styled(title, theme::title()), title_row);
     let choices = format!("{APPLY}{HINT_GAP}{CANCEL}");
-    frame.render_widget(Span::styled(choices, theme::dim()), hint);
+    frame.render_widget(Span::styled(choices, theme::muted()), hint);
     button(hits, hint, hint.x, APPLY.width(), true);
     let cancel = hint
         .x
@@ -163,8 +163,9 @@ mod tests {
     use crate::ui::testing::{buffer, cursor, find};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
+    use ratatui::style::{Color, Modifier};
 
-    /// Where a piece of text starts in the rows under `top`, left of the details pane.
+    /// Where a piece of text starts in the rows under `top`, left of the preview's text.
     fn under(drawn: &Buffer, text: &str, top: u16) -> Option<(u16, u16)> {
         let cells: Vec<String> = text.chars().map(String::from).collect();
         (top + 1..drawn.area.height).find_map(|y| {
@@ -185,10 +186,11 @@ mod tests {
         press(&mut f.app, &[KeyCode::End, KeyCode::F(2)]);
         let drawn = buffer(&mut f.app, 120, 30);
         let (title_x, title_y) = find(&drawn, "Rename", 0..120).expect("the title");
-        assert_eq!(drawn[(title_x, title_y)].fg, theme::BRIGHT_FOREGROUND);
-        assert_eq!(drawn[(title_x, title_y)].bg, theme::DARK_BACKGROUND);
+        assert_eq!(drawn[(title_x, title_y)].fg, theme::FOREGROUND);
+        assert!(drawn[(title_x, title_y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(drawn[(title_x, title_y)].bg, Color::Reset);
         let (x, y) = under(&drawn, "notes.txt", title_y).expect("the name");
-        assert_eq!(drawn[(x, y)].bg, theme::LIGHTER_BACKGROUND, "in a field");
+        assert_eq!(drawn[(x, y)].bg, theme::FIELD, "in a field");
         assert_eq!(cursor(&mut f.app, 120, 30), (x + 5, y));
 
         // Typing shows up where the cursor is, and the cursor moves along.
@@ -211,7 +213,7 @@ mod tests {
         let (title_x, title_y) = find(&drawn, "New Folder", 0..120).expect("the title");
         let (x, y) = under(&drawn, "New Folder", title_y).expect("the name");
         assert_eq!(x, title_x);
-        assert_eq!(drawn[(x, y)].bg, theme::LIGHTER_BACKGROUND, "in a field");
+        assert_eq!(drawn[(x, y)].bg, theme::FIELD, "in a field");
         assert_eq!(cursor(&mut f.app, 120, 30), (x + 10, y), "after the name");
     }
 
@@ -228,17 +230,13 @@ mod tests {
         let delete = find(&drawn, "Delete  ", 0..120).expect("the Delete choice");
         let cancel = find(&drawn, "Cancel", 0..120).expect("the Cancel choice");
         assert_eq!(delete.1, cancel.1, "side by side");
-        assert_eq!(
-            drawn[cancel].bg,
-            theme::ACCENT,
-            "Cancel is what Enter takes"
-        );
-        assert_ne!(drawn[delete].bg, theme::ACCENT);
+        assert_eq!(drawn[cancel].bg, theme::WASH, "Cancel is what Enter takes");
+        assert_ne!(drawn[delete].bg, theme::WASH);
 
         press(&mut f.app, &[KeyCode::Right]);
         let drawn = buffer(&mut f.app, 120, 30);
-        assert_eq!(drawn[delete].bg, theme::ACCENT);
-        assert_ne!(drawn[cancel].bg, theme::ACCENT);
+        assert_eq!(drawn[delete].bg, theme::WASH);
+        assert_ne!(drawn[cancel].bg, theme::WASH);
     }
 
     #[test]
@@ -264,26 +262,23 @@ mod tests {
         });
         let drawn = buffer(&mut f.app, 120, 30);
         let title = find(&drawn, "Empty the trash?", 0..120).expect("the title");
-        assert_eq!(drawn[title].fg, theme::BRIGHT_FOREGROUND);
-        assert_eq!(drawn[title].bg, theme::DARK_BACKGROUND);
+        assert_eq!(drawn[title].fg, theme::FOREGROUND);
+        assert!(drawn[title].modifier.contains(Modifier::BOLD));
+        assert_eq!(drawn[title].bg, Color::Reset);
         let asks = "3 items will be deleted permanently. This can't be undone.";
         assert!(find(&drawn, asks, 0..120).is_some());
         // The choice, not the title: it is followed by the gap before Cancel.
         let empty = find(&drawn, "Empty Trash  ", 0..120).expect("the Empty Trash choice");
         let cancel = find(&drawn, "Cancel", 0..120).expect("the Cancel choice");
         assert_eq!(empty.1, cancel.1, "side by side");
-        assert_eq!(
-            drawn[cancel].bg,
-            theme::ACCENT,
-            "Cancel is what Enter takes"
-        );
-        assert_ne!(drawn[empty].bg, theme::ACCENT);
+        assert_eq!(drawn[cancel].bg, theme::WASH, "Cancel is what Enter takes");
+        assert_ne!(drawn[empty].bg, theme::WASH);
         assert_eq!(find(&drawn, "Delete for good?", 0..120), None);
 
         press(&mut f.app, &[KeyCode::Right]);
         let drawn = buffer(&mut f.app, 120, 30);
-        assert_eq!(drawn[empty].bg, theme::ACCENT);
-        assert_ne!(drawn[cancel].bg, theme::ACCENT);
+        assert_eq!(drawn[empty].bg, theme::WASH);
+        assert_ne!(drawn[cancel].bg, theme::WASH);
 
         // One item is one item.
         f.app.dialog = Some(Dialog::EmptyTrash {

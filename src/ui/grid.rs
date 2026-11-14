@@ -12,7 +12,7 @@ use super::list::{self, size_text};
 use super::{fit, picture, scroll};
 use crate::app::{App, HitMap, Spot, TileSize};
 use crate::format::{self, DateStyle};
-use crate::icons::Icon;
+use crate::icons;
 use crate::model::{self, Entry};
 use crate::theme;
 
@@ -102,11 +102,12 @@ pub fn draw(
     let columns = columns(area.width, size);
     let rows = visible_rows(area.height, size);
     let date_style = app.date_style;
+    let caption = app.caption;
     let pane = &mut app.panes[pane_index];
     pane.grid_columns = columns;
     pane.page_rows = rows;
     if pane.entries.is_empty() {
-        list::empty(frame, area, pane);
+        list::empty(frame, area, pane, caption);
         return;
     }
     pane.offset = scroll(pane.offset, pane.cursor / columns, rows);
@@ -138,13 +139,13 @@ pub fn draw(
         if selected {
             let around = Rect::new(tile.x, tile.y, tile.width, thumb.height + 2);
             if let Some(around) = clip(around, area) {
-                let style = theme::selected_tile(focused);
+                let style = selected_tile(focused);
                 frame.render_widget(Block::bordered().border_style(style), around);
             }
         }
 
         let name = if selected {
-            theme::selected_tile(focused)
+            theme::title()
         } else {
             theme::base()
         };
@@ -152,26 +153,37 @@ pub fn draw(
         let under = thumb.bottom() + 1;
         centered(frame, area, tile, under, fit(&entry.name, width), name);
         let details = details(entry, now, date_style, width);
-        centered(frame, area, tile, under + 1, details, theme::dim());
+        centered(frame, area, tile, under + 1, details, theme::muted());
     }
+}
+
+/// The frame around a selected tile: the accent where the keyboard is,
+/// muted elsewhere.
+fn selected_tile(focused: bool) -> Style {
+    theme::fg(if focused { theme::ACCENT } else { theme::MUTED })
+}
+
+/// A folder card or a file's stand-in box, and the muted marks on it.
+fn card() -> Style {
+    theme::on(theme::MUTED, theme::TAB)
 }
 
 /// A plain card with a folder's tab on its top left.
 pub(super) fn folder_card(frame: &mut Frame, thumb: Rect) {
     let tab = "▄".repeat((thumb.width / 3) as usize);
-    frame.render_widget(Paragraph::new(tab).style(theme::card_tab()), thumb);
-    let card = Rect {
+    frame.render_widget(Paragraph::new(tab).style(theme::fg(theme::TAB)), thumb);
+    let body = Rect {
         y: thumb.y + 1,
         height: thumb.height - 1,
         ..thumb
     };
-    frame.render_widget(Block::new().style(theme::card()), card);
+    frame.render_widget(Block::new().style(card()), body);
 }
 
 /// What a file shows until it has a picture of its own: a box with the glyph
 /// of its kind in the middle and its extension in the bottom right corner.
 pub(super) fn stand_in(frame: &mut Frame, thumb: Rect, visible: Rect, entry: &Entry) {
-    frame.render_widget(Block::new().style(theme::card()), visible);
+    frame.render_widget(Block::new().style(card()), visible);
     let mut mark = |row: u16, text: String, alignment: Alignment| {
         let line = Rect {
             y: thumb.y + row,
@@ -180,13 +192,11 @@ pub(super) fn stand_in(frame: &mut Frame, thumb: Rect, visible: Rect, entry: &En
             ..thumb
         };
         if let Some(line) = clip(line, visible) {
-            let text = Paragraph::new(text)
-                .style(theme::card())
-                .alignment(alignment);
+            let text = Paragraph::new(text).style(card()).alignment(alignment);
             frame.render_widget(text, line);
         }
     };
-    let glyph = Icon::for_category(entry.category()).glyph();
+    let glyph = icons::of(entry);
     mark(
         thumb.height.saturating_sub(1) / 2,
         glyph.to_string(),
@@ -239,10 +249,11 @@ fn details(entry: &Entry, now: SystemTime, date_style: DateStyle, width: usize) 
 mod tests {
     use super::*;
     use crate::app::testing::{ctrl, fixture, grid_fixture, pictures, press, settle, split};
-    use crate::icons::Icon;
+    use crate::icons;
     use crate::thumbs::testing::painted;
     use crate::ui::testing::{buffer, find, screen};
     use ratatui::crossterm::event::KeyCode;
+    use ratatui::style::{Color, Modifier};
     use std::fs::{self, File};
     use std::time::Duration;
 
@@ -256,21 +267,21 @@ mod tests {
         assert_eq!(visible_rows(3, TileSize::Normal), 1);
 
         // The files area of a 120 by 24 window: three tiles across, two whole rows.
-        let area = Rect::new(24, 2, 62, 22);
+        let area = Rect::new(0, 2, 62, 22);
         let thumb = |offset, index| thumb_rect(area, TileSize::Normal, offset, index);
-        assert_eq!(thumb(0, 0), Some(Rect::new(27, 3, 16, 6)));
-        assert_eq!(thumb(0, 4), Some(Rect::new(47, 13, 16, 6)));
+        assert_eq!(thumb(0, 0), Some(Rect::new(3, 3, 16, 6)));
+        assert_eq!(thumb(0, 4), Some(Rect::new(23, 13, 16, 6)));
         assert_eq!(
             thumb(0, 6),
-            Some(Rect::new(27, 23, 16, 1)),
+            Some(Rect::new(3, 23, 16, 1)),
             "the row the window cuts is cut"
         );
         assert_eq!(thumb(0, 9), None, "below the window");
         assert_eq!(thumb(1, 0), None, "scrolled away above");
-        assert_eq!(thumb(1, 6), Some(Rect::new(27, 13, 16, 6)));
+        assert_eq!(thumb(1, 6), Some(Rect::new(3, 13, 16, 6)));
         assert_eq!(
             thumb_rect(area, TileSize::Large, 0, 1),
-            Some(Rect::new(57, 3, 24, 9))
+            Some(Rect::new(33, 3, 24, 9))
         );
     }
 
@@ -280,13 +291,13 @@ mod tests {
         // A 24-hour time is never wider than five cells, so the line fits at any hour.
         f.app.date_style = crate::format::DateStyle::DayFirst;
         f.app.handle_key(ctrl(KeyCode::Char('1')));
-        let buffer = buffer(&mut f.app, 120, 24);
-        let lines = screen(&mut f.app, 120, 24);
+        let buffer = buffer(&mut f.app, 62, 26);
+        let lines = screen(&mut f.app, 62, 26);
 
         // Three tiles of 18 cells starting at 26, 46 and 66; names on the row under the thumbnails.
-        assert_eq!(find(&buffer, "Documents", 24..86), Some((31, 10)));
-        assert_eq!(find(&buffer, "Pictures", 24..86), Some((51, 10)));
-        assert_eq!(find(&buffer, "notes.txt", 24..86), Some((71, 10)));
+        assert_eq!(find(&buffer, "Documents", 0..62), Some((7, 10)));
+        assert_eq!(find(&buffer, "Pictures", 0..62), Some((27, 10)));
+        assert_eq!(find(&buffer, "notes.txt", 0..62), Some((47, 10)));
 
         let notes = &f.app.pane().entries[2];
         let date = format::short_date(notes.modified.unwrap(), SystemTime::now(), f.app.date_style);
@@ -294,54 +305,55 @@ mod tests {
         assert!(under.contains(&format!("No items · {date}")), "{under}");
         assert!(under.contains(&format!("2 items · {date}")), "{under}");
         assert!(under.contains(&format!("5 B · {date}")), "{under}");
-        let (x, y) = find(&buffer, "5 B", 24..86).unwrap();
-        assert_eq!(buffer[(x, y)].fg, theme::DIM);
+        let (x, y) = find(&buffer, "5 B", 0..62).unwrap();
+        assert_eq!(buffer[(x, y)].fg, theme::MUTED);
     }
 
     #[test]
     fn folders_are_cards_with_a_tab_and_files_a_box_with_their_kind() {
         let mut f = fixture();
         f.app.handle_key(ctrl(KeyCode::Char('1')));
-        let buffer = buffer(&mut f.app, 120, 24);
+        let buffer = buffer(&mut f.app, 62, 26);
 
         // Documents: the tab on the top left, the card under it.
-        assert_eq!(buffer[(27, 3)].symbol(), "▄");
-        assert_eq!(buffer[(27, 3)].fg, theme::LIGHTER_BACKGROUND);
-        assert_eq!(buffer[(42, 3)].symbol(), " ");
-        assert_eq!(buffer[(42, 3)].bg, theme::BACKGROUND);
-        assert_eq!(buffer[(27, 4)].bg, theme::LIGHTER_BACKGROUND);
-        assert_eq!(buffer[(42, 8)].bg, theme::LIGHTER_BACKGROUND);
+        assert_eq!(buffer[(3, 3)].symbol(), "▄");
+        assert_eq!(buffer[(3, 3)].fg, theme::TAB);
+        assert_eq!(buffer[(18, 3)].symbol(), " ");
+        assert_eq!(buffer[(18, 3)].bg, Color::Reset);
+        assert_eq!(buffer[(3, 4)].bg, theme::TAB);
+        assert_eq!(buffer[(18, 8)].bg, theme::TAB);
 
         // notes.txt: a box, the glyph of its kind in the middle, the extension in a corner.
-        assert_eq!(buffer[(67, 3)].bg, theme::LIGHTER_BACKGROUND);
-        assert_eq!(buffer[(82, 8)].bg, theme::LIGHTER_BACKGROUND);
-        assert_eq!(buffer[(74, 5)].symbol(), Icon::Text.glyph());
-        assert_eq!(buffer[(74, 5)].fg, theme::DIM);
-        assert_eq!(find(&buffer, "TXT", 24..86), Some((79, 8)));
-        assert_eq!(buffer[(79, 8)].fg, theme::DIM);
-        assert_eq!(buffer[(79, 8)].bg, theme::LIGHTER_BACKGROUND);
+        assert_eq!(buffer[(43, 3)].bg, theme::TAB);
+        assert_eq!(buffer[(58, 8)].bg, theme::TAB);
+        assert_eq!(buffer[(50, 5)].symbol(), icons::TEXT);
+        assert_eq!(buffer[(50, 5)].fg, theme::MUTED);
+        assert_eq!(find(&buffer, "TXT", 0..62), Some((55, 8)));
+        assert_eq!(buffer[(55, 8)].fg, theme::MUTED);
+        assert_eq!(buffer[(55, 8)].bg, theme::TAB);
     }
 
     #[test]
     fn the_selected_tile_wears_the_color_itself() {
         let mut f = fixture();
         f.app.handle_key(ctrl(KeyCode::Char('1')));
-        let lit = buffer(&mut f.app, 120, 24);
-        // An accent frame around the thumbnail and the name in accent.
-        assert_eq!(lit[(26, 2)].symbol(), "┌");
-        assert_eq!(lit[(43, 9)].symbol(), "┘");
-        assert_eq!(lit[(26, 2)].fg, theme::ACCENT);
-        assert_eq!(lit[(31, 10)].fg, theme::ACCENT);
+        let lit = buffer(&mut f.app, 62, 26);
+        // A frame in the accent around the thumbnail and the name bold.
+        assert_eq!(lit[(2, 2)].symbol(), "┌");
+        assert_eq!(lit[(19, 9)].symbol(), "┘");
+        assert_eq!(lit[(2, 2)].fg, theme::ACCENT);
+        assert!(lit[(7, 10)].modifier.contains(Modifier::BOLD));
         // The others have neither.
-        assert_eq!(lit[(46, 2)].symbol(), " ");
-        assert_eq!(lit[(51, 10)].fg, theme::FOREGROUND);
+        assert_eq!(lit[(22, 2)].symbol(), " ");
+        assert_eq!(lit[(27, 10)].fg, theme::FOREGROUND);
+        assert!(!lit[(27, 10)].modifier.contains(Modifier::BOLD));
 
-        // With the keyboard in the details pane the selection goes grey.
-        press(&mut f.app, &[KeyCode::Tab]);
-        let unlit = buffer(&mut f.app, 120, 24);
-        assert_eq!(unlit[(26, 2)].symbol(), "┌");
-        assert_eq!(unlit[(26, 2)].fg, theme::BRIGHT_FOREGROUND);
-        assert_eq!(unlit[(31, 10)].fg, theme::BRIGHT_FOREGROUND);
+        // With the keyboard in the other pane the frame is muted.
+        split(&mut f.app);
+        let unlit = buffer(&mut f.app, 124, 26);
+        let tile = tile_rect(LEFT, TileSize::Normal, 0, 0).unwrap();
+        assert_eq!(unlit[(tile.x, tile.y)].symbol(), "┌");
+        assert_eq!(unlit[(tile.x, tile.y)].fg, theme::MUTED);
     }
 
     #[test]
@@ -350,7 +362,7 @@ mod tests {
         fs::write(f.home.join("a-very-long-file-name-indeed.txt"), "").unwrap();
         f.app.handle_key(ctrl(KeyCode::Char('1')));
         press(&mut f.app, &[KeyCode::F(5)]);
-        let all = screen(&mut f.app, 120, 24).join("\n");
+        let all = screen(&mut f.app, 62, 26).join("\n");
         assert!(all.contains("a-very-long-file-…"), "{all}");
         assert!(!all.contains("a-very-long-file-n"), "{all}");
     }
@@ -359,43 +371,43 @@ mod tests {
     fn the_grid_scrolls_by_rows_to_keep_the_selected_tile_whole() {
         let mut f = grid_fixture();
         press(&mut f.app, &[KeyCode::End]);
-        let below = buffer(&mut f.app, 120, 24);
+        let below = buffer(&mut f.app, 62, 26);
         assert_eq!(f.app.pane().offset, 2, "rows scrolled away");
         // The last tile is on the second row now, all of it: frame, name and details.
-        assert_eq!(below[(26, 12)].symbol(), "┌");
-        assert_eq!(find(&below, "notes.txt", 24..86), Some((31, 20)));
-        assert!(find(&below, "5 B", 24..86).is_some_and(|(_, y)| y == 21));
-        assert_eq!(find(&below, "a.txt", 24..86), None);
-        assert!(find(&below, "e.txt", 24..86).is_some());
+        assert_eq!(below[(2, 12)].symbol(), "┌");
+        assert_eq!(find(&below, "notes.txt", 0..62), Some((7, 20)));
+        assert!(find(&below, "5 B", 0..62).is_some_and(|(_, y)| y == 21));
+        assert_eq!(find(&below, "a.txt", 0..62), None);
+        assert!(find(&below, "e.txt", 0..62).is_some());
 
         press(&mut f.app, &[KeyCode::Up]);
-        buffer(&mut f.app, 120, 24);
+        buffer(&mut f.app, 62, 26);
         assert_eq!(f.app.pane().offset, 2, "still in view: nothing moves");
         press(&mut f.app, &[KeyCode::Home]);
-        let top = buffer(&mut f.app, 120, 24);
+        let top = buffer(&mut f.app, 62, 26);
         assert_eq!(f.app.pane().offset, 0);
-        assert!(find(&top, "a.txt", 24..86).is_some());
-        assert_eq!(find(&top, "notes.txt", 24..86), None);
+        assert!(find(&top, "a.txt", 0..62).is_some());
+        assert_eq!(find(&top, "notes.txt", 0..62), None);
     }
 
     #[test]
     fn bigger_and_smaller_tiles_change_how_many_fit_across() {
         let mut f = grid_fixture();
-        screen(&mut f.app, 130, 30);
+        screen(&mut f.app, 72, 32);
         assert_eq!(f.app.pane().grid_columns, 3);
         f.app.handle_key(ctrl(KeyCode::Char('=')));
-        let big = buffer(&mut f.app, 130, 30);
+        let big = buffer(&mut f.app, 72, 32);
         assert_eq!(f.app.pane().grid_columns, 2);
         // A 26-cell tile: the frame's corners are that far apart, around a 9-row thumbnail.
-        let (x, y) = find(&big, "┌", 24..96).unwrap();
+        let (x, y) = find(&big, "┌", 0..72).unwrap();
         assert_eq!(big[(x + 25, y)].symbol(), "┐");
         assert_eq!(big[(x, y + 10)].symbol(), "└");
 
         f.app.handle_key(ctrl(KeyCode::Char('-')));
         f.app.handle_key(ctrl(KeyCode::Char('-')));
-        let small = buffer(&mut f.app, 130, 30);
+        let small = buffer(&mut f.app, 72, 32);
         assert_eq!(f.app.pane().grid_columns, 4);
-        let (x, y) = find(&small, "┌", 24..96).unwrap();
+        let (x, y) = find(&small, "┌", 0..72).unwrap();
         assert_eq!(small[(x + 13, y)].symbol(), "┐");
         assert_eq!(small[(x, y + 5)].symbol(), "└");
     }
@@ -408,31 +420,31 @@ mod tests {
         press(&mut f.app, &[KeyCode::F(5)]);
 
         // Drawing only asks: until the picture has been made the stand-in shows.
-        let before = buffer(&mut f.app, 120, 24);
-        assert_eq!(before[(74, 5)].symbol(), Icon::Text.glyph());
-        assert!(!painted(&before[(74, 5)]));
+        let before = buffer(&mut f.app, 62, 26);
+        assert_eq!(before[(50, 5)].symbol(), icons::TEXT);
+        assert!(!painted(&before[(50, 5)]));
         settle(&mut f.app);
-        let after = buffer(&mut f.app, 120, 24);
+        let after = buffer(&mut f.app, 62, 26);
 
         // notes.txt, four by three: all sixteen by six cells of its thumbnail and no more.
-        for (x, y) in [(67, 3), (82, 3), (74, 5), (67, 8), (82, 8)] {
+        for (x, y) in [(43, 3), (58, 3), (50, 5), (43, 8), (58, 8)] {
             assert!(painted(&after[(x, y)]), "{x}, {y}");
         }
-        assert_eq!(after[(74, 5)].symbol(), " ", "the stand-in is gone");
-        for (x, y) in [(66, 3), (83, 3), (67, 2), (67, 9)] {
+        assert_eq!(after[(50, 5)].symbol(), " ", "the stand-in is gone");
+        for (x, y) in [(42, 3), (59, 3), (43, 2), (43, 9)] {
             assert!(!painted(&after[(x, y)]), "{x}, {y}");
         }
         // tall.jpg on the second row, three by four: nine cells wide in the middle of sixteen.
-        for (x, y) in [(30, 13), (38, 13), (30, 18), (38, 18)] {
+        for (x, y) in [(6, 13), (14, 13), (6, 18), (14, 18)] {
             assert!(painted(&after[(x, y)]), "{x}, {y}");
         }
-        for (x, y) in [(27, 13), (29, 13), (39, 13), (42, 18), (30, 12), (30, 19)] {
+        for (x, y) in [(3, 13), (5, 13), (15, 13), (18, 18), (6, 12), (6, 19)] {
             assert!(!painted(&after[(x, y)]), "{x}, {y}");
-            assert_eq!(after[(x, y)].bg, theme::BACKGROUND);
+            assert_eq!(after[(x, y)].bg, Color::Reset);
         }
         // Folders keep their card and are never asked for.
-        assert_eq!(after[(27, 3)].symbol(), "▄");
-        assert_eq!(after[(27, 4)].bg, theme::LIGHTER_BACKGROUND);
+        assert_eq!(after[(3, 3)].symbol(), "▄");
+        assert_eq!(after[(3, 4)].bg, theme::TAB);
         let mut asked = thumbnailer.asked();
         asked.sort();
         assert_eq!(asked, ["notes.txt", "tall.jpg"]);
@@ -451,26 +463,27 @@ mod tests {
             fs::write(f.home.join(format!("{name}.txt")), name).unwrap();
         }
         f.app.handle_key(ctrl(KeyCode::Char('1')));
-        // Sorting says so in a band under the view: the view is one row shorter.
+        // What sorting says goes in the footer, under the rule.
         press(&mut f.app, &[KeyCode::Char('s'), KeyCode::Char('S')]);
-        buffer(&mut f.app, 120, 26);
+        buffer(&mut f.app, 62, 27);
         settle(&mut f.app);
-        let cut = buffer(&mut f.app, 120, 26);
+        let cut = buffer(&mut f.app, 62, 27);
 
-        // The third row of tiles: two rows of its thumbnails fit above the band.
-        let area = Rect::new(24, 2, 62, 23);
+        // The third row of tiles: two rows of its thumbnails fit above the rule.
+        let area = Rect::new(0, 2, 62, 23);
         assert_eq!(
             thumb_rect(area, TileSize::Normal, 0, 6),
-            Some(Rect::new(27, 23, 16, 2))
+            Some(Rect::new(3, 23, 16, 2))
         );
-        for (x, y) in [(27, 23), (42, 23), (27, 24), (42, 24)] {
+        for (x, y) in [(3, 23), (18, 23), (3, 24), (18, 24)] {
             assert!(painted(&cut[(x, y)]), "{x}, {y}");
         }
-        for x in 24..86 {
-            assert!(!painted(&cut[(x, 25)]), "the band at {x} is drawn over");
-            assert_eq!(cut[(x, 25)].bg, theme::LIGHTER_BACKGROUND);
+        for x in 0..62 {
+            assert!(!painted(&cut[(x, 25)]), "the rule at {x} is drawn over");
+            assert_eq!(cut[(x, 25)].symbol(), "─");
+            assert_eq!(cut[(x, 25)].fg, theme::BORDER);
         }
-        assert_eq!(find(&cut, "Sorted by name", 24..86), Some((26, 25)));
+        assert!(find(&cut, "Sorted by name", 0..62).is_some_and(|(_, y)| y == 26));
     }
 
     #[test]
@@ -480,12 +493,12 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('1')));
         press(&mut f.app, &[KeyCode::F(5)]);
         for _ in 0..3 {
-            buffer(&mut f.app, 120, 24);
+            buffer(&mut f.app, 62, 26);
             settle(&mut f.app);
         }
-        let failed = buffer(&mut f.app, 120, 24);
-        assert_eq!(failed[(74, 5)].symbol(), Icon::Text.glyph());
-        assert_eq!(failed[(67, 3)].bg, theme::LIGHTER_BACKGROUND);
+        let failed = buffer(&mut f.app, 62, 26);
+        assert_eq!(failed[(50, 5)].symbol(), icons::TEXT);
+        assert_eq!(failed[(43, 3)].bg, theme::TAB);
         assert_eq!(thumbnailer.asked(), ["notes.txt"], "asked once");
 
         // Written again later: it is worth another try.
@@ -494,10 +507,10 @@ mod tests {
         let file = File::options().write(true).open(f.home.join("notes.txt"));
         file.unwrap().set_modified(later).unwrap();
         press(&mut f.app, &[KeyCode::F(5)]);
-        buffer(&mut f.app, 120, 24);
+        buffer(&mut f.app, 62, 26);
         settle(&mut f.app);
-        let mended = buffer(&mut f.app, 120, 24);
-        assert!(painted(&mended[(74, 5)]));
+        let mended = buffer(&mut f.app, 62, 26);
+        assert!(painted(&mended[(50, 5)]));
         assert_eq!(thumbnailer.asked(), ["notes.txt", "notes.txt"]);
     }
 
@@ -505,18 +518,18 @@ mod tests {
     fn bigger_tiles_show_the_same_thumbnail_bigger() {
         let (mut f, thumbnailer) = pictures();
         f.app.handle_key(ctrl(KeyCode::Char('1')));
-        buffer(&mut f.app, 130, 30);
+        buffer(&mut f.app, 72, 32);
         settle(&mut f.app);
-        let normal = buffer(&mut f.app, 130, 30);
-        let area = Rect::new(24, 2, 72, 28);
+        let normal = buffer(&mut f.app, 72, 32);
+        let area = Rect::new(0, 2, 72, 28);
         let thumb = thumb_rect(area, TileSize::Normal, 0, 2).unwrap();
         assert!(painted(&normal[(thumb.x, thumb.y)]));
         assert!(painted(&normal[(thumb.right() - 1, thumb.bottom() - 1)]));
 
         f.app.handle_key(ctrl(KeyCode::Char('=')));
-        buffer(&mut f.app, 130, 30);
+        buffer(&mut f.app, 72, 32);
         settle(&mut f.app);
-        let large = buffer(&mut f.app, 130, 30);
+        let large = buffer(&mut f.app, 72, 32);
         // Twenty-four cells by nine now, filled from edge to edge.
         let thumb = thumb_rect(area, TileSize::Large, 0, 2).unwrap();
         assert_eq!((thumb.width, thumb.height), (24, 9));
@@ -548,14 +561,14 @@ mod tests {
 
     // Two panes in a window 182 cells wide: 124 of them for the files, 62 on
     // the left, a hairline, 61 on the right, each under a row for its path.
-    const LEFT: Rect = Rect::new(24, 3, 62, 21);
-    const RIGHT: Rect = Rect::new(87, 3, 61, 21);
+    const LEFT: Rect = Rect::new(0, 3, 62, 21);
+    const RIGHT: Rect = Rect::new(63, 3, 61, 21);
 
     #[test]
     fn two_grids_each_have_their_own_tiles_across_and_their_own_selected_tile() {
         let mut f = grid_fixture();
         split(&mut f.app);
-        buffer(&mut f.app, 182, 24);
+        buffer(&mut f.app, 124, 26);
         let across = |app: &App| (app.panes[0].grid_columns, app.panes[1].grid_columns);
         assert_eq!(across(&f.app), (3, 2));
         assert_eq!((f.app.panes[0].page_rows, f.app.panes[1].page_rows), (2, 2));
@@ -565,24 +578,24 @@ mod tests {
         assert_eq!(f.app.pane().cursor, 2);
         press(&mut f.app, &[KeyCode::BackTab, KeyCode::Down]);
         assert_eq!(f.app.pane().cursor, 3);
-        let drawn = buffer(&mut f.app, 182, 24);
+        let drawn = buffer(&mut f.app, 124, 26);
         let here = tile_rect(LEFT, TileSize::Normal, 0, 3).unwrap();
         let there = tile_rect(RIGHT, TileSize::Normal, 0, 2).unwrap();
         assert_eq!((here.y, there.y), (13, 13), "the second row of each");
         assert_eq!(drawn[(here.x, here.y)].symbol(), "┌");
         assert_eq!(drawn[(here.x, here.y)].fg, theme::ACCENT);
         assert_eq!(drawn[(there.x, there.y)].symbol(), "┌");
-        assert_eq!(drawn[(there.x, there.y)].fg, theme::BRIGHT_FOREGROUND);
+        assert_eq!(drawn[(there.x, there.y)].fg, theme::MUTED);
         // One frame each, and a hairline between the two grids.
-        let corners = (0..182u16)
-            .flat_map(|x| (0..24u16).map(move |y| (x, y)))
+        let corners = (0..124u16)
+            .flat_map(|x| (0..26u16).map(move |y| (x, y)))
             .filter(|at| drawn[*at].symbol() == "┌");
         assert_eq!(corners.count(), 2);
-        assert_eq!(drawn[(86, 2)].symbol(), "│");
-        assert_eq!(drawn[(86, 23)].symbol(), "│");
+        assert_eq!(drawn[(62, 2)].symbol(), "│");
+        assert_eq!(drawn[(62, 23)].symbol(), "│");
         // The path is on the row above the tiles.
-        assert_eq!(find(&drawn, "~", 24..86), Some((26, 2)));
-        assert_eq!(find(&drawn, "~", 87..148), Some((89, 2)));
+        assert_eq!(drawn[(1, 2)].symbol(), "~");
+        assert_eq!(drawn[(64, 2)].symbol(), "~");
     }
 
     #[test]
@@ -592,14 +605,14 @@ mod tests {
         split(&mut f.app);
         press(&mut f.app, &[KeyCode::Right, KeyCode::Enter]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-        buffer(&mut f.app, 182, 24);
+        buffer(&mut f.app, 124, 26);
         settle(&mut f.app);
-        let drawn = buffer(&mut f.app, 182, 24);
+        let drawn = buffer(&mut f.app, 124, 26);
 
         // notes.txt, the third tile on the left; a.jpg, the second on the right.
         let notes = thumb_rect(LEFT, TileSize::Normal, 0, 2).unwrap();
         let picture = thumb_rect(RIGHT, TileSize::Normal, 0, 1).unwrap();
-        assert!(notes.right() <= 86 && picture.x >= 87);
+        assert!(notes.right() <= 62 && picture.x >= 63);
         for thumb in [notes, picture] {
             assert_eq!((thumb.width, thumb.height), (16, 6));
             for (x, y) in [

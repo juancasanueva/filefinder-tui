@@ -23,14 +23,11 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ),
     (
         "Tab / Shift+Tab",
-        "Move between the sidebar, the panes and the details",
+        "Move between the list and the preview, or the panes",
     ),
     ("⏎", "Open"),
     ("Space", "Preview the selected file"),
-    (
-        "Alt+⏎",
-        "Everything else, for files and for drives in the sidebar",
-    ),
+    ("Alt+⏎", "Everything else, for what is selected"),
     ("Backspace", "Go to the parent folder"),
     ("Alt+← / Alt+→", "Back / forward"),
     ("Alt+Home", "Go home"),
@@ -40,8 +37,6 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+Shift+C", "Copy the path as text"),
     ("F2 / Ctrl+Shift+D", "Rename / duplicate"),
     ("Ctrl+Shift+N", "New folder"),
-    ("Ctrl+P", "Pin or unpin the folder"),
-    ("Delete in the sidebar", "Unpin the folder"),
     ("Delete (fn+⌫) / ⌘⌫", "Move to the trash"),
     ("Shift+Delete", "Delete permanently (asks first)"),
     (
@@ -57,7 +52,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
         "Ctrl+= / Ctrl+- / Ctrl+0",
         "Bigger, smaller or normal tiles",
     ),
-    ("Ctrl+I", "Show or hide the details pane"),
+    ("Alt+P", "Show or hide the preview pane"),
     ("S / Shift+S", "Sort: name, kind, newest, oldest, size"),
     ("Ctrl+H", "Show hidden files"),
     ("F5", "Reload"),
@@ -124,9 +119,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
     };
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(theme::rule())
+        .border_style(theme::card_rule())
         .padding(Padding::new(3, 3, air as u16, 0))
-        .style(theme::base().bg(theme::DARK_BACKGROUND));
+        .style(theme::base());
 
     let inner_width = width.saturating_sub(SIDES);
     let more = match (first > 0, first < last) {
@@ -140,7 +135,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
             Span::styled(TITLE, theme::title()),
             Span::styled(
                 pad_left(more, inner_width.saturating_sub(TITLE.len())),
-                theme::dim(),
+                theme::muted(),
             ),
         ]),
         Line::default(),
@@ -156,17 +151,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
                 Some((keys, does)) => (*keys, does.as_str()),
                 None => ("", ""),
             };
-            spans.push(Span::styled(pad(keys, KEY_WIDTH), theme::accent()));
+            spans.push(Span::styled(pad(keys, KEY_WIDTH), theme::base()));
             spans.push(Span::styled(
                 pad(does, column_width.saturating_sub(KEY_WIDTH)),
-                theme::base().bg(theme::DARK_BACKGROUND),
+                theme::base(),
             ));
         }
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(Span::styled(
         fit(MOUSE, inner_width),
-        theme::dim(),
+        theme::muted(),
     )));
     frame.render_widget(Clear, overlay);
     frame.render_widget(Paragraph::new(lines).block(block), overlay);

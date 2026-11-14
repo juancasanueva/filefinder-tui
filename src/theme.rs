@@ -1,123 +1,376 @@
-//! Folio's fallback palette: near-black panels with one yellow accent.
+//! flea's terminal palette: its fallback colours, since macOS has no Omarchy
+//! theme to follow, drawn at the colour depth the terminal offers. The
+//! background is always the terminal's own; only the fills below paint one.
+
+use std::cell::Cell;
+use std::ffi::OsStr;
+use std::ops::RangeInclusive;
 
 use ratatui::style::{Color, Modifier, Style};
 
-pub const ACCENT: Color = Color::Rgb(0xFF, 0xD6, 0x0A);
-pub const BACKGROUND: Color = Color::Rgb(0x16, 0x16, 0x1a);
-pub const DARK_BACKGROUND: Color = Color::Rgb(0x11, 0x11, 0x14);
-pub const LIGHTER_BACKGROUND: Color = Color::Rgb(0x23, 0x23, 0x29);
-pub const FOREGROUND: Color = Color::Rgb(0xc8, 0xc8, 0xd0);
-pub const BRIGHT_FOREGROUND: Color = Color::Rgb(0xec, 0xec, 0xf1);
-pub const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
+pub const FOREGROUND: Color = Color::Rgb(0xca, 0xcc, 0xcc);
+/// Muted text, the metadata ink and the frame.
+pub const MUTED: Color = Color::Rgb(0x90, 0x92, 0x92);
+/// The cursor row of a list the keyboard has left.
+pub const SELECTED: Color = Color::Rgb(0x31, 0x34, 0x36);
+/// The cursor row of the list the keyboard is in.
+pub const CURSOR: Color = Color::Rgb(0x31, 0x34, 0x36);
+/// A marked row.
+pub const MARKED: Color = Color::Rgb(0x51, 0x54, 0x55);
+/// The current tab, and the menu's cursor row.
+pub const TAB: Color = Color::Rgb(0x1f, 0x22, 0x24);
+/// Behind a match.
+#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+pub const MATCH: Color = Color::Rgb(0x2a, 0x2d, 0x2f);
+/// The rules and the lines between panes.
+pub const BORDER: Color = Color::Rgb(0x26, 0x29, 0x2b);
+/// The rule inside a card.
+pub const CARD_RULE: Color = Color::Rgb(0x43, 0x46, 0x47);
+/// Behind a card's default button.
+pub const WASH: Color = Color::Rgb(0x2a, 0x2d, 0x2f);
+/// Behind a prompt's field.
+pub const FIELD: Color = Color::Rgb(0x1d, 0x20, 0x22);
+/// Behind the selected part of a field.
+#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+pub const FIELD_SELECTION: Color = Color::Rgb(0x47, 0x49, 0x4b);
+/// A file's extension.
+#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+pub const EXTENSION: Color = Color::Rgb(0x90, 0x92, 0x92);
+pub const ERROR: Color = Color::Rgb(0xb0, 0x69, 0x69);
+/// What can't be used right now.
+#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+pub const UNAVAILABLE: Color = Color::Rgb(0x68, 0x42, 0x43);
+pub const SYMLINK: Color = Color::Rgb(0x94, 0xe2, 0xd5);
+pub const EXECUTABLE: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
+/// Text behind a card.
+#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+pub const DIMMED: Color = Color::Rgb(0x6d, 0x70, 0x70);
+/// Without a theme the accent is the foreground itself.
+pub const ACCENT: Color = FOREGROUND;
 
-/// Secondary text: the foreground mixed halfway into the background.
-pub const DIM: Color = Color::Rgb(0x7c, 0x7c, 0x83);
-/// Separators and section labels.
-pub const FAINT: Color = Color::Rgb(0x4a, 0x4a, 0x52);
-/// Hairlines between panels.
-pub const RULE: Color = Color::Rgb(0x2c, 0x2c, 0x33);
-/// The accent mixed into the background, behind the selected item.
-pub const SELECTION: Color = Color::Rgb(0x3e, 0x37, 0x17);
-/// Text on top of the accent.
-pub const ON_ACCENT: Color = Color::Rgb(0x11, 0x11, 0x14);
+/// How many colours the terminal can show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Depth {
+    /// `NO_COLOR`: no colour at all.
+    Mono,
+    /// The sixteen basic colours, the last resort.
+    Sixteen,
+    /// The 256-colour palette.
+    Indexed,
+    #[default]
+    Truecolor,
+}
+
+impl Depth {
+    /// The one place the depth is decided, from the environment: `NO_COLOR`
+    /// set and not empty asks for none; `COLORTERM` says when the terminal
+    /// takes any colour; a terminal type known for sixteen gets those; any
+    /// other gets the 256-colour palette.
+    pub fn from_env(
+        no_color: Option<&OsStr>,
+        colorterm: Option<&OsStr>,
+        term: Option<&OsStr>,
+    ) -> Self {
+        if no_color.is_some_and(|value| !value.is_empty()) {
+            return Depth::Mono;
+        }
+        if matches!(said(colorterm), "truecolor" | "24bit") {
+            return Depth::Truecolor;
+        }
+        match said(term) {
+            "dumb" | "linux" | "ansi" | "vt100" | "vt220" => Depth::Sixteen,
+            _ => Depth::Indexed,
+        }
+    }
+
+    /// What this process's environment asks for.
+    pub fn detect() -> Self {
+        let var = std::env::var_os;
+        Self::from_env(
+            var("NO_COLOR").as_deref(),
+            var("COLORTERM").as_deref(),
+            var("TERM").as_deref(),
+        )
+    }
+
+    /// Without a fill to tell it apart, the cursor row is reverse video.
+    pub fn reverses(self) -> bool {
+        matches!(self, Depth::Mono | Depth::Sixteen)
+    }
+}
+
+/// What an environment variable says, as text; nothing when it isn't.
+fn said(value: Option<&OsStr>) -> &str {
+    value.and_then(OsStr::to_str).unwrap_or_default()
+}
+
+thread_local! {
+    /// The depth the frame being drawn uses. Drawing sets it from the app.
+    static DEPTH: Cell<Depth> = const { Cell::new(Depth::Truecolor) };
+}
+
+pub fn set_depth(depth: Depth) {
+    DEPTH.with(|cell| cell.set(depth));
+}
+
+pub fn depth() -> Depth {
+    DEPTH.with(Cell::get)
+}
+
+/// A palette colour as the terminal can show it: itself in truecolor, the
+/// nearest of 256 or of 16, or nothing at all without colour.
+pub fn ink(color: Color) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    match depth() {
+        Depth::Truecolor => color,
+        Depth::Indexed => Color::Indexed(nearest([r, g, b], 16..=255)),
+        Depth::Sixteen => basic(nearest([r, g, b], 0..=15)),
+        Depth::Mono => Color::Reset,
+    }
+}
+
+/// The palette index nearest a colour, among `range`.
+fn nearest(rgb: [u8; 3], range: RangeInclusive<u8>) -> u8 {
+    let distance = |index: &u8| {
+        let candidate = indexed(*index);
+        rgb.iter()
+            .zip(candidate)
+            .map(|(a, b)| (i32::from(*a) - b).pow(2))
+            .sum::<i32>()
+    };
+    range.min_by_key(distance).unwrap_or(7)
+}
+
+/// The colour a 256-colour palette index stands for.
+fn indexed(index: u8) -> [i32; 3] {
+    const BASIC: [[i32; 3]; 16] = [
+        [0, 0, 0],
+        [128, 0, 0],
+        [0, 128, 0],
+        [128, 128, 0],
+        [0, 0, 128],
+        [128, 0, 128],
+        [0, 128, 128],
+        [192, 192, 192],
+        [128, 128, 128],
+        [255, 0, 0],
+        [0, 255, 0],
+        [255, 255, 0],
+        [0, 0, 255],
+        [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 255],
+    ];
+    let index = usize::from(index);
+    if index < 16 {
+        BASIC[index]
+    } else if index < 232 {
+        let n = index - 16;
+        let level = |c: usize| if c == 0 { 0 } else { 55 + c as i32 * 40 };
+        [level(n / 36), level(n / 6 % 6), level(n % 6)]
+    } else {
+        [8 + (index as i32 - 232) * 10; 3]
+    }
+}
+
+fn basic(index: u8) -> Color {
+    const NAMED: [Color; 16] = [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ];
+    NAMED[usize::from(index) % 16]
+}
+
+/// Text in a colour of the palette.
+pub fn fg(color: Color) -> Style {
+    Style::new().fg(ink(color))
+}
+
+/// A fill of the palette behind text in another.
+pub fn on(color: Color, fill: Color) -> Style {
+    fg(color).bg(ink(fill))
+}
 
 pub fn base() -> Style {
-    Style::new().fg(FOREGROUND).bg(BACKGROUND)
+    fg(FOREGROUND)
 }
 
-pub fn dim() -> Style {
-    Style::new().fg(DIM)
-}
-
-pub fn faint() -> Style {
-    Style::new().fg(FAINT)
-}
-
-pub fn bright() -> Style {
-    Style::new().fg(BRIGHT_FOREGROUND)
+/// Muted text and the metadata ink.
+pub fn muted() -> Style {
+    fg(MUTED)
 }
 
 pub fn title() -> Style {
-    bright().add_modifier(Modifier::BOLD)
+    base().add_modifier(Modifier::BOLD)
 }
 
-pub fn accent() -> Style {
-    Style::new().fg(ACCENT)
+/// The rules and the lines between panes.
+pub fn border() -> Style {
+    fg(BORDER)
 }
 
-pub fn rule() -> Style {
-    Style::new().fg(RULE)
-}
-
-/// The selected item where the keyboard is.
-pub fn selected() -> Style {
-    Style::new().fg(ACCENT).bg(SELECTION)
-}
-
-/// The selected item in a pane the keyboard has left.
-pub fn selected_inactive() -> Style {
-    Style::new().fg(BRIGHT_FOREGROUND).bg(LIGHTER_BACKGROUND)
-}
-
-/// The selected tile's frame and name: the selection's color with nothing behind it.
-pub fn selected_tile(focused: bool) -> Style {
-    if focused { accent() } else { bright() }
-}
-
-/// A folder card or a file's stand-in box, and the dim marks on it.
-pub fn card() -> Style {
-    Style::new().fg(DIM).bg(LIGHTER_BACKGROUND)
-}
-
-/// The tab on top of a folder card, drawn with half blocks.
-pub fn card_tab() -> Style {
-    Style::new().fg(LIGHTER_BACKGROUND)
-}
-
-pub fn button() -> Style {
-    Style::new()
-        .fg(ON_ACCENT)
-        .bg(ACCENT)
-        .add_modifier(Modifier::BOLD)
+/// The frame and rules of a card or the menu.
+pub fn card_rule() -> Style {
+    fg(CARD_RULE)
 }
 
 pub fn error() -> Style {
-    Style::new().fg(RED).bg(LIGHTER_BACKGROUND)
+    fg(ERROR)
 }
 
-pub fn notice() -> Style {
-    Style::new().fg(FOREGROUND).bg(LIGHTER_BACKGROUND)
-}
-
-/// The band that says what file work is under way.
-pub fn working() -> Style {
-    Style::new().fg(ACCENT).bg(LIGHTER_BACKGROUND)
-}
-
-/// A dialog's panel, like the shortcuts': the darkest background.
-pub fn panel() -> Style {
-    Style::new().fg(FOREGROUND).bg(DARK_BACKGROUND)
-}
-
-/// The text being typed in a dialog.
+/// What is being typed in a field.
 pub fn field() -> Style {
-    Style::new().fg(BRIGHT_FOREGROUND).bg(LIGHTER_BACKGROUND)
+    on(FOREGROUND, FIELD)
 }
 
-/// A field in the top bar: the accent while it has the keyboard.
-pub fn bar_field(typing: bool) -> Style {
-    let fg = if typing { ACCENT } else { FOREGROUND };
-    Style::new().fg(fg).bg(LIGHTER_BACKGROUND)
-}
-
-/// A line of the menu: the one the keyboard is on in the selection's
-/// colors, and one that can't be used right now dim.
+/// A line of the menu: the one the keyboard is on on the tab fill, and one
+/// that can't be used right now muted.
 pub fn menu_item(lit: bool, enabled: bool) -> Style {
-    let style = if lit { selected() } else { panel() };
-    if enabled { style } else { style.fg(DIM) }
+    let ink = if enabled { FOREGROUND } else { MUTED };
+    let style = if lit { on(ink, TAB) } else { fg(ink) };
+    style.add_modifier(cursor_modifier(lit))
 }
 
-/// A choice in a dialog: the lit one is what Enter takes.
+/// A choice in a dialog: the lit one, which Enter takes, on the wash.
 pub fn choice(lit: bool) -> Style {
-    if lit { button() } else { notice() }
+    if lit {
+        on(FOREGROUND, WASH)
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(cursor_modifier(true))
+    } else {
+        muted()
+    }
+}
+
+/// What stands in for a fill the depth can't show: reverse video on the
+/// cursor row.
+pub fn cursor_modifier(cursor: bool) -> Modifier {
+    if cursor && depth().reverses() {
+        Modifier::REVERSED
+    } else {
+        Modifier::empty()
+    }
+}
+
+/// A row of a list behind its text: the cursor's fill where the keyboard
+/// is, the selected fill where it isn't, the marked fill, or none. Without
+/// fills the cursor row is reverse video, and without colour a marked row
+/// is underlined.
+pub fn row_fill(cursor: bool, focused: bool, marked: bool) -> Style {
+    let style = Style::new().add_modifier(cursor_modifier(cursor));
+    if depth().reverses() {
+        if marked && !cursor && depth() == Depth::Mono {
+            return style.add_modifier(Modifier::UNDERLINED);
+        }
+        if cursor {
+            return style;
+        }
+    }
+    match (cursor, focused, marked) {
+        (true, true, _) => style.bg(ink(CURSOR)),
+        (true, false, _) => style.bg(ink(SELECTED)),
+        (false, _, true) => style.bg(ink(MARKED)),
+        _ => style,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_depth_follows_no_color_then_colorterm_then_the_terminal_type() {
+        let os = |text: &'static str| Some(OsStr::new(text));
+        assert_eq!(Depth::from_env(os("1"), os("truecolor"), None), Depth::Mono);
+        // Set but empty asks for nothing.
+        assert_eq!(
+            Depth::from_env(os(""), os("truecolor"), None),
+            Depth::Truecolor
+        );
+        assert_eq!(Depth::from_env(None, os("24bit"), None), Depth::Truecolor);
+        assert_eq!(
+            Depth::from_env(None, None, os("xterm-256color")),
+            Depth::Indexed
+        );
+        assert_eq!(Depth::from_env(None, os("yes"), None), Depth::Indexed);
+        assert_eq!(Depth::from_env(None, None, os("linux")), Depth::Sixteen);
+        assert!(Depth::Mono.reverses() && Depth::Sixteen.reverses());
+        assert!(!Depth::Indexed.reverses() && !Depth::Truecolor.reverses());
+    }
+
+    #[test]
+    fn the_256_colour_palette_takes_the_nearest_index() {
+        set_depth(Depth::Indexed);
+        for (color, index) in [
+            (FOREGROUND, 252),
+            (MUTED, 246),
+            (SELECTED, 236),
+            (CURSOR, 236),
+            (MATCH, 236),
+            (MARKED, 240),
+            (TAB, 235),
+            (BORDER, 235),
+            (CARD_RULE, 238),
+            (FIELD, 234),
+            (SYMLINK, 116),
+            (EXECUTABLE, 151),
+            (ERROR, 131),
+        ] {
+            assert_eq!(ink(color), Color::Indexed(index), "{color:?}");
+        }
+    }
+
+    #[test]
+    fn truecolor_keeps_the_palette_and_mono_drops_every_colour() {
+        set_depth(Depth::Truecolor);
+        assert_eq!(ink(FOREGROUND), Color::Rgb(0xca, 0xcc, 0xcc));
+        assert_eq!(base().fg, Some(FOREGROUND));
+        assert_eq!(base().bg, None, "the terminal's own background");
+        set_depth(Depth::Mono);
+        assert_eq!(ink(FOREGROUND), Color::Reset);
+        assert_eq!(ink(ERROR), Color::Reset);
+        set_depth(Depth::Sixteen);
+        assert_eq!(ink(FOREGROUND), Color::Gray);
+    }
+
+    #[test]
+    fn rows_fill_by_cursor_focus_and_mark_or_fall_back_to_attributes() {
+        set_depth(Depth::Truecolor);
+        assert_eq!(row_fill(true, true, false).bg, Some(CURSOR));
+        assert_eq!(row_fill(true, false, true).bg, Some(SELECTED));
+        assert_eq!(row_fill(false, true, true).bg, Some(MARKED));
+        assert_eq!(row_fill(false, true, false), Style::new());
+
+        set_depth(Depth::Mono);
+        let cursor = row_fill(true, true, false);
+        assert_eq!(cursor.bg, None);
+        assert!(cursor.add_modifier.contains(Modifier::REVERSED));
+        let marked = row_fill(false, true, true);
+        assert!(marked.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(marked.bg, None);
+
+        set_depth(Depth::Sixteen);
+        assert!(
+            row_fill(true, false, false)
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(row_fill(false, true, true).bg, Some(Color::DarkGray));
+    }
 }

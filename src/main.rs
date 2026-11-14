@@ -1,4 +1,4 @@
-//! FileFinder: a keyboard-first terminal file manager for macOS, after Omarchy's folio.
+//! FileFinder: a keyboard-first terminal file manager for macOS, after flea.
 
 mod app;
 mod format;
@@ -6,7 +6,6 @@ mod icons;
 mod input;
 mod model;
 mod ops;
-mod places;
 mod search;
 mod state;
 mod system;
@@ -31,6 +30,7 @@ use ratatui_image::picker::Picker;
 use app::{App, Config};
 use format::DateStyle;
 use system::MacSystem;
+use theme::Depth;
 use thumbs::{MacThumbnailer, Thumbs};
 
 fn main() -> io::Result<()> {
@@ -50,12 +50,12 @@ fn main() -> io::Result<()> {
         state_dir: Some(home.join(".config/filefinder-tui")),
         thumbs: Some(Thumbs::new(picker, Arc::new(thumbnailer))),
         trash_dir: home.join(".Trash"),
-        volumes_dir: PathBuf::from("/Volumes"),
         home: home.clone(),
         start,
         date_style: DateStyle::from_env(),
+        depth: Depth::detect(),
     };
-    let mut app = App::new(config, Box::new(MacSystem::new(&home)));
+    let mut app = App::new(config, Box::new(MacSystem::new()));
     // Tells Ctrl+I from Tab and Ctrl+Shift+N from Ctrl+N, where the terminal can.
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     if enhanced {

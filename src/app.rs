@@ -1,6 +1,6 @@
 //! Application state and what each key does to it.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -18,10 +18,10 @@ use crate::format::DateStyle;
 use crate::input::Input;
 use crate::model::{self, Entry, SortMode};
 use crate::ops::{self, Change, History, Kind, Report, Step};
-use crate::places::{self, Place, PlaceKind, Section};
 use crate::search::Walk;
 use crate::state::{self, Saved, Trashed};
-use crate::system::System;
+use crate::system::{System, Volume};
+use crate::theme::Depth;
 use crate::thumbs::{Facts, Thumbs};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,18 +55,33 @@ impl TileSize {
     }
 }
 
+/// Where the keyboard is: in a pane's list, or in the preview pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
-    Sidebar,
-    Files,
-    Details,
+    List,
+    Preview,
 }
 
+/// What the footer says for a while.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub text: String,
     pub is_error: bool,
+    /// After a change undo can take back: the footer says so.
+    pub undoable: bool,
+    /// When it was said, and how long it stays.
+    pub at: Instant,
+    pub lasts: Duration,
 }
+
+/// How long a notice stays in the footer.
+const NOTICE_LASTS: Duration = Duration::from_secs(4);
+/// How long an error, and a receipt for what undo can take back, stay.
+const RECEIPT_LASTS: Duration = Duration::from_secs(8);
+/// How often the caption of an empty folder changes.
+const CAPTION_EVERY: Duration = Duration::from_millis(2800);
+/// How many captions an empty folder goes round.
+pub const CAPTIONS: usize = 3;
 
 /// A question in front of the window. While one is open every key goes to it.
 pub enum Dialog {
@@ -95,15 +110,12 @@ pub enum Action {
     PasteInto,
     CopyPath,
     Compress,
-    Pin,
     Terminal,
     Trash,
     Delete,
     NewFolder,
     Restore,
     EmptyTrash,
-    OpenPlace,
-    Unpin,
     /// Open Terminal Here, in the menu for the folder itself.
     TerminalHere,
 }
@@ -120,8 +132,8 @@ pub enum MenuRow {
     Separator,
 }
 
-/// The menu for the selection, or for a place in the sidebar. While it is
-/// open every key goes to it.
+/// The menu for the selection, or for the folder. While it is open every
+/// key goes to it.
 pub struct Menu {
     pub rows: Vec<MenuRow>,
     /// The line the keyboard is on: never a hairline.
@@ -188,7 +200,7 @@ fn item_if(enabled: bool, label: &'static str, action: Action) -> MenuRow {
     }
 }
 
-/// A field in the top bar. While one has the keyboard every key goes to it.
+/// A field in the header. While one has the keyboard every key goes to it.
 pub enum Field {
     /// Ctrl+L: a path to go to.
     Path(Input),
@@ -199,17 +211,10 @@ pub enum Field {
 /// What a part of the window stands for, as the last frame drew it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Spot {
-    /// The sidebar, wherever no place is.
-    Sidebar,
-    /// A place in the sidebar, by its number among them all.
-    Place(usize),
     /// A pane's files, wherever no item is.
     Pane(usize),
     /// An item of a pane: a row of the list or of its own column, or a tile.
-    Item {
-        pane: usize,
-        index: usize,
-    },
+    Item { pane: usize, index: usize },
     /// A row of a folder above the pane's own in the columns view: item
     /// `index` of `ancestors[depth]`.
     Above {
@@ -218,18 +223,15 @@ pub enum Spot {
         index: usize,
     },
     /// A breadcrumb, and the folder it stands for.
-    Crumb {
-        pane: usize,
-        path: PathBuf,
-    },
+    Crumb { pane: usize, path: PathBuf },
     /// The path field, Ctrl+L.
     PathField,
     /// The search field, `/`.
     SearchField,
-    Toggle(Toggle),
-    /// The details pane, wherever its Open button isn't.
-    Details,
-    OpenButton,
+    /// A row of the parent folder's listing, left of the list.
+    Parent(usize),
+    /// The preview pane.
+    Preview,
     /// The menu, wherever no line is.
     Menu,
     /// A line of the menu, by its number among its rows.
@@ -242,16 +244,6 @@ pub enum Spot {
     Help,
 }
 
-/// The switches at the right end of the top bar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Toggle {
-    View,
-    Sort,
-    Hidden,
-    Split,
-    Details,
-}
-
 /// Where the last frame drew what a click can land on. Drawing writes it;
 /// the mouse reads it and nothing else, so a click lands on what was on
 /// screen under it.
@@ -259,8 +251,6 @@ pub enum Toggle {
 pub struct HitMap {
     /// In the order drawn: a later one is on top of an earlier one.
     spots: Vec<(Rect, Spot)>,
-    /// The sidebar's lines, the ones scrolled out of sight included.
-    pub sidebar_lines: usize,
 }
 
 impl HitMap {
@@ -286,8 +276,8 @@ impl HitMap {
 /// How soon a second click on the same item makes it a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
-/// Rows of a list, or lines of the sidebar or the shortcuts, that one turn
-/// of the wheel scrolls; the grid scrolls by one row of tiles.
+/// Rows of a list, of the preview or of the shortcuts, that one turn of the
+/// wheel scrolls; the grid scrolls by one row of tiles.
 const WHEEL_ROWS: usize = 3;
 
 /// A left click on an item, for telling a double click.
@@ -301,9 +291,6 @@ struct Click {
 pub enum Listing {
     /// The items of the folder at `cwd`.
     Folder,
-    /// The files used lately, in place of a folder's. `cwd` is the home
-    /// folder meanwhile: that is where "up" leads from there.
-    Recents,
     /// What a search at and below `cwd` found, or what was there before
     /// while nothing is typed.
     Search(Search),
@@ -336,7 +323,7 @@ struct Clipboard {
 
 /// File work under way on a thread of its own.
 struct Work {
-    /// What the band says meanwhile.
+    /// What the footer says meanwhile.
     label: String,
     cancel: Arc<AtomicBool>,
     results: Receiver<Report>,
@@ -349,9 +336,6 @@ impl Drop for Work {
     }
 }
 
-/// How many of the files used lately Recents lists.
-const RECENTS_LIMIT: usize = 200;
-
 /// What is said when macOS keeps the terminal out of the trash.
 const TRASH_REFUSED: &str = "Trash: Permission was refused. Give your terminal \
                              Full Disk Access in System Settings to see it.";
@@ -361,8 +345,6 @@ const TRASH_REFUSED: &str = "Trash: Permission was refused. Give your terminal \
 struct Visit {
     path: PathBuf,
     selected: Option<String>,
-    /// It was Recents that was showing, not the folder.
-    recents: bool,
 }
 
 /// Where a pane was before it was listed again behind its back: what to
@@ -398,6 +380,9 @@ pub struct Pane {
     /// The folders from home (or `/`) down to this one's parent. Only the columns
     /// view needs them, so they are listed when a folder is shown in that view.
     pub ancestors: Vec<Ancestor>,
+    /// The parent folder's items, which the list view shows on its left;
+    /// none at `/`, and none in the other views.
+    pub parent: Vec<Entry>,
     /// Rows the pane's view showed last time, for Page Up and Page Down.
     pub page_rows: usize,
     /// Tiles across the pane's grid last time, for Up and Down.
@@ -417,6 +402,7 @@ impl Pane {
             anchor: None,
             offset: 0,
             ancestors: Vec::new(),
+            parent: Vec::new(),
             page_rows: 10,
             grid_columns: 1,
             back: Vec::new(),
@@ -427,6 +413,11 @@ impl Pane {
     /// The item under the cursor: the one Enter opens and the details show.
     pub fn selected(&self) -> Option<&Entry> {
         self.entries.get(self.cursor)
+    }
+
+    /// Whether an item is marked: one of several selected together.
+    pub fn is_marked(&self, index: usize) -> bool {
+        self.marks.contains(&index)
     }
 
     /// Whether an item is selected: the one under the cursor, or each of
@@ -499,13 +490,9 @@ impl Pane {
     }
 
     /// Whether the pane lists a folder's own items. Only there can things
-    /// be pasted or made, and only that can be pinned.
+    /// be pasted or made.
     pub fn is_folder(&self) -> bool {
         matches!(self.listing, Listing::Folder)
-    }
-
-    pub fn recents(&self) -> bool {
-        matches!(self.listing, Listing::Recents)
     }
 
     /// The search that is open in the pane.
@@ -538,10 +525,9 @@ impl Pane {
             // What a search found is no place to come back to: the folder
             // it looked in is, as it was.
             Listing::Search(search) => search.origin.clone(),
-            listing => Visit {
+            Listing::Folder => Visit {
                 path: self.cwd.clone(),
                 selected: self.selected().map(|entry| entry.name.clone()),
-                recents: matches!(listing, Listing::Recents),
             },
         }
     }
@@ -679,15 +665,15 @@ pub struct Config {
     /// A folder to open, or a file to select in its folder.
     pub start: PathBuf,
     pub date_style: DateStyle,
-    /// Where the view, the tile size and the pinned folders are remembered;
+    /// Where the view, the tile size and the preview are remembered;
     /// `None` remembers nothing.
     pub state_dir: Option<PathBuf>,
     /// What makes the thumbnails; `None` leaves every file its stand-in.
     pub thumbs: Option<Thumbs>,
     /// Where Delete moves things: the trash folder.
     pub trash_dir: PathBuf,
-    /// Where drives are mounted.
-    pub volumes_dir: PathBuf,
+    /// How many colours the terminal shows.
+    pub depth: Depth,
 }
 
 pub struct App {
@@ -699,9 +685,16 @@ pub struct App {
     pub tile: TileSize,
     pub sort: SortMode,
     pub show_hidden: bool,
-    pub details_visible: bool,
-    pub sidebar: Vec<Section>,
-    pub sidebar_cursor: usize,
+    /// Whether the preview pane shows beside the list: Alt+P.
+    pub preview_visible: bool,
+    /// How many rows of the preview's body are scrolled away.
+    pub preview_scroll: usize,
+    /// Rows of the preview's body shown last time, for paging it.
+    pub preview_rows: usize,
+    /// The item the preview was last about, to scroll back to the top for another.
+    previewed: Option<PathBuf>,
+    /// How many colours the terminal shows.
+    pub depth: Depth,
     pub help_visible: bool,
     /// How many lines the shortcuts are scrolled down; drawing keeps it in range.
     pub help_scroll: usize,
@@ -710,31 +703,31 @@ pub struct App {
     pub dialog: Option<Dialog>,
     /// The menu that is open: Alt+Enter.
     pub menu: Option<Menu>,
-    /// The field in the top bar that has the keyboard.
+    /// The field in the header that has the keyboard.
     pub field: Option<Field>,
     pub message: Option<Message>,
+    /// Which caption an empty folder shows; `tick` moves it on.
+    pub caption: usize,
+    /// Since when the active pane has shown an empty folder.
+    empty_since: Option<Instant>,
+    /// The volume each folder the footer named is on, asked once.
+    volumes: HashMap<PathBuf, Option<Volume>>,
     pub should_quit: bool,
     pub date_style: DateStyle,
     pub thumbs: Option<Thumbs>,
-    /// What was read about the selected item for the details pane.
+    /// What was read about the selected item for the preview pane.
     pub facts: Option<Facts>,
     clipboard: Option<Clipboard>,
     history: History,
     work: Option<Work>,
-    /// Every pinned folder, the ones that are gone included: they keep their
-    /// line in the file and are only left out of the sidebar.
-    pins: Vec<PathBuf>,
     /// Where what this app moved to the trash came from, and when: one
     /// record for each item, as long as it is there.
     trashed: Vec<Trashed>,
     trash_dir: PathBuf,
-    volumes_dir: PathBuf,
     state_dir: Option<PathBuf>,
     system: Box<dyn System>,
     /// Where the last frame drew what a click can land on.
     pub hits: HitMap,
-    /// Lines of the sidebar the wheel scrolled away; drawing keeps it in range.
-    pub sidebar_scroll: usize,
     /// The last left click on an item, for telling a double click.
     last_click: Option<Click>,
     /// What time it is: the real clock, or a test's.
@@ -748,28 +741,25 @@ impl App {
             .as_deref()
             .map(state::load)
             .unwrap_or_default();
-        let pins = config
-            .state_dir
-            .as_deref()
-            .map(state::load_pins)
-            .unwrap_or_default();
         let trashed = config
             .state_dir
             .as_deref()
             .map(state::load_trashed)
             .unwrap_or_default();
         let mut app = Self {
-            sidebar: Vec::new(),
             panes: vec![Pane::new(config.home.clone(), Vec::new())],
             home: config.home,
             active: 0,
-            focus: Focus::Files,
+            focus: Focus::List,
             view: saved.view,
             tile: saved.tile,
             sort: SortMode::Name,
             show_hidden: false,
-            details_visible: true,
-            sidebar_cursor: 0,
+            preview_visible: saved.preview,
+            preview_scroll: 0,
+            preview_rows: 1,
+            previewed: None,
+            depth: config.depth,
             help_visible: false,
             help_scroll: 0,
             help_rows: 1,
@@ -777,6 +767,9 @@ impl App {
             menu: None,
             field: None,
             message: None,
+            caption: 0,
+            empty_since: None,
+            volumes: HashMap::new(),
             should_quit: false,
             date_style: config.date_style,
             thumbs: config.thumbs,
@@ -784,18 +777,14 @@ impl App {
             clipboard: None,
             history: History::default(),
             work: None,
-            pins,
             trashed,
             trash_dir: config.trash_dir,
-            volumes_dir: config.volumes_dir,
             state_dir: config.state_dir,
             system,
             hits: HitMap::default(),
-            sidebar_scroll: 0,
             last_click: None,
             clock: Box::new(Instant::now),
         };
-        app.rebuild_sidebar();
         let (folder, select) = if config.start.is_dir() {
             (config.start, None)
         } else {
@@ -831,45 +820,30 @@ impl App {
         self.pane().selected()
     }
 
-    pub fn places(&self) -> impl Iterator<Item = &Place> {
-        self.sidebar
-            .iter()
-            .flat_map(|section| section.places.iter())
-    }
-
-    /// The sidebar place the active pane is in: Recents while it shows them,
-    /// and otherwise the deepest place holding its folder.
-    pub fn current_place(&self) -> Option<usize> {
-        let pane = self.pane();
-        let recents = |place: &Place| place.kind == PlaceKind::Recents;
-        if pane.recents() {
-            return self.places().position(recents);
-        }
-        self.places()
-            .enumerate()
-            .filter(|(_, place)| !recents(place) && pane.cwd.starts_with(&place.path))
-            .max_by_key(|(_, place)| place.path.components().count())
-            .map(|(index, _)| index)
-    }
-
-    /// Reads the sidebar's places again. Done at the start, on F5, when a pin
-    /// changes and as the keyboard moves into it; never while drawing.
-    fn rebuild_sidebar(&mut self) {
-        self.sidebar = places::sections(&self.home, &self.pins, &self.trash_dir, &self.volumes_dir);
-        let last = self.places().count().saturating_sub(1);
-        self.sidebar_cursor = self.sidebar_cursor.min(last);
-    }
-
-    /// What the file work under way is doing, in the band's words.
+    /// What the file work under way is doing, in the footer's words.
     pub fn working(&self) -> Option<&str> {
         self.work.as_ref().map(|work| work.label.as_str())
     }
 
+    /// Whether the list view shows the parent folder and the preview beside
+    /// a single pane.
+    pub fn shows_preview(&self) -> bool {
+        self.preview_visible && self.view == ViewMode::List && self.panes.len() == 1
+    }
+
+    /// The volume the active pane's folder is on, as `tick` last asked.
+    pub fn volume(&self) -> Option<&Volume> {
+        self.volumes.get(&self.pane().cwd)?.as_ref()
+    }
+
     /// What every turn of the event loop does besides keys: takes in the file
     /// work that finished, what a search found and the thumbnails made since
-    /// the last one, and reads what the details pane says about a newly
-    /// selected item, so that drawing never has to.
+    /// the last one, reads what the preview shows of a newly selected item
+    /// and the volume of a newly shown folder, lets what the footer says go
+    /// when its time is up and moves an empty folder's caption on, so that
+    /// drawing never has to.
     pub fn tick(&mut self) {
+        let now = (self.clock)();
         self.collect_work();
         for pane in &mut self.panes {
             pane.collect_found();
@@ -877,14 +851,58 @@ impl App {
         if let Some(thumbs) = &mut self.thumbs {
             thumbs.collect();
         }
+        let (hidden, sort) = (self.show_hidden, self.sort);
         let selected = self.panes[self.active].selected();
         let current = match (&self.facts, selected) {
-            (Some(facts), Some(entry)) => facts.describes(entry),
+            (Some(facts), Some(entry)) => facts.describes(entry, hidden, sort),
             (None, None) => true,
             _ => false,
         };
         if !current {
-            self.facts = selected.map(Facts::read);
+            self.facts = selected.map(|entry| Facts::read(entry, hidden, sort));
+        }
+        // Another item: its preview starts at the top.
+        let under_cursor = selected.map(|entry| entry.path.clone());
+        if under_cursor != self.previewed {
+            self.previewed = under_cursor;
+            self.preview_scroll = 0;
+        }
+        // The folders the preview shows on screen are counted here, not
+        // while drawing.
+        if let Some(Some(Ok(children))) = self.facts.as_ref().map(|facts| facts.children.as_ref()) {
+            let shown = children
+                .iter()
+                .skip(self.preview_scroll)
+                .take(self.preview_rows);
+            shown.for_each(|child| {
+                child.item_count();
+            });
+        }
+        let folder = self.pane().cwd.clone();
+        if !self.volumes.contains_key(&folder) {
+            let volume = self.system.volume(&folder);
+            self.volumes.insert(folder, volume);
+        }
+        if let Some(message) = &self.message
+            && now.saturating_duration_since(message.at) >= message.lasts
+        {
+            self.message = None;
+        }
+        let empty = self.pane().entries.is_empty() && self.pane().is_folder();
+        match (empty, self.empty_since) {
+            (false, _) => {
+                self.empty_since = None;
+                self.caption = 0;
+            }
+            (true, None) => {
+                self.empty_since = Some(now);
+                self.caption = 0;
+            }
+            (true, Some(since)) => {
+                let beats =
+                    now.saturating_duration_since(since).as_millis() / CAPTION_EVERY.as_millis();
+                self.caption = (beats % CAPTIONS as u128) as usize;
+            }
         }
     }
 
@@ -969,16 +987,14 @@ impl App {
             KeyCode::Char('2') if ctrl => self.set_view(ViewMode::List),
             KeyCode::Char('3') if ctrl => self.set_view(ViewMode::Columns),
             KeyCode::Char('h') if ctrl => self.toggle_hidden(),
-            KeyCode::Char('i') if ctrl => self.toggle_details(),
-            KeyCode::Char('p') if ctrl => self.toggle_pin(),
+            KeyCode::Char('p' | 'P') if alt => self.toggle_preview(),
             // Ctrl++ is Ctrl+Shift+= on most keyboards; either spelling may arrive.
             KeyCode::Char('=' | '+') if ctrl => self.set_tile(self.tile.bigger()),
             KeyCode::Char('-') if ctrl => self.set_tile(self.tile.smaller()),
             KeyCode::Char('0') if ctrl => self.set_tile(TileSize::Normal),
             _ => match self.focus {
-                Focus::Sidebar => self.sidebar_key(key),
-                Focus::Files => self.files_key(key),
-                Focus::Details => self.details_key(key),
+                Focus::List => self.files_key(key),
+                Focus::Preview => self.preview_key(key),
             },
         }
     }
@@ -1041,17 +1057,13 @@ impl App {
                 self.click_above(pane, depth, index);
             }
             (true, Spot::Pane(pane)) => self.enter_pane(pane),
-            (true, Spot::Place(place)) => {
-                self.sidebar_cursor = place;
-                self.open_place();
-            }
+            (true, Spot::Parent(index)) => self.open_parent_row(index),
+            (true, Spot::Preview) => self.focus_preview(),
             (true, Spot::Crumb { pane, path }) => {
                 self.active = pane.min(self.panes.len() - 1);
                 self.navigate(&path);
             }
             (true, Spot::SearchField) => self.search(),
-            (true, Spot::Toggle(toggle)) => self.flip(toggle),
-            (true, Spot::OpenButton) => self.open_selected(),
             (false, Spot::Item { pane, index }) => {
                 self.enter_pane(pane);
                 let pane = self.pane_mut();
@@ -1074,12 +1086,6 @@ impl App {
             (false, Spot::Pane(pane)) => {
                 self.enter_pane(pane);
                 let groups = self.folder_menu();
-                self.show_menu(groups, Some(at));
-            }
-            (false, Spot::Place(place)) => {
-                self.focus = Focus::Sidebar;
-                self.sidebar_cursor = place;
-                let groups = self.place_menu();
                 self.show_menu(groups, Some(at));
             }
             _ => {}
@@ -1109,7 +1115,7 @@ impl App {
         self.handle_key(KeyEvent::from(KeyCode::Enter));
     }
 
-    /// A click away from the field in the top bar that has the keyboard:
+    /// A click away from the field in the header that has the keyboard:
     /// the path field closes as with Escape, and the search hands the
     /// keyboard to what it found as with Tab.
     fn leave_field(&mut self) {
@@ -1123,8 +1129,30 @@ impl App {
 
     /// The keyboard goes to a pane's files.
     fn enter_pane(&mut self, pane: usize) {
-        self.focus = Focus::Files;
+        self.focus = Focus::List;
         self.active = pane.min(self.panes.len() - 1);
+    }
+
+    /// The keyboard goes to the preview pane, when it shows.
+    fn focus_preview(&mut self) {
+        if self.shows_preview() {
+            self.focus = Focus::Preview;
+        }
+    }
+
+    /// A click on a row of the parent folder's listing: goes into the
+    /// folder it is, or to the parent folder with the file selected.
+    fn open_parent_row(&mut self, index: usize) {
+        self.enter_pane(self.active);
+        let Some(entry) = self.pane().parent.get(index) else {
+            return;
+        };
+        let (path, name, is_dir) = (entry.path.clone(), entry.name.clone(), entry.is_dir);
+        if is_dir {
+            self.navigate(&path);
+        } else if let Some(folder) = path.parent().map(Path::to_path_buf) {
+            self.go_to(&folder, Some(&name));
+        }
     }
 
     /// A left click on an item: the cursor there and only it selected; with
@@ -1188,23 +1216,7 @@ impl App {
         arrived
     }
 
-    /// A click on a switch in the top bar: what its key does. The view goes
-    /// round from the grid to the list to the columns.
-    fn flip(&mut self, toggle: Toggle) {
-        match toggle {
-            Toggle::View => self.set_view(match self.view {
-                ViewMode::Grid => ViewMode::List,
-                ViewMode::List => ViewMode::Columns,
-                ViewMode::Columns => ViewMode::Grid,
-            }),
-            Toggle::Sort => self.set_sort(self.sort.step(1)),
-            Toggle::Hidden => self.toggle_hidden(),
-            Toggle::Split => self.toggle_split(),
-            Toggle::Details => self.toggle_details(),
-        }
-    }
-
-    /// A turn of the wheel over a pane, the sidebar or the shortcuts
+    /// A turn of the wheel over a pane, the preview or the shortcuts
     /// scrolls it; under the menu or a dialog nothing does.
     fn wheel(&mut self, spot: Option<Spot>, down: bool) {
         if self.menu.is_some() || self.dialog.is_some() {
@@ -1232,19 +1244,11 @@ impl App {
                     pane.wheel(down, WHEEL_ROWS, 1);
                 }
             }
-            Some(Spot::Sidebar | Spot::Place(_)) => {
-                let rows = self
-                    .hits
-                    .rect_of(&Spot::Sidebar)
-                    .map_or(0, |rect| rect.height);
-                let most = self.hits.sidebar_lines.saturating_sub(rows as usize);
-                let scroll = self.sidebar_scroll.min(most);
-                self.sidebar_scroll = if down {
-                    (scroll + WHEEL_ROWS).min(most)
-                } else {
-                    scroll.saturating_sub(WHEEL_ROWS)
-                };
-            }
+            Some(Spot::Preview) => self.scroll_preview(if down {
+                WHEEL_ROWS as isize
+            } else {
+                -(WHEEL_ROWS as isize)
+            }),
             _ => {}
         }
     }
@@ -1282,14 +1286,9 @@ impl App {
         true
     }
 
-    /// Alt+Enter: opens the menu for the selection, or for the place under
-    /// the cursor while the keyboard is in the sidebar.
+    /// Alt+Enter: opens the menu for the selection.
     fn open_menu(&mut self) {
-        let groups = if self.focus == Focus::Sidebar {
-            self.place_menu()
-        } else {
-            self.files_menu()
-        };
+        let groups = self.files_menu();
         self.show_menu(groups, None);
     }
 
@@ -1324,20 +1323,9 @@ impl App {
         let together = selection
             .iter()
             .all(|path| path.parent() == selection[0].parent());
-        let (mut paste_into, mut pin) = (None, None);
-        if entry.is_dir {
-            let label = if self.pins.contains(&entry.path) {
-                "Unpin"
-            } else {
-                "Pin"
-            };
-            paste_into = Some(item_if(
-                one && pasting,
-                "Paste Into Folder",
-                Action::PasteInto,
-            ));
-            pin = Some(item_if(one, label, Action::Pin));
-        }
+        let paste_into = entry
+            .is_dir
+            .then(|| item_if(one && pasting, "Paste Into Folder", Action::PasteInto));
         let open = if entry.is_dir { "Open Folder" } else { "Open" };
         let clipboard = [
             Some(item("Copy", Action::Copy)),
@@ -1353,7 +1341,6 @@ impl App {
             ],
             clipboard.into_iter().flatten().collect(),
             vec![item_if(together, "Compress", Action::Compress)],
-            pin.into_iter().collect(),
             vec![item("Open Terminal Here", Action::Terminal)],
             vec![
                 item("Move to Trash", Action::Trash),
@@ -1375,19 +1362,6 @@ impl App {
             item_if(here, "New Folder", Action::NewFolder),
             item_if(here, "Open Terminal Here", Action::TerminalHere),
         ]]
-    }
-
-    /// The menu's lines for the sidebar place the keyboard is on.
-    fn place_menu(&self) -> Vec<Vec<MenuRow>> {
-        let Some(place) = self.places().nth(self.sidebar_cursor) else {
-            return Vec::new();
-        };
-        let more = match place.kind {
-            PlaceKind::Pinned => vec![item("Unpin", Action::Unpin)],
-            PlaceKind::Trash => vec![item("Empty Trash…", Action::EmptyTrash)],
-            _ => Vec::new(),
-        };
-        vec![vec![item("Open", Action::OpenPlace)], more]
     }
 
     /// A key pressed while the menu is open: it goes nowhere else.
@@ -1421,7 +1395,6 @@ impl App {
             Action::PasteInto => self.paste_into_selected(),
             Action::CopyPath => self.copy_path(),
             Action::Compress => self.compress(),
-            Action::Pin => self.pin_selected(),
             Action::Terminal => self.open_terminal(),
             Action::TerminalHere => self.open_terminal_here(),
             Action::Trash => self.trash(),
@@ -1429,8 +1402,6 @@ impl App {
             Action::NewFolder => self.ask_new_folder(),
             Action::Restore => self.restore(),
             Action::EmptyTrash => self.ask_empty_trash(),
-            Action::OpenPlace => self.open_place(),
-            Action::Unpin => self.unpin_place(),
         }
     }
 
@@ -1470,8 +1441,7 @@ impl App {
         self.field = Some(Field::Path(Input::new(&path)));
     }
 
-    /// A path the way the top bar and the details pane spell it: `~` for
-    /// the home folder.
+    /// A path the way the header spells it: `~` for the home folder.
     pub fn shown_path(&self, path: &Path) -> String {
         match path.strip_prefix(&self.home) {
             Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
@@ -1590,7 +1560,7 @@ impl App {
             });
         }
         // Up, Down and Enter act on the files from the field.
-        self.focus = Focus::Files;
+        self.focus = Focus::List;
         self.field = Some(Field::Search);
     }
 
@@ -1677,18 +1647,12 @@ impl App {
     fn answer(&mut self, dialog: Dialog) {
         match dialog {
             Dialog::Rename { path, input } => match ops::rename(&path, &input.text()) {
-                Ok(Some(change)) => {
-                    let (old, new) = (change.name(), input.text());
-                    self.changed(change, format!("Renamed {old} to {}.", new.trim()));
-                }
+                Ok(Some(change)) => self.changed(change, "Renamed".to_string()),
                 Ok(None) => {}
                 Err(error) => self.fail(error.to_string()),
             },
             Dialog::NewFolder { folder, input } => match ops::new_folder(&folder, &input.text()) {
-                Ok(Some(change)) => {
-                    let text = format!("Made {}.", change.name());
-                    self.changed(change, text);
-                }
+                Ok(Some(change)) => self.changed(change, "Folder created".to_string()),
                 Ok(None) => {}
                 Err(error) => self.fail(error.to_string()),
             },
@@ -1870,9 +1834,6 @@ impl App {
     /// What the file commands act on: everything selected in the active
     /// pane. One method for all of them.
     fn selection(&self) -> Vec<PathBuf> {
-        if self.focus == Focus::Sidebar {
-            return Vec::new();
-        }
         let selected = self.pane().selection();
         selected.map(|entry| entry.path.clone()).collect()
     }
@@ -1926,7 +1887,7 @@ impl App {
     /// Copies what was taken into a folder, or moves it there when it was cut.
     fn paste_into(&mut self, folder: PathBuf) {
         let Some(clipboard) = &self.clipboard else {
-            self.note("There's nothing to paste.");
+            self.note("Nothing to paste");
             return;
         };
         let (paths, cut) = (clipboard.paths.clone(), clipboard.cut);
@@ -1959,13 +1920,10 @@ impl App {
         });
     }
 
-    /// Delete: unpins in the sidebar and moves the selection to the trash
-    /// everywhere else, except in the trash itself, where all that is left
-    /// to do with it is to delete it for good.
+    /// Delete: moves the selection to the trash, except in the trash
+    /// itself, where all that is left to do with it is to delete it for good.
     fn delete_key(&mut self) {
-        if self.focus == Focus::Sidebar {
-            self.unpin_place();
-        } else if self.in_trash() {
+        if self.in_trash() {
             self.ask_delete();
         } else {
             self.trash();
@@ -1974,8 +1932,7 @@ impl App {
 
     /// Whether the pane shows the trash, or a folder that is in it.
     fn in_trash(&self) -> bool {
-        let pane = self.pane();
-        !pane.recents() && pane.cwd.starts_with(&self.trash_dir)
+        self.pane().cwd.starts_with(&self.trash_dir)
     }
 
     /// Moves the selection to the trash.
@@ -2070,7 +2027,7 @@ impl App {
             Ok(Some(change)) => {
                 self.keep_trash_records(Some(&change));
                 self.relist(&change.origins(), None);
-                self.note(&told("Undid", &change));
+                self.receipt(format!("Undid {}", undone(&change)), false);
             }
             Ok(None) => self.note("There's nothing to undo."),
             Err(error) => {
@@ -2145,12 +2102,17 @@ impl App {
     /// Takes in what a command over several items did: logs it for undo,
     /// lists the folder again and says how it went.
     fn settle(&mut self, report: Report, neighbour: Option<PathBuf>) {
-        let message = outcome(&report);
+        let (text, is_error) = outcome(&report);
+        let undoable = !is_error && !report.change.steps.is_empty();
         let landed = report.change.landed();
         self.keep_trash_records(Some(&report.change));
         self.history.record(report.change);
         self.relist(&landed, neighbour);
-        self.message = Some(message);
+        if is_error {
+            self.fail(text);
+        } else {
+            self.receipt(text, undoable);
+        }
     }
 
     /// Takes in a change made to one item.
@@ -2158,7 +2120,7 @@ impl App {
         let landed = change.landed();
         self.history.record(change);
         self.relist(&landed, None);
-        self.note(&said);
+        self.receipt(said, true);
     }
 
     /// Lists what the pane shows again and puts the cursor on the first of
@@ -2166,6 +2128,8 @@ impl App {
     /// `neighbour`. The other pane's folder is listed again too, since what
     /// changed may show there, and that pane stays where it was.
     fn relist(&mut self, paths: &[PathBuf], neighbour: Option<PathBuf>) {
+        // The space left may have changed with the files.
+        self.volumes.clear();
         let selected = self.selected().map(|entry| entry.path.clone());
         if self.reload() {
             let wanted = paths.iter().cloned().chain(selected).chain(neighbour);
@@ -2210,14 +2174,14 @@ impl App {
         let shown = self.in_pane(1, |app| app.show_folder(&folder, None));
         if shown {
             self.active = 1;
-            self.focus = Focus::Files;
+            self.focus = Focus::List;
         } else {
             // Why was said; a pane with nothing to show is no use.
             self.panes.pop();
         }
     }
 
-    /// `|` and the split switch in the top bar: two panes, or back to one.
+    /// `|` and Alt+1: two panes, or back to one.
     fn toggle_split(&mut self) {
         if self.panes.len() > 1 {
             self.close_split();
@@ -2231,7 +2195,7 @@ impl App {
         if self.panes.len() > 1 {
             self.panes.truncate(1);
             self.active = 0;
-            self.focus = Focus::Files;
+            self.focus = Focus::List;
         }
     }
 
@@ -2245,11 +2209,14 @@ impl App {
         after.or(before).map(|entry| entry.path.clone())
     }
 
-    /// Escape: stops the file work under way; with none, leaves the search
-    /// that is showing, or dismisses what went wrong. With none of that to
-    /// do, it leaves only the item under the cursor selected.
+    /// Escape: takes the keyboard back from the preview to the list; stops
+    /// the file work under way; with none, leaves the search that is
+    /// showing, or dismisses what went wrong. With none of that to do, it
+    /// leaves only the item under the cursor selected.
     fn escape(&mut self) {
-        if self.work.is_none() && self.pane().search().is_some() {
+        if self.focus == Focus::Preview {
+            self.focus = Focus::List;
+        } else if self.work.is_none() && self.pane().search().is_some() {
             self.leave_search();
         } else if self.work.is_some() || self.message.is_some() {
             self.stop_or_dismiss();
@@ -2320,120 +2287,38 @@ impl App {
         }
     }
 
-    fn sidebar_key(&mut self, key: KeyEvent) {
-        let last = self.places().count().saturating_sub(1);
+    /// Keys while the preview pane has the keyboard: up and down scroll it.
+    fn preview_key(&mut self, key: KeyEvent) {
+        let page = self.preview_rows.max(1) as isize;
         match key.code {
-            KeyCode::Up => self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1),
-            KeyCode::Down => self.sidebar_cursor = (self.sidebar_cursor + 1).min(last),
-            KeyCode::Enter | KeyCode::Right => self.open_place(),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_preview(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_preview(1),
+            KeyCode::PageUp => self.scroll_preview(-page),
+            KeyCode::PageDown => self.scroll_preview(page),
             _ => {}
         }
     }
 
-    /// Enter in the sidebar: goes to the place the keyboard is on, and
-    /// hands the keyboard to the files.
-    fn open_place(&mut self) {
-        let place = self.places().nth(self.sidebar_cursor);
-        let Some((kind, path)) = place.map(|place| (place.kind, place.path.clone())) else {
-            return;
-        };
-        match kind {
-            PlaceKind::Recents => self.open_recents(),
-            _ => self.navigate(&path),
-        }
-        self.focus = Focus::Files;
+    /// Scrolls the preview's body; drawing keeps it in range.
+    fn scroll_preview(&mut self, rows: isize) {
+        self.preview_scroll = self.preview_scroll.saturating_add_signed(rows);
     }
 
-    fn details_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Enter {
-            self.open_selected();
-        }
-    }
-
-    /// Tab and Shift+Tab: the sidebar, each pane in turn, then the details.
-    /// The sidebar and the details go on showing the pane that was active.
+    /// Tab and Shift+Tab: each pane in turn, then the preview when it shows.
     fn move_focus(&mut self, delta: isize) {
-        let mut stops = vec![(Focus::Sidebar, None)];
-        stops.extend((0..self.panes.len()).map(|pane| (Focus::Files, Some(pane))));
-        if self.details_visible {
-            stops.push((Focus::Details, None));
+        let mut stops: Vec<(Focus, Option<usize>)> = (0..self.panes.len())
+            .map(|pane| (Focus::List, Some(pane)))
+            .collect();
+        if self.shows_preview() {
+            stops.push((Focus::Preview, None));
         }
         let here = |(focus, pane): &(Focus, Option<usize>)| {
             *focus == self.focus && pane.is_none_or(|pane| pane == self.active)
         };
-        let index = stops.iter().position(here).unwrap_or(1) as isize;
+        let index = stops.iter().position(here).unwrap_or(0) as isize;
         let (focus, pane) = stops[(index + delta).rem_euclid(stops.len() as isize) as usize];
         self.focus = focus;
         self.active = pane.unwrap_or(self.active);
-        if self.focus == Focus::Sidebar {
-            // A drive plugged in since the last look shows up now.
-            self.rebuild_sidebar();
-            self.sidebar_cursor = self.current_place().unwrap_or(self.sidebar_cursor);
-        }
-    }
-
-    /// Ctrl+P: pins the pane's folder to the sidebar, or unpins it.
-    fn toggle_pin(&mut self) {
-        if !self.pane().is_folder() {
-            self.note("Only folders can be pinned.");
-            return;
-        }
-        let folder = self.pane().cwd.clone();
-        self.toggle_pin_of(folder);
-    }
-
-    /// Pin, in the menu: Ctrl+P with the folder under the cursor in place
-    /// of the one that is showing.
-    fn pin_selected(&mut self) {
-        let folder = self.selected().filter(|entry| entry.is_dir);
-        if let Some(folder) = folder.map(|entry| entry.path.clone()) {
-            self.toggle_pin_of(folder);
-        }
-    }
-
-    /// Pins a folder to the sidebar, or unpins it when it is pinned.
-    fn toggle_pin_of(&mut self, folder: PathBuf) {
-        // What Home lists is read again, so a folder made since counts.
-        self.rebuild_sidebar();
-        let name = places::label(&folder);
-        let mut pins = self.pins.clone();
-        let under_home = |place: &Place| place.kind == PlaceKind::Home && place.path == folder;
-        if let Some(index) = pins.iter().position(|pin| *pin == folder) {
-            pins.remove(index);
-        } else if self.places().any(under_home) {
-            self.note(&format!("{name} is already under Home."));
-            return;
-        } else {
-            pins.push(folder);
-        }
-        self.set_pins(pins, &name);
-    }
-
-    /// Delete in the sidebar: unpins the pinned place the keyboard is on.
-    fn unpin_place(&mut self) {
-        let place = self.places().nth(self.sidebar_cursor);
-        let Some(place) = place.filter(|place| place.kind == PlaceKind::Pinned) else {
-            return;
-        };
-        let (path, name) = (place.path.clone(), place.label.clone());
-        let pins = self.pins.iter().filter(|pin| **pin != path);
-        self.set_pins(pins.cloned().collect(), &name);
-    }
-
-    /// Saves the pinned folders and lists them in the sidebar. Pins that
-    /// can't be saved stay as they were; `name` is the folder they changed for.
-    fn set_pins(&mut self, pins: Vec<PathBuf>, name: &str) {
-        let saved = match &self.state_dir {
-            Some(dir) => state::save_pins(dir, &pins),
-            None => Ok(()),
-        };
-        match saved {
-            Ok(()) => {
-                self.pins = pins;
-                self.rebuild_sidebar();
-            }
-            Err(_) => self.fail(format!("Couldn't save the pin to {name}.")),
-        }
     }
 
     fn open_selected(&mut self) {
@@ -2464,7 +2349,7 @@ impl App {
     /// where we were for Back. False when the folder couldn't be shown.
     fn go_to(&mut self, path: &Path, select: Option<&str>) -> bool {
         let from = self.pane().visit();
-        if from.recents || path != from.path {
+        if path != from.path {
             let shown = self.show_folder(path, select);
             if shown {
                 let pane = self.pane_mut();
@@ -2483,28 +2368,8 @@ impl App {
         true
     }
 
-    /// Shows the files used lately in place of a folder, remembering where
-    /// we were for Back.
-    fn open_recents(&mut self) {
-        let from = self.pane().visit();
-        if from.recents {
-            // Already there, unless a search is in the way.
-            self.leave_search();
-            return;
-        }
-        self.show_recents(None);
-        let pane = self.pane_mut();
-        pane.back.push(from);
-        pane.forward.clear();
-    }
-
     fn go_up(&mut self) {
         let from = self.pane().visit();
-        if from.recents {
-            // Recents hang off the home folder.
-            self.go_home();
-            return;
-        }
         let Some(parent) = from.path.parent().map(Path::to_path_buf) else {
             return;
         };
@@ -2561,12 +2426,13 @@ impl App {
         self.remember();
     }
 
-    /// Saves the view and tile size for the next launch.
+    /// Saves the view, the tile size and the preview for the next launch.
     fn remember(&self) {
         if let Some(dir) = &self.state_dir {
             let saved = Saved {
                 view: self.view,
                 tile: self.tile,
+                preview: self.preview_visible,
             };
             // A view that isn't remembered is no reason to interrupt.
             let _ = state::save(dir, saved);
@@ -2578,11 +2444,13 @@ impl App {
         self.reload_all();
     }
 
-    fn toggle_details(&mut self) {
-        self.details_visible = !self.details_visible;
-        if !self.details_visible && self.focus == Focus::Details {
-            self.focus = Focus::Files;
+    /// Alt+P: hides or shows the preview pane, and remembers it.
+    fn toggle_preview(&mut self) {
+        self.preview_visible = !self.preview_visible;
+        if !self.preview_visible && self.focus == Focus::Preview {
+            self.focus = Focus::List;
         }
+        self.remember();
     }
 
     fn set_sort(&mut self, sort: SortMode) {
@@ -2591,9 +2459,9 @@ impl App {
         self.note(sort.tip());
     }
 
-    /// F5: reads the sidebar's places and what the pane shows again.
+    /// F5: reads what the pane shows, and its volume, again.
     fn refresh(&mut self) {
-        self.rebuild_sidebar();
+        self.volumes.clear();
         self.reload();
     }
 
@@ -2608,14 +2476,9 @@ impl App {
         self.revisit(&here)
     }
 
-    /// Shows what a visit was of: a folder, or the files used lately.
+    /// Shows the folder a visit was of.
     fn revisit(&mut self, visit: &Visit) -> bool {
-        if visit.recents {
-            self.show_recents(visit.selected.as_deref());
-            true
-        } else {
-            self.show_folder(&visit.path, visit.selected.as_deref())
-        }
+        self.show_folder(&visit.path, visit.selected.as_deref())
     }
 
     /// Lists a folder into the active pane; on failure says why and stays put.
@@ -2644,32 +2507,25 @@ impl App {
         }
     }
 
-    /// Asks Spotlight for the files used lately and lists them into the
-    /// active pane, the newest first whatever the sort order is.
-    fn show_recents(&mut self, select: Option<&str>) {
-        let found = self.system.recents(RECENTS_LIMIT);
-        // One that went since Spotlight last looked is simply not listed.
-        let entries = found
-            .into_iter()
-            .filter_map(|path| Entry::from_path(path).ok());
-        let entries = entries.collect();
-        let home = self.home.clone();
-        let pane = self.pane_mut();
-        pane.show(home, entries, select);
-        pane.listing = Listing::Recents;
-        self.refresh_ancestors();
-        self.message = None;
-    }
-
     /// Lists the folders above the active pane's again, when the view shows
-    /// them. What a search found is a column on its own.
+    /// them: the columns view all of them, the list view the parent. What
+    /// a search found is a column on its own.
     fn refresh_ancestors(&mut self) {
         let ancestors = if self.view == ViewMode::Columns && self.pane().results().is_none() {
             self.list_ancestors(&self.pane().cwd)
         } else {
             Vec::new()
         };
-        self.pane_mut().ancestors = ancestors;
+        let parent = match self.pane().cwd.parent() {
+            // A folder that can't be read leaves the column empty.
+            Some(parent) if self.view == ViewMode::List => {
+                model::list_dir(parent, self.show_hidden, self.sort).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let pane = self.pane_mut();
+        pane.ancestors = ancestors;
+        pane.parent = parent;
     }
 
     /// One listing for each folder from home (or `/` outside it) down to the parent of `cwd`.
@@ -2695,18 +2551,30 @@ impl App {
         ancestors
     }
 
-    fn note(&mut self, text: &str) {
+    fn say(&mut self, text: String, is_error: bool, undoable: bool, lasts: Duration) {
         self.message = Some(Message {
-            text: text.to_string(),
-            is_error: false,
+            text,
+            is_error,
+            undoable,
+            at: (self.clock)(),
+            lasts,
         });
     }
 
+    /// A notice, for four seconds.
+    fn note(&mut self, text: &str) {
+        self.say(text.to_string(), false, false, NOTICE_LASTS);
+    }
+
+    /// What a change did, or what undo took back, for eight seconds; after
+    /// a change undo can take back, the footer says so.
+    fn receipt(&mut self, text: String, undoable: bool) {
+        self.say(text, false, undoable, RECEIPT_LASTS);
+    }
+
+    /// What went wrong, for eight seconds.
     fn fail(&mut self, text: String) {
-        self.message = Some(Message {
-            text,
-            is_error: true,
-        });
+        self.say(text, true, false, RECEIPT_LASTS);
     }
 }
 
@@ -2717,13 +2585,11 @@ fn opens_menu(key: KeyEvent) -> bool {
     alt_enter || key.code == KeyCode::Menu
 }
 
-/// How a command over several items went, for the band.
-fn outcome(report: &Report) -> Message {
+/// How a command over several items went, for the footer, and whether
+/// that is an error.
+fn outcome(report: &Report) -> (String, bool) {
     if let Some(error) = &report.error {
-        return Message {
-            text: error.to_string(),
-            is_error: true,
-        };
+        return (error.to_string(), true);
     }
     let done = ops::count(report.done);
     let text = if report.stopped && report.change.kind == Kind::Compress {
@@ -2736,21 +2602,32 @@ fn outcome(report: &Report) -> Message {
         "It is already in this folder.".to_string()
     } else {
         match report.change.kind {
-            Kind::Copy => format!("Copied {done}."),
+            Kind::Copy => format!("Copied {done}"),
             Kind::Duplicate => format!("Duplicated {done}."),
-            Kind::Trash => format!("Moved {done} to the trash."),
+            Kind::Trash => format!("Moved {done} to Trash"),
             Kind::Compress => format!("Compressed into {}.", report.change.name()),
             Kind::Restore => format!("Restored {done}."),
             Kind::Move | Kind::Rename | Kind::NewFolder => format!("Moved {done}."),
         }
     };
-    Message {
-        text,
-        is_error: false,
+    (text, false)
+}
+
+/// What an undo took back, after "Undid".
+fn undone(change: &Change) -> &'static str {
+    match change.kind {
+        Kind::Copy => "the copy",
+        Kind::Move => "the move",
+        Kind::Trash => "the move to Trash",
+        Kind::Duplicate => "the duplicate",
+        Kind::Rename => "the rename",
+        Kind::NewFolder => "the new folder",
+        Kind::Compress => "the compress",
+        Kind::Restore => "the restore",
     }
 }
 
-/// What the band says after an undo ("Undid") or a redo ("Redid").
+/// What the footer says after a redo ("Redid").
 fn told(verb: &str, change: &Change) -> String {
     let items = ops::count(change.steps.len());
     let name = change.name();
@@ -2814,10 +2691,10 @@ pub mod testing {
         pub previewed: Rc<RefCell<Vec<PathBuf>>>,
         /// Every text put on the system clipboard.
         pub copied: Rc<RefCell<Vec<String>>>,
-        /// What Spotlight answers when asked for the files used lately.
-        pub recents: Rc<RefCell<Vec<PathBuf>>>,
-        /// How many times it was asked.
-        pub asked: Rc<Cell<usize>>,
+        /// The volume every folder is on; `None` when it can't be told.
+        pub volume: Rc<RefCell<Option<Volume>>>,
+        /// How many times a volume was asked about.
+        pub volumes_asked: Rc<Cell<usize>>,
         /// Every folder a terminal was opened in.
         pub terminals: Rc<RefCell<Vec<PathBuf>>>,
         /// Whether no terminal can be started.
@@ -2854,11 +2731,6 @@ pub mod testing {
             Ok(())
         }
 
-        fn recents(&self, limit: usize) -> Vec<PathBuf> {
-            self.asked.set(self.asked.get() + 1);
-            self.recents.borrow().iter().take(limit).cloned().collect()
-        }
-
         fn open_terminal(&self, folder: &Path) -> io::Result<()> {
             if self.no_terminal.get() {
                 return Err(io::Error::other("no terminal started"));
@@ -2884,6 +2756,23 @@ pub mod testing {
                 })
             })
         }
+
+        fn volume(&self, _folder: &Path) -> Option<Volume> {
+            self.volumes_asked.set(self.volumes_asked.get() + 1);
+            self.volume.borrow().clone()
+        }
+    }
+
+    impl FakeSystem {
+        /// A system whose volumes are all APFS with 1.2 GB free.
+        fn new() -> Self {
+            let system = Self::default();
+            *system.volume.borrow_mut() = Some(Volume {
+                kind: "apfs".to_string(),
+                free: 1_200_000_000,
+            });
+            system
+        }
     }
 
     pub struct Fixture {
@@ -2892,9 +2781,6 @@ pub mod testing {
         pub home: PathBuf,
         /// The trash the app was given: a folder of the fixture's own.
         pub trash: PathBuf,
-        /// Where the app looks for drives: a folder of the fixture's own,
-        /// not there until a test mounts something.
-        pub volumes: PathBuf,
         _dir: tempfile::TempDir,
     }
 
@@ -2961,9 +2847,8 @@ pub mod testing {
         fs::write(home.join("Pictures").join("a.jpg"), "jpg").unwrap();
         fs::write(home.join("notes.txt"), "hello").unwrap();
         fs::write(home.join(".hidden"), "").unwrap();
-        let system = FakeSystem::default();
+        let system = FakeSystem::new();
         let trash = home.join(".Trash");
-        let volumes = home.join(".Volumes");
         let config = Config {
             home: home.clone(),
             start: home.clone(),
@@ -2971,7 +2856,7 @@ pub mod testing {
             state_dir: None,
             thumbs,
             trash_dir: trash.clone(),
-            volumes_dir: volumes.clone(),
+            depth: Depth::Truecolor,
         };
         let mut app = App::new(config, Box::new(system.clone()));
         // The tests written against the list keep it; the others switch with Ctrl+1 or Ctrl+3.
@@ -2981,7 +2866,6 @@ pub mod testing {
             system,
             home,
             trash,
-            volumes,
             _dir: dir,
         }
     }
@@ -2995,9 +2879,9 @@ pub mod testing {
             state_dir: state_dir.map(Path::to_path_buf),
             thumbs: None,
             trash_dir: home.join(".Trash"),
-            volumes_dir: home.join(".Volumes"),
+            depth: Depth::Truecolor,
         };
-        App::new(config, Box::new(FakeSystem::default()))
+        App::new(config, Box::new(FakeSystem::new()))
     }
 
     /// The fixture as a grid three tiles across and two rows tall, holding ten items:
@@ -3009,7 +2893,8 @@ pub mod testing {
         }
         f.app.handle_key(ctrl(KeyCode::Char('1')));
         f.app.handle_key(key(KeyCode::F(5)));
-        crate::ui::testing::screen(&mut f.app, 120, 24);
+        // The body of a window 62 across and 26 down is 62 by 22.
+        crate::ui::testing::screen(&mut f.app, 62, 26);
         f
     }
 
@@ -3066,6 +2951,14 @@ pub mod testing {
         }
     }
 
+    /// A clock the test moves on by hand, for the app to tell the time by.
+    pub fn manual_clock(app: &mut App) -> Rc<Cell<Instant>> {
+        let now = Rc::new(Cell::new(Instant::now()));
+        let read = now.clone();
+        app.clock = Box::new(move || read.get());
+        now
+    }
+
     pub fn names(app: &App) -> Vec<String> {
         app.pane()
             .entries
@@ -3091,7 +2984,7 @@ mod tests {
         let f = fixture();
         assert_eq!(f.app.pane().cwd, f.home);
         assert_eq!(names(&f.app), ["Documents", "Pictures", "notes.txt"]);
-        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(f.app.focus, Focus::List);
     }
 
     #[test]
@@ -3104,7 +2997,7 @@ mod tests {
             state_dir: None,
             thumbs: None,
             trash_dir: f.trash.clone(),
-            volumes_dir: f.volumes.clone(),
+            depth: Depth::Truecolor,
         };
         let app = App::new(config, Box::new(FakeSystem::default()));
         assert_eq!(app.pane().cwd, f.home);
@@ -3186,39 +3079,145 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_sidebar_files_and_details() {
+    fn tab_moves_the_keyboard_between_the_list_and_the_preview() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Details);
+        assert_eq!(f.app.focus, Focus::Preview);
         press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Sidebar);
-        press(&mut f.app, &[KeyCode::BackTab, KeyCode::BackTab]);
-        assert_eq!(f.app.focus, Focus::Files);
-        f.app.details_visible = false;
+        assert_eq!(f.app.focus, Focus::List);
+        press(&mut f.app, &[KeyCode::BackTab]);
+        assert_eq!(f.app.focus, Focus::Preview);
+        // Escape gives it back to the list.
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.app.focus, Focus::List);
+        // Without the preview, or in another view, Tab stays in the list.
+        f.app.handle_key(alt(KeyCode::Char('p')));
         press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Sidebar);
+        assert_eq!(f.app.focus, Focus::List);
+        f.app.handle_key(alt(KeyCode::Char('p')));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.focus, Focus::List);
     }
 
     #[test]
-    fn the_sidebar_lists_home_folders_and_enter_goes_there() {
+    fn notices_go_after_four_seconds_receipts_and_errors_after_eight() {
         let mut f = fixture();
-        let home = &f.app.sidebar[0];
-        let labels: Vec<_> = home
-            .places
-            .iter()
-            .map(|place| place.label.as_str())
-            .collect();
+        let clock = manual_clock(&mut f.app);
+        let wait = |secs| clock.set(clock.get() + Duration::from_secs(secs));
+        press(&mut f.app, &[KeyCode::Char('s')]);
+        assert_eq!(f.app.message.as_ref().map(|m| m.undoable), Some(false));
+        wait(3);
+        f.app.tick();
+        assert!(f.app.message.is_some());
+        wait(1);
+        f.app.tick();
+        assert_eq!(f.app.message, None, "a notice: four seconds");
+
+        // A change undo can take back says so, and stays eight seconds.
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Delete]);
+        let receipt = f.app.message.clone().unwrap();
         assert_eq!(
-            (home.title, labels),
-            ("Home", vec!["Documents", "Pictures"])
+            (receipt.text.as_str(), receipt.undoable),
+            ("Moved 1 item to Trash", true)
         );
+        wait(7);
+        f.app.tick();
+        assert!(f.app.message.is_some());
+        wait(1);
+        f.app.tick();
+        assert_eq!(f.app.message, None);
+        // So does what undo took back.
+        f.app.handle_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(
+            f.app.message.as_ref().map(|m| m.lasts),
+            Some(Duration::from_secs(8))
+        );
+
+        // Escape dismisses an error at once.
+        f.app.navigate(&f.home.join("missing"));
+        assert!(f.app.message.as_ref().is_some_and(|m| m.is_error));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert_eq!(f.app.message, None);
+    }
+
+    #[test]
+    fn the_volume_is_asked_once_for_each_folder_and_never_while_drawing() {
+        let mut f = fixture();
+        f.app.tick();
+        for _ in 0..3 {
+            crate::ui::testing::buffer(&mut f.app, 120, 30);
+            f.app.tick();
+        }
+        assert_eq!(f.system.volumes_asked.get(), 1);
+        assert_eq!(f.app.volume().map(|v| v.kind.as_str()), Some("apfs"));
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        f.app.tick();
+        f.app.tick();
+        assert_eq!(f.system.volumes_asked.get(), 2, "a new folder");
+        press(&mut f.app, &[KeyCode::Backspace]);
+        f.app.tick();
+        assert_eq!(f.system.volumes_asked.get(), 2, "kept from before");
+        // F5 and a change to files ask again: the space left may differ.
+        press(&mut f.app, &[KeyCode::F(5)]);
+        f.app.tick();
+        assert_eq!(f.system.volumes_asked.get(), 3);
+        // A volume that can't be told leaves the footer without it.
+        *f.system.volume.borrow_mut() = None;
+        press(&mut f.app, &[KeyCode::F(5)]);
+        f.app.tick();
+        let drawn = crate::ui::testing::screen(&mut f.app, 120, 30);
+        assert!(!drawn[29].contains("free"), "{}", drawn[29]);
+        assert!(drawn[29].trim_end().ends_with("? keys"));
+    }
+
+    #[test]
+    fn alt_p_hides_and_shows_the_preview_and_remembers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let state = dir.path().join("state");
+        let mut app = launch(&home, Some(&state));
+        assert!(app.preview_visible, "shown at first");
+        press(&mut app, &[KeyCode::Tab]);
+        assert_eq!(app.focus, Focus::Preview);
+        // Hidden, it gives the keyboard back to the list.
+        app.handle_key(alt(KeyCode::Char('p')));
+        assert!(!app.preview_visible);
+        assert_eq!(app.focus, Focus::List);
+        let saved = fs::read_to_string(state.join("state")).unwrap();
+        assert!(saved.contains("preview=off"), "{saved}");
+        assert!(!launch(&home, Some(&state)).preview_visible);
+        app.handle_key(alt(KeyCode::Char('p')));
+        assert!(launch(&home, Some(&state)).preview_visible);
+    }
+
+    #[test]
+    fn with_the_preview_focused_up_and_down_scroll_it_and_leave_the_cursor() {
+        let mut f = several();
+        let lines: String = (1..=60).map(|n| format!("line {n}\n")).collect();
+        fs::write(f.home.join("notes.txt"), lines).unwrap();
+        press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
+        f.app.tick();
+        crate::ui::testing::buffer(&mut f.app, 120, 30);
+        let at = f.app.pane().cursor;
         press(
             &mut f.app,
-            &[KeyCode::BackTab, KeyCode::Down, KeyCode::Enter],
+            &[KeyCode::Tab, KeyCode::Down, KeyCode::Char('j')],
         );
-        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-        assert_eq!(f.app.focus, Focus::Files);
-        assert_eq!(f.app.current_place(), Some(1));
+        assert_eq!(f.app.preview_scroll, 2);
+        press(&mut f.app, &[KeyCode::Char('k')]);
+        assert_eq!(f.app.preview_scroll, 1);
+        press(&mut f.app, &[KeyCode::PageDown]);
+        assert_eq!(f.app.preview_scroll, 1 + f.app.preview_rows);
+        press(&mut f.app, &[KeyCode::PageUp, KeyCode::Up, KeyCode::Up]);
+        assert_eq!(f.app.preview_scroll, 0);
+        assert_eq!(f.app.pane().cursor, at, "the list stays where it was");
+        // Another item starts at the top.
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Esc, KeyCode::Up]);
+        f.app.tick();
+        assert_eq!(f.app.preview_scroll, 0);
     }
 
     #[test]
@@ -3287,11 +3286,11 @@ mod tests {
     }
 
     #[test]
-    fn the_view_starts_as_a_grid_and_ctrl_1_2_3_switch_and_remember_it() {
+    fn the_view_starts_as_the_list_and_ctrl_1_2_3_switch_and_remember_it() {
         let f = fixture();
         let state = tempfile::tempdir().unwrap();
         let mut app = launch(&f.home, Some(state.path()));
-        assert_eq!(app.view, ViewMode::Grid);
+        assert_eq!(app.view, ViewMode::List);
         assert!(
             !state.path().join("state").exists(),
             "nothing is written until something changes"
@@ -3307,7 +3306,7 @@ mod tests {
         app.handle_key(ctrl(KeyCode::Char('2')));
         assert_eq!(app.view, ViewMode::List);
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
-        assert_eq!(saved, "view=list\ntiles=normal\n");
+        assert_eq!(saved, "view=list\ntiles=normal\npreview=on\n");
         app.handle_key(ctrl(KeyCode::Char('1')));
         assert_eq!(app.view, ViewMode::Grid);
         assert_eq!(launch(&f.home, Some(state.path())).view, ViewMode::Grid);
@@ -3409,23 +3408,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_i_hides_the_details_and_takes_the_keyboard_back_to_the_files() {
-        let mut f = fixture();
-        press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Details);
-        f.app.handle_key(ctrl(KeyCode::Char('i')));
-        assert!(!f.app.details_visible);
-        assert_eq!(f.app.focus, Focus::Files);
-        f.app.handle_key(ctrl(KeyCode::Char('i')));
-        assert!(f.app.details_visible);
-        assert_eq!(f.app.focus, Focus::Files);
-        // From the sidebar the keyboard stays where it is.
-        press(&mut f.app, &[KeyCode::BackTab]);
-        f.app.handle_key(ctrl(KeyCode::Char('i')));
-        assert_eq!(f.app.focus, Focus::Sidebar);
-    }
-
-    #[test]
     fn ctrl_plus_minus_and_zero_resize_the_tiles_and_remember_the_size() {
         let f = fixture();
         let state = tempfile::tempdir().unwrap();
@@ -3443,7 +3425,7 @@ mod tests {
         );
         app.handle_key(ctrl(KeyCode::Char('+')));
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
-        assert_eq!(saved, "view=grid\ntiles=large\n");
+        assert_eq!(saved, "view=list\ntiles=large\npreview=on\n");
         assert_eq!(launch(&f.home, Some(state.path())).tile, Large);
     }
 
@@ -3661,7 +3643,7 @@ mod tests {
         );
         assert_eq!(names(&f.app), ["notes.txt"]);
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
-        assert_eq!(said(&f.app), ("Copied 1 item.", false));
+        assert_eq!(said(&f.app), ("Copied 1 item", false));
 
         // A copy can be pasted again, and the one already there is left as it is.
         fs::write(documents.join("notes.txt"), "changed since").unwrap();
@@ -3697,7 +3679,7 @@ mod tests {
 
         f.app.handle_key(ctrl(KeyCode::Char('v')));
         assert_eq!(f.app.working(), None);
-        assert_eq!(said(&f.app), ("There's nothing to paste.", false));
+        assert_eq!(said(&f.app), ("Nothing to paste", false));
         assert_eq!(on_disk(&f.home.join("Documents")), ["notes.txt"]);
     }
 
@@ -3745,7 +3727,7 @@ mod tests {
         assert!(!f.home.join("notes.txt").exists());
         assert_eq!(names(&f.app), ["Documents", "Pictures", "todo.txt"]);
         assert_eq!(selected_name(&f.app), Some("todo.txt"));
-        assert_eq!(said(&f.app), ("Renamed notes.txt to todo.txt.", false));
+        assert_eq!(said(&f.app), ("Renamed", false));
 
         // A folder has no extension: the cursor is at the end. Escape leaves it be.
         select(&mut f.app, "Documents");
@@ -3821,7 +3803,7 @@ mod tests {
         assert!(f.app.dialog.is_none());
         assert!(f.home.join("New Folder").is_dir());
         assert_eq!(selected_name(&f.app), Some("New Folder"));
-        assert_eq!(said(&f.app), ("Made New Folder.", false));
+        assert_eq!(said(&f.app), ("Folder created", false));
 
         // The same name again is refused; nothing is made or replaced.
         fs::write(f.home.join("New Folder").join("kept.txt"), "kept").unwrap();
@@ -3851,7 +3833,7 @@ mod tests {
         assert!(!f.home.join("Pictures").exists());
         assert_eq!(names(&f.app), ["Documents", "notes.txt"]);
         assert_eq!(selected_name(&f.app), Some("notes.txt"), "the next one");
-        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        assert_eq!(said(&f.app), ("Moved 1 item to Trash", false));
 
         // The last one gone, the cursor falls on the one before.
         press(&mut f.app, &[KeyCode::Delete]);
@@ -3941,7 +3923,7 @@ mod tests {
         assert_eq!(said(&f.app), ("Copied the path.", false));
         // It is text for other apps, not a file to paste.
         f.app.handle_key(ctrl(KeyCode::Char('v')));
-        assert_eq!(said(&f.app), ("There's nothing to paste.", false));
+        assert_eq!(said(&f.app), ("Nothing to paste", false));
 
         // Ctrl+C by itself copies the file, not its path.
         f.app.handle_key(ctrl(KeyCode::Char('c')));
@@ -3963,7 +3945,7 @@ mod tests {
         assert_eq!(read(notes.clone()), "hello");
         assert!(on_disk(&f.trash).is_empty());
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
-        assert_eq!(said(&f.app), ("Undid moving 1 item to the trash.", false));
+        assert_eq!(said(&f.app), ("Undid the move to Trash", false));
 
         f.app.handle_key(ctrl_shift('z'));
         assert!(!notes.exists());
@@ -3995,10 +3977,10 @@ mod tests {
         );
 
         f.app.handle_key(ctrl(KeyCode::Char('z')));
-        assert_eq!(said(&f.app), ("Undid making New Folder.", false));
+        assert_eq!(said(&f.app), ("Undid the new folder", false));
         assert!(f.trash.join("New Folder").is_dir(), "trashed, not deleted");
         f.app.handle_key(ctrl(KeyCode::Char('z')));
-        assert_eq!(said(&f.app), ("Undid renaming notes.txt.", false));
+        assert_eq!(said(&f.app), ("Undid the rename", false));
         assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
 
@@ -4030,7 +4012,7 @@ mod tests {
         assert!(on_disk(&f.home.join("Documents")).is_empty());
         assert_eq!(read(f.trash.join("notes.txt")), "hello", "not deleted");
         assert_eq!(read(f.home.join("notes.txt")), "hello");
-        assert_eq!(said(&f.app), ("Undid copying 1 item.", false));
+        assert_eq!(said(&f.app), ("Undid the copy", false));
     }
 
     #[test]
@@ -4097,23 +4079,6 @@ mod tests {
     }
 
     #[test]
-    fn with_the_keyboard_in_the_sidebar_the_file_keys_leave_the_files_alone() {
-        let mut f = fixture();
-        select(&mut f.app, "notes.txt");
-        press(&mut f.app, &[KeyCode::BackTab]);
-        assert_eq!(f.app.focus, Focus::Sidebar);
-        press(&mut f.app, &[KeyCode::Delete, KeyCode::F(2)]);
-        f.app.handle_key(shift(KeyCode::Delete));
-        f.app.handle_key(ctrl_shift('d'));
-        f.app.handle_key(ctrl(KeyCode::Char('x')));
-        assert!(f.app.dialog.is_none());
-        assert_eq!(f.app.working(), None);
-        f.app.handle_key(ctrl(KeyCode::Char('v')));
-        assert_eq!(said(&f.app), ("There's nothing to paste.", false));
-        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
-    }
-
-    #[test]
     fn the_keys_from_before_still_do_what_they_did() {
         let mut f = fixture();
         // The new chords' letters, typed plain, change nothing.
@@ -4129,7 +4094,7 @@ mod tests {
         assert_eq!(f.app.sort, SortMode::Name);
         press(&mut f.app, &[KeyCode::Char('S')]);
         assert_eq!(f.app.sort, SortMode::Size);
-        // Escape dismisses what the band says, and Q closes the window.
+        // Escape dismisses what the footer says, and Q closes the window.
         assert!(f.app.message.is_some());
         press(&mut f.app, &[KeyCode::Esc]);
         assert_eq!(f.app.message, None);
@@ -4137,298 +4102,10 @@ mod tests {
         assert!(f.app.should_quit);
     }
 
-    // The sidebar's other sections. Pins are remembered in a folder inside
-    // the fixture, drives come from a folder of its own, and Spotlight is a
-    // fake that answers what the test tells it to.
-
-    type Listed = (&'static str, Vec<&'static str>);
-
-    fn home_places() -> Listed {
-        ("Home", vec!["Documents", "Pictures"])
-    }
-
-    fn views() -> Listed {
-        ("Views", vec!["Recents", "Trash"])
-    }
-
-    /// Every section of the sidebar with the labels of its places.
-    fn sections(app: &App) -> Vec<(&str, Vec<&str>)> {
-        app.sidebar
-            .iter()
-            .map(|section| {
-                let labels = section.places.iter().map(|place| place.label.as_str());
-                (section.title, labels.collect())
-            })
-            .collect()
-    }
-
-    fn place_of(app: &App, label: &str) -> Option<usize> {
-        app.places().position(|place| place.label == label)
-    }
-
-    /// Moves the keyboard into the sidebar and onto a place.
-    fn go_to_place(app: &mut App, label: &str) {
-        while app.focus != Focus::Sidebar {
-            press(app, &[KeyCode::BackTab]);
-        }
-        let index = place_of(app, label).unwrap_or_else(|| panic!("{label} isn't listed"));
-        press(app, &[KeyCode::Up; 40]);
-        press(app, &vec![KeyCode::Down; index]);
-        assert_eq!(app.sidebar_cursor, index);
-    }
-
-    fn open_place(app: &mut App, label: &str) {
-        go_to_place(app, label);
-        press(app, &[KeyCode::Enter]);
-    }
-
-    fn pin(app: &mut App) {
-        app.handle_key(ctrl(KeyCode::Char('p')));
-    }
-
-    #[test]
-    fn the_sidebar_holds_home_and_the_views_and_leaves_empty_sections_out() {
-        let f = fixture();
-        assert_eq!(sections(&f.app), [home_places(), views()]);
-    }
-
-    #[test]
-    fn ctrl_p_pins_the_folder_and_ctrl_p_again_unpins_it() {
-        let f = fixture();
-        let state = f.home.join(".state");
-        let mut app = launch(&f.home, Some(&state));
-        let trip = f.home.join("Pictures").join("Trip");
-        app.navigate(&trip);
-        assert_eq!(app.current_place(), Some(1), "Pictures holds it");
-
-        pin(&mut app);
-        let pinned = ("Pinned", vec!["Trip"]);
-        assert_eq!(sections(&app), [home_places(), pinned, views()]);
-        assert_eq!(read(state.join("pinned")), format!("{}\n", trip.display()));
-        assert_eq!(app.message, None);
-        assert_eq!(app.current_place(), Some(2), "the pin is the deepest");
-        assert_eq!(app.pane().cwd, trip);
-
-        pin(&mut app);
-        assert_eq!(sections(&app), [home_places(), views()]);
-        assert_eq!(read(state.join("pinned")), "");
-        assert_eq!(app.current_place(), Some(1));
-    }
-
-    #[test]
-    fn pins_survive_a_restart_and_a_folder_that_is_gone_is_kept_but_not_listed() {
-        let f = fixture();
-        let state = f.home.join(".state");
-        let trip = f.home.join("Pictures").join("Trip");
-        let gone = f.home.join("Pictures").join("Gone");
-        fs::create_dir(&gone).unwrap();
-        let mut app = launch(&f.home, Some(&state));
-        for folder in [&gone, &trip] {
-            app.navigate(folder);
-            pin(&mut app);
-        }
-        assert_eq!(sections(&app)[1], ("Pinned", vec!["Gone", "Trip"]));
-        fs::remove_dir(&gone).unwrap();
-
-        let mut again = launch(&f.home, Some(&state));
-        assert_eq!(sections(&again)[1], ("Pinned", vec!["Trip"]));
-        // Its line stays in the file, for when the folder comes back.
-        let both = format!("{}\n{}\n", gone.display(), trip.display());
-        assert_eq!(read(state.join("pinned")), both);
-        again.navigate(&trip);
-        pin(&mut again);
-        assert_eq!(read(state.join("pinned")), format!("{}\n", gone.display()));
-        assert_eq!(sections(&again), [home_places(), views()]);
-    }
-
-    #[test]
-    fn what_home_already_lists_and_what_is_not_a_folder_cannot_be_pinned() {
-        let f = fixture();
-        let state = f.home.join(".state");
-        let mut app = launch(&f.home, Some(&state));
-        app.navigate(&f.home.join("Pictures"));
-        pin(&mut app);
-        assert_eq!(said(&app), ("Pictures is already under Home.", false));
-
-        open_place(&mut app, "Recents");
-        pin(&mut app);
-        assert_eq!(said(&app), ("Only folders can be pinned.", false));
-        assert_eq!(sections(&app), [home_places(), views()]);
-        assert!(!state.join("pinned").exists());
-    }
-
-    #[test]
-    fn a_pin_that_cannot_be_saved_says_so_and_is_not_kept() {
-        let f = fixture();
-        // A file is where the folder for the pins would go.
-        let state = f.home.join("notes.txt").join("state");
-        let mut app = launch(&f.home, Some(&state));
-        app.navigate(&f.home.join("Pictures").join("Trip"));
-        pin(&mut app);
-        assert_eq!(said(&app), ("Couldn't save the pin to Trip.", true));
-        assert_eq!(sections(&app), [home_places(), views()]);
-        assert_eq!(read(f.home.join("notes.txt")), "hello");
-    }
-
-    #[test]
-    fn delete_in_the_sidebar_unpins_a_pinned_place_and_leaves_the_others() {
-        let f = fixture();
-        let state = f.home.join(".state");
-        let mut app = launch(&f.home, Some(&state));
-        let trip = f.home.join("Pictures").join("Trip");
-        app.navigate(&trip);
-        pin(&mut app);
-
-        for label in ["Pictures", "Recents", "Trash"] {
-            go_to_place(&mut app, label);
-            press(&mut app, &[KeyCode::Delete]);
-        }
-        assert_eq!(sections(&app)[1], ("Pinned", vec!["Trip"]));
-        assert!(app.dialog.is_none());
-
-        go_to_place(&mut app, "Trip");
-        press(&mut app, &[KeyCode::Delete]);
-        assert_eq!(sections(&app), [home_places(), views()]);
-        assert_eq!(read(state.join("pinned")), "");
-        // Only the pin went: the folder and everything else is where it was.
-        assert!(trip.is_dir());
-        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
-        assert!(on_disk(&f.home.join(".Trash")).is_empty());
-        assert_eq!(app.pane().cwd, trip);
-        assert_eq!(app.focus, Focus::Sidebar);
-        assert_eq!(app.sidebar_cursor, 2, "on what moved up into its row");
-    }
-
-    #[test]
-    fn recents_lists_what_spotlight_says_was_used_lately() {
-        let mut f = fixture();
-        let photo = f.home.join("Pictures").join("a.jpg");
-        let notes = f.home.join("notes.txt");
-        *f.system.recents.borrow_mut() =
-            vec![photo.clone(), f.home.join("gone.txt"), notes.clone()];
-        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
-        assert_eq!(f.system.asked.get(), 0, "not before it is opened");
-
-        open_place(&mut f.app, "Recents");
-        assert!(f.app.pane().recents());
-        assert_eq!(names(&f.app), ["a.jpg", "notes.txt"], "Spotlight's order");
-        assert_eq!(f.app.focus, Focus::Files);
-        assert_eq!(f.app.current_place(), place_of(&f.app, "Recents"));
-
-        // Enter opens a file and Space previews it.
-        press(
-            &mut f.app,
-            &[KeyCode::Down, KeyCode::Enter, KeyCode::Char(' ')],
-        );
-        let asked_for = [notes];
-        assert_eq!(*f.system.opened.borrow(), asked_for);
-        assert_eq!(*f.system.previewed.borrow(), asked_for);
-
-        // Back returns to where we were, and forward to Recents.
-        f.app.handle_key(alt(KeyCode::Left));
-        assert!(!f.app.pane().recents());
-        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-        assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
-        f.app.handle_key(alt(KeyCode::Right));
-        assert!(f.app.pane().recents());
-        assert_eq!(selected_name(&f.app), Some("notes.txt"));
-    }
-
-    #[test]
-    fn up_from_recents_is_the_home_folder() {
-        let mut f = fixture();
-        *f.system.recents.borrow_mut() = vec![f.home.join("notes.txt")];
-        let leaving = [
-            key(KeyCode::Backspace),
-            key(KeyCode::Left),
-            alt(KeyCode::Home),
-        ];
-        for leave in leaving {
-            f.app.navigate(&f.home.join("Pictures"));
-            open_place(&mut f.app, "Recents");
-            assert!(f.app.pane().recents());
-            f.app.handle_key(leave);
-            assert!(!f.app.pane().recents());
-            assert_eq!(f.app.pane().cwd, f.home);
-            assert_eq!(names(&f.app), ["Documents", "Pictures", "notes.txt"]);
-            // Recents is one step back.
-            f.app.handle_key(alt(KeyCode::Left));
-            assert!(f.app.pane().recents());
-            assert_eq!(names(&f.app), ["notes.txt"]);
-        }
-    }
-
-    #[test]
-    fn f5_in_recents_asks_spotlight_again_and_drawing_never_does() {
-        let mut f = fixture();
-        open_place(&mut f.app, "Recents");
-        assert!(names(&f.app).is_empty());
-        assert_eq!(f.system.asked.get(), 1);
-
-        f.system.recents.borrow_mut().push(f.home.join("notes.txt"));
-        for _ in 0..3 {
-            f.app.tick();
-            crate::ui::testing::screen(&mut f.app, 120, 24);
-        }
-        assert_eq!(f.system.asked.get(), 1);
-        assert!(names(&f.app).is_empty());
-
-        press(&mut f.app, &[KeyCode::F(5)]);
-        assert_eq!(f.system.asked.get(), 2);
-        assert_eq!(names(&f.app), ["notes.txt"]);
-        assert!(f.app.pane().recents());
-    }
-
-    #[test]
-    fn in_recents_nothing_is_pasted_or_made_and_the_rest_acts_on_the_real_files() {
-        let mut f = fixture();
-        let photo = f.home.join("Pictures").join("a.jpg");
-        let plan = f.home.join("Documents").join("plan.md");
-        let notes = f.home.join("notes.txt");
-        fs::write(&plan, "plan").unwrap();
-        *f.system.recents.borrow_mut() = vec![photo.clone(), plan.clone(), notes.clone()];
-        open_place(&mut f.app, "Recents");
-
-        f.app.handle_key(ctrl(KeyCode::Char('v')));
-        assert_eq!(said(&f.app), ("Files can't be pasted here.", false));
-        assert_eq!(f.app.working(), None);
-        f.app.handle_key(ctrl_shift('n'));
-        assert_eq!(said(&f.app), ("Folders can't be made here.", false));
-        assert!(f.app.dialog.is_none());
-        assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
-
-        // The path that is copied is the file's own, wherever it is.
-        f.app.handle_key(ctrl_shift('c'));
-        assert_eq!(*f.system.copied.borrow(), [photo.display().to_string()]);
-
-        // Ctrl+C takes the file for a paste somewhere else.
-        select(&mut f.app, "plan.md");
-        f.app.handle_key(ctrl(KeyCode::Char('c')));
-        assert_eq!(said(&f.app), ("1 item ready to paste.", false));
-
-        // F2 renames it where it is.
-        select(&mut f.app, "a.jpg");
-        press(&mut f.app, &[KeyCode::F(2)]);
-        clear_field(&mut f.app);
-        type_text(&mut f.app, "b.jpg");
-        press(&mut f.app, &[KeyCode::Enter]);
-        assert_eq!(on_disk(&f.home.join("Pictures")), ["Trip", "b.jpg"]);
-        assert!(f.app.pane().recents());
-
-        // Delete moves it to the trash.
-        select(&mut f.app, "notes.txt");
-        press(&mut f.app, &[KeyCode::Delete]);
-        assert_eq!(read(f.trash.join("notes.txt")), "hello");
-        assert!(!notes.exists());
-        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
-        assert!(f.app.pane().recents());
-        assert_eq!(names(&f.app), ["plan.md"]);
-
-        f.app.navigate(&f.home.join("Pictures"));
-        f.app.handle_key(ctrl(KeyCode::Char('v')));
-        finish_work(&mut f.app);
-        assert_eq!(read(f.home.join("Pictures").join("plan.md")), "plan");
-        assert_eq!(read(plan), "plan");
+    /// Opens the trash folder, which the menu offers.
+    fn open_trash(app: &mut App) {
+        let trash = app.trash_dir.clone();
+        app.navigate(&trash);
     }
 
     #[test]
@@ -4438,11 +4115,10 @@ mod tests {
             select(&mut f.app, name);
             press(&mut f.app, &[KeyCode::Delete]);
         }
-        open_place(&mut f.app, "Trash");
+        open_trash(&mut f.app);
         assert_eq!(f.app.pane().cwd, f.trash);
         assert_eq!(names(&f.app), ["Pictures", "notes.txt"]);
-        assert_eq!(f.app.focus, Focus::Files);
-        assert_eq!(f.app.current_place(), place_of(&f.app, "Trash"));
+        assert_eq!(f.app.focus, Focus::List);
 
         // Delete doesn't move it to the trash again: it asks, like Shift+Delete.
         select(&mut f.app, "notes.txt");
@@ -4477,7 +4153,7 @@ mod tests {
     fn a_trash_nothing_was_ever_moved_to_opens_empty() {
         let mut f = fixture();
         assert!(!f.trash.exists());
-        open_place(&mut f.app, "Trash");
+        open_trash(&mut f.app);
         assert_eq!(f.app.pane().cwd, f.trash);
         assert!(names(&f.app).is_empty());
         assert_eq!(f.app.message, None);
@@ -4489,7 +4165,7 @@ mod tests {
         fs::create_dir(&f.trash).unwrap();
         fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o000)).unwrap();
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
-        open_place(&mut f.app, "Trash");
+        open_trash(&mut f.app);
         fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
         assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
@@ -4498,50 +4174,7 @@ mod tests {
         assert_eq!(said(&f.app), (refused, true));
     }
 
-    #[test]
-    fn drives_lists_the_mounted_volumes_except_the_systems_own() {
-        let mut f = fixture();
-        fs::create_dir_all(f.volumes.join("USB").join("Photos")).unwrap();
-        fs::create_dir(f.volumes.join("Backup")).unwrap();
-        fs::write(f.volumes.join("stray.txt"), "").unwrap();
-        // What `/Volumes/Macintosh HD` is: a link to the root.
-        std::os::unix::fs::symlink("/", f.volumes.join("Macintosh HD")).unwrap();
-        press(&mut f.app, &[KeyCode::F(5)]);
-        let drives = ("Drives", vec!["Backup", "USB"]);
-        assert_eq!(sections(&f.app), [home_places(), views(), drives]);
-
-        open_place(&mut f.app, "USB");
-        assert_eq!(f.app.pane().cwd, f.volumes.join("USB"));
-        assert_eq!(names(&f.app), ["Photos"]);
-        assert_eq!(f.app.focus, Focus::Files);
-        press(&mut f.app, &[KeyCode::Enter]);
-        assert_eq!(f.app.pane().cwd, f.volumes.join("USB").join("Photos"));
-        assert_eq!(f.app.current_place(), place_of(&f.app, "USB"));
-    }
-
-    #[test]
-    fn the_sidebar_is_read_again_on_f5_and_when_the_keyboard_moves_into_it() {
-        let mut f = fixture();
-        fs::create_dir(f.home.join("Music")).unwrap();
-        f.app.tick();
-        crate::ui::testing::screen(&mut f.app, 120, 24);
-        press(&mut f.app, &[KeyCode::Down]);
-        assert_eq!(sections(&f.app), [home_places(), views()], "not yet");
-        press(&mut f.app, &[KeyCode::F(5)]);
-        let home = ("Home", vec!["Documents", "Music", "Pictures"]);
-        assert_eq!(sections(&f.app), [home.clone(), views()]);
-
-        // A drive plugged in shows up when the keyboard gets there.
-        fs::create_dir_all(f.volumes.join("USB")).unwrap();
-        press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Details);
-        assert_eq!(sections(&f.app), [home.clone(), views()]);
-        press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Sidebar);
-        assert_eq!(sections(&f.app), [home, views(), ("Drives", vec!["USB"])]);
-    }
-
-    // The path field (Ctrl+L) and the search (/). Both live in the top bar
+    // The path field (Ctrl+L) and the search (/). Both live in the header
     // and take the keyboard while they are open.
 
     fn path_field(app: &App) -> (String, usize) {
@@ -4702,7 +4335,7 @@ mod tests {
         assert_eq!(completed(&mut f.app, "~/no"), "~/no");
         assert_eq!(completed(&mut f.app, "~/Nowhere/x"), "~/Nowhere/x");
         // Tab went nowhere else.
-        assert_eq!((f.app.focus, &f.app.pane().cwd), (Focus::Files, &f.home));
+        assert_eq!((f.app.focus, &f.app.pane().cwd), (Focus::List, &f.home));
     }
 
     #[test]
@@ -4787,7 +4420,7 @@ mod tests {
             (sort, view, hidden),
             (SortMode::Name, ViewMode::List, false)
         );
-        assert_eq!((f.app.focus, f.app.pane().cursor), (Focus::Files, 1));
+        assert_eq!((f.app.focus, f.app.pane().cursor), (Focus::List, 1));
         assert_eq!(f.app.pane().cwd, f.home);
         assert!(f.app.pane().search().is_none());
         assert_eq!((f.app.working(), &f.app.message), (None, &None));
@@ -4956,7 +4589,7 @@ mod tests {
         // Tab hands the keyboard to what was found; the search stays.
         press(&mut f.app, &[KeyCode::Tab]);
         assert!(f.app.field.is_none());
-        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(f.app.focus, Focus::List);
 
         press(&mut f.app, &[KeyCode::Char(' '), KeyCode::Enter]);
         let asked_for = [plan.clone()];
@@ -4986,7 +4619,7 @@ mod tests {
         assert_eq!(on_disk(&f.home.join("Documents")), ["trip-notes.md"]);
         assert_eq!(names(&f.app), ["trip-notes.md", "Trip", "day-trip.jpg"]);
         assert_eq!(selected_name(&f.app), Some("trip-notes.md"));
-        let renamed = "Renamed trip-plan.md to trip-notes.md.";
+        let renamed = "Renamed";
         assert_eq!(said(&f.app), (renamed, false));
 
         // Delete moves it to the trash, and the cursor to what was next to it.
@@ -4996,7 +4629,7 @@ mod tests {
         assert_eq!(read(f.trash.join("day-trip.jpg")), "jpg");
         assert_eq!(names(&f.app), ["trip-notes.md", "Trip"]);
         assert_eq!(selected_name(&f.app), Some("Trip"));
-        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        assert_eq!(said(&f.app), ("Moved 1 item to Trash", false));
 
         // `/` hands the keyboard back to the field, as it was left.
         press(&mut f.app, &[KeyCode::Char('/')]);
@@ -5039,7 +4672,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::Backspace; 5]);
         press(&mut f.app, &[KeyCode::Tab]);
         assert!(f.app.field.is_none() && f.app.pane().search().is_none());
-        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(f.app.focus, Focus::List);
         assert_eq!(names(&f.app), FOLDER);
     }
 
@@ -5065,25 +4698,6 @@ mod tests {
     }
 
     #[test]
-    fn a_search_from_recents_looks_below_home_and_escape_returns_to_them() {
-        let mut f = searchable();
-        *f.system.recents.borrow_mut() = vec![f.home.join("notes.txt")];
-        open_place(&mut f.app, "Recents");
-        press(&mut f.app, &[KeyCode::Char('/')]);
-        assert_eq!(
-            names(&f.app),
-            ["notes.txt"],
-            "as it was, until something is typed"
-        );
-        search_for(&mut f.app, "trip");
-        assert_eq!(names(&f.app), TRIPS);
-        assert!(!f.app.pane().recents());
-        press(&mut f.app, &[KeyCode::Esc]);
-        assert!(f.app.pane().recents());
-        assert_eq!(names(&f.app), ["notes.txt"]);
-    }
-
-    #[test]
     fn with_no_field_open_the_keys_do_what_they_did() {
         let mut f = searchable();
         // A search and a path field, come and gone.
@@ -5105,9 +4719,9 @@ mod tests {
         press(&mut f.app, &[KeyCode::Backspace]);
         assert_eq!(f.app.pane().cwd, f.home);
         assert_eq!(selected_name(&f.app), Some("Pictures"));
-        // Tab moves between the panes again, and L alone is only a letter.
+        // Tab moves to the preview again, and L alone is only a letter.
         press(&mut f.app, &[KeyCode::Tab, KeyCode::Char('l')]);
-        assert_eq!(f.app.focus, Focus::Details);
+        assert_eq!(f.app.focus, Focus::Preview);
         assert!(f.app.field.is_none());
         press(&mut f.app, &[KeyCode::Char('q')]);
         assert!(f.app.should_quit);
@@ -5145,13 +4759,13 @@ mod tests {
 
         press(&mut f.app, &[KeyCode::Char('|')]);
         assert_eq!(f.app.panes.len(), 2);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        assert_eq!(keyboard(&f.app), (Focus::List, 1));
         assert_eq!(f.app.pane().cwd, pictures);
 
         // Pressed again it closes the right pane, as Ctrl+W does.
         press(&mut f.app, &[KeyCode::Char('|')]);
         assert_eq!(f.app.panes.len(), 1);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
 
         // Some terminals send the bar with Shift held, since it takes Shift to type.
         f.app
@@ -5172,10 +4786,10 @@ mod tests {
         let mut f = fixture();
         f.app.handle_key(alt(KeyCode::Char('1')));
         assert_eq!(f.app.panes.len(), 2);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        assert_eq!(keyboard(&f.app), (Focus::List, 1));
         f.app.handle_key(alt(KeyCode::Char('1')));
         assert_eq!(f.app.panes.len(), 1);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
 
         // Ctrl+1 still means the grid, and splits nothing.
         f.app.handle_key(ctrl(KeyCode::Char('1')));
@@ -5190,13 +4804,13 @@ mod tests {
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Down]);
         f.app.handle_key(ctrl(KeyCode::Char('w')));
         assert_eq!(f.app.panes.len(), 1, "one pane: there is none to close");
-        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
 
         // The new pane is on the right, in the same folder, with the keyboard.
         press(&mut f.app, &[KeyCode::Tab]);
         split(&mut f.app);
         assert_eq!(f.app.panes.len(), 2);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        assert_eq!(keyboard(&f.app), (Focus::List, 1));
         assert_eq!(f.app.pane().cwd, pictures);
         assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
         assert_eq!(selected_name(&f.app), Some("Trip"));
@@ -5208,37 +4822,35 @@ mod tests {
         f.app.handle_key(ctrl_alt(KeyCode::Char('N')));
         split(&mut f.app);
         assert_eq!(f.app.panes.len(), 2);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
+        assert_eq!(keyboard(&f.app), (Focus::List, 1));
         assert_eq!(f.app.pane().cwd, pictures.join("Trip"));
 
         // From the left pane too it is the right one that closes.
         press(&mut f.app, &[KeyCode::BackTab]);
         f.app.handle_key(ctrl(KeyCode::Char('w')));
         assert_eq!(f.app.panes.len(), 1);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
         assert_eq!(f.app.pane().cwd, pictures);
         assert_eq!(selected_name(&f.app), Some("a.jpg"));
 
-        // Closed from the right pane or the sidebar, the left one takes the keyboard.
+        // Closed from either pane, the left one takes the keyboard.
         f.app.handle_key(ctrl_alt(KeyCode::Char('N')));
         assert_eq!((f.app.panes.len(), f.app.active), (2, 1));
         f.app.handle_key(ctrl(KeyCode::Char('w')));
         assert_eq!(f.app.panes.len(), 1);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
         split(&mut f.app);
-        press(&mut f.app, &[KeyCode::Tab, KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Sidebar);
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
         f.app.handle_key(ctrl(KeyCode::Char('w')));
         assert_eq!(f.app.panes.len(), 1);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
     }
 
     #[test]
     fn each_pane_has_its_own_folder_history_cursor_and_listing() {
         let mut f = searchable();
         let pictures = f.home.join("Pictures");
-        let recent = f.home.join("notes.txt");
-        f.system.recents.borrow_mut().push(recent);
         press(&mut f.app, &[KeyCode::Down]);
         split(&mut f.app);
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Enter]);
@@ -5252,26 +4864,21 @@ mod tests {
         assert_eq!(selected_name(&f.app), Some("Trip"));
         press(&mut f.app, &[KeyCode::BackTab]);
         f.app.handle_key(alt(KeyCode::Left));
-        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
         assert_eq!(f.app.pane().cwd, f.home);
         press(&mut f.app, &[KeyCode::End]);
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
         assert_eq!(under_cursor(&f.app, 1), Some("Trip"));
 
-        // A search on the left, the files used lately on the right.
+        // A search on the left, a folder on the right.
         press(&mut f.app, &[KeyCode::Char('/')]);
         search_for(&mut f.app, "trip");
         assert_eq!(names(&f.app), TRIPS);
         assert_eq!(pane_names(&f.app, 1), ["Trip", "a.jpg"]);
-        // Out of the field, then on to the right pane and round to the sidebar.
-        press(&mut f.app, &[KeyCode::Tab; 4]);
-        assert_eq!(keyboard(&f.app), (Focus::Sidebar, 1));
-        open_place(&mut f.app, "Recents");
-        assert_eq!(keyboard(&f.app), (Focus::Files, 1));
-        assert!(f.app.pane().recents());
-        assert_eq!(names(&f.app), ["notes.txt"]);
+        // Out of the field, then on to the right pane.
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Tab]);
+        assert_eq!(keyboard(&f.app), (Focus::List, 1));
         assert!(f.app.panes[0].results().is_some());
-        assert_eq!(pane_names(&f.app, 0), TRIPS);
 
         // Up from there is the right pane's business alone.
         press(&mut f.app, &[KeyCode::Backspace]);
@@ -5281,39 +4888,24 @@ mod tests {
     }
 
     #[test]
-    fn tab_goes_from_the_sidebar_through_both_panes_to_the_details() {
+    fn tab_goes_between_the_two_panes() {
         let mut f = fixture();
         split(&mut f.app);
         let walk = |app: &mut App, code: KeyCode| {
-            let stops = (0..4).map(|_| {
+            let stops = (0..2).map(|_| {
                 press(app, &[code]);
                 keyboard(app)
             });
             stops.collect::<Vec<_>>()
         };
+        // Two panes show no preview: they are the only stops.
         assert_eq!(
             walk(&mut f.app, KeyCode::Tab),
-            [
-                (Focus::Details, 1),
-                (Focus::Sidebar, 1),
-                (Focus::Files, 0),
-                (Focus::Files, 1)
-            ]
+            [(Focus::List, 0), (Focus::List, 1)]
         );
         assert_eq!(
             walk(&mut f.app, KeyCode::BackTab),
-            [
-                (Focus::Files, 0),
-                (Focus::Sidebar, 0),
-                (Focus::Details, 0),
-                (Focus::Files, 1)
-            ]
-        );
-        // Without the details there are three stops.
-        f.app.handle_key(ctrl(KeyCode::Char('i')));
-        assert_eq!(
-            walk(&mut f.app, KeyCode::Tab)[..3],
-            [(Focus::Sidebar, 1), (Focus::Files, 0), (Focus::Files, 1)]
+            [(Focus::List, 0), (Focus::List, 1)]
         );
     }
 
@@ -5330,8 +4922,7 @@ mod tests {
         assert_eq!(f.app.pane().cwd, pictures);
         assert_eq!(f.app.panes[0].cwd, documents);
 
-        // The sidebar's place and the path field are the right pane's.
-        assert_eq!(f.app.current_place(), place_of(&f.app, "Pictures"));
+        // The path field is the right pane's.
         open_path_field(&mut f.app);
         assert_eq!(path_field(&f.app).0, "~/Pictures");
         press(&mut f.app, &[KeyCode::Esc]);
@@ -5343,7 +4934,6 @@ mod tests {
 
         // And the left one's once the keyboard is there.
         press(&mut f.app, &[KeyCode::BackTab]);
-        assert_eq!(f.app.current_place(), place_of(&f.app, "Documents"));
         open_path_field(&mut f.app);
         assert_eq!(path_field(&f.app).0, "~/Documents");
         press(&mut f.app, &[KeyCode::Esc]);
@@ -5375,7 +4965,7 @@ mod tests {
         assert_eq!(names(&f.app), ["notes.txt"]);
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
         assert_eq!(pane_names(&f.app, 0), FOLDER);
-        assert_eq!(said(&f.app), ("Copied 1 item.", false));
+        assert_eq!(said(&f.app), ("Copied 1 item", false));
 
         // Cut on the right, pasted on the left: both panes see it move.
         f.app.handle_key(ctrl(KeyCode::Char('x')));
@@ -5533,7 +5123,7 @@ mod tests {
         f.app.handle_key(shift(KeyCode::Home));
         assert_eq!(chosen(&f.app), ["Documents", "Pictures", "a.txt"]);
         // A page is the three rows a window this short shows.
-        crate::ui::testing::screen(&mut f.app, 120, 6);
+        crate::ui::testing::screen(&mut f.app, 120, 7);
         f.app.handle_key(shift(KeyCode::PageDown));
         assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
         f.app.handle_key(shift(KeyCode::PageUp));
@@ -5571,7 +5161,7 @@ mod tests {
         assert_eq!(chosen(&f.app), pane_names(&f.app, 0));
         assert_eq!(selected_name(&f.app), Some("b.txt"));
 
-        // Only the files' own key: the sidebar has nothing to select.
+        // Only the list's own key: from the preview it selects nothing.
         press(&mut f.app, &[KeyCode::Down, KeyCode::BackTab]);
         f.app.handle_key(ctrl(KeyCode::Char('a')));
         assert_eq!(chosen(&f.app), ["c.txt"]);
@@ -5597,7 +5187,7 @@ mod tests {
         assert_eq!(chosen(&f.app), ["c.txt"]);
         assert_eq!(selected_name(&f.app), Some("c.txt"));
 
-        // Escape dismisses what the band says before it touches the selection.
+        // Escape dismisses what the footer says before it touches the selection.
         f.app.handle_key(ctrl(KeyCode::Char('a')));
         f.app.handle_key(ctrl(KeyCode::Char('c')));
         assert_eq!(said(&f.app), ("8 items ready to paste.", false));
@@ -5635,7 +5225,7 @@ mod tests {
         assert_eq!(on_disk(&documents), ["a.txt", "b.txt", "c.txt"]);
         assert_eq!(read(documents.join("c.txt")), "c");
         assert_eq!(on_disk(&f.home).len(), 8, "the originals stay");
-        assert_eq!(said(&f.app), ("Copied 3 items.", false));
+        assert_eq!(said(&f.app), ("Copied 3 items", false));
 
         f.app.handle_key(ctrl(KeyCode::Char('a')));
         f.app.handle_key(ctrl(KeyCode::Char('x')));
@@ -5665,7 +5255,7 @@ mod tests {
             ["Documents", "Pictures", "a.txt", "e.txt", "notes.txt"]
         );
         assert_eq!(on_disk(&f.trash), ["b.txt", "c.txt", "d.txt"]);
-        assert_eq!(said(&f.app), ("Moved 3 items to the trash.", false));
+        assert_eq!(said(&f.app), ("Moved 3 items to Trash", false));
         assert_eq!(chosen(&f.app), ["e.txt"]);
         // One undo brings the three of them back.
         f.app.handle_key(ctrl(KeyCode::Char('z')));
@@ -5712,14 +5302,10 @@ mod tests {
         f.app.handle_key(ctrl_shift('c'));
         let lines = format!("{}\n{}", a.display(), b.display());
         assert_eq!(*f.system.copied.borrow(), [lines]);
-        // Space, Enter and the Open button are for the one under the cursor.
+        // Space and Enter are for the one under the cursor.
         press(&mut f.app, &[KeyCode::Char(' '), KeyCode::Enter]);
-        press(
-            &mut f.app,
-            &[KeyCode::Tab, KeyCode::Enter, KeyCode::BackTab],
-        );
         assert_eq!(*f.system.previewed.borrow(), std::slice::from_ref(&b));
-        assert_eq!(*f.system.opened.borrow(), [b.clone(), b.clone()]);
+        assert_eq!(*f.system.opened.borrow(), std::slice::from_ref(&b));
         assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
 
         f.app.handle_key(ctrl_shift('d'));
@@ -5751,9 +5337,9 @@ mod tests {
         assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(chosen(&f.app).len(), 8);
-        // Round by the details and the sidebar.
+        // Round the two panes and back to the left one.
         press(&mut f.app, &[KeyCode::Tab; 3]);
-        assert_eq!(keyboard(&f.app), (Focus::Files, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
         assert_eq!(chosen(&f.app), ["a.txt", "b.txt"]);
 
         // Pasted into the other pane's folder, it is still what is selected here.
@@ -5786,23 +5372,20 @@ mod tests {
         press(&mut f.app, &[KeyCode::Delete]);
         assert_eq!(on_disk(&f.trash), ["a.txt"]);
         assert_eq!(on_disk(&f.home).len(), 7);
-        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        assert_eq!(said(&f.app), ("Moved 1 item to Trash", false));
         press(&mut f.app, &[KeyCode::Esc]);
         assert_eq!(f.app.message, None);
         assert_eq!(chosen(&f.app), ["b.txt"]);
         f.app.handle_key(ctrl(KeyCode::Char('c')));
         assert_eq!(said(&f.app), ("1 item ready to paste.", false));
 
-        // Tab goes round the three regions and the one pane stays the active one.
+        // Tab goes to the preview and back, and the one pane stays the active one.
         let mut stops = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             press(&mut f.app, &[KeyCode::Tab]);
             stops.push(keyboard(&f.app));
         }
-        assert_eq!(
-            stops,
-            [(Focus::Details, 0), (Focus::Sidebar, 0), (Focus::Files, 0)]
-        );
+        assert_eq!(stops, [(Focus::Preview, 0), (Focus::List, 0)]);
         press(&mut f.app, &[KeyCode::F(2)]);
         assert!(matches!(f.app.dialog, Some(Dialog::Rename { .. })));
     }
@@ -5882,7 +5465,7 @@ mod tests {
         "Delete…",
     ];
 
-    const FOLDER_MENU: [&str; 19] = [
+    const FOLDER_MENU: [&str; 17] = [
         "Open Folder",
         "Preview",
         "-",
@@ -5895,8 +5478,6 @@ mod tests {
         "Copy Path",
         "-",
         "Compress",
-        "-",
-        "Pin",
         "-",
         "Open Terminal Here",
         "-",
@@ -5926,9 +5507,9 @@ mod tests {
         press(&mut f.app, &[KeyCode::Esc]);
         assert_eq!(f.app.pane().cwd, f.home, "it was not opened");
 
-        // From the details pane it is the same item's menu.
+        // From the preview pane it is the same item's menu.
         press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Details);
+        assert_eq!(f.app.focus, Focus::Preview);
         f.app.handle_key(alt(KeyCode::Enter));
         assert_eq!(menu(&f.app), FOLDER_MENU);
     }
@@ -5977,7 +5558,7 @@ mod tests {
         }
         assert!(!f.app.should_quit && !f.app.help_visible);
         assert!(f.app.dialog.is_none() && f.app.field.is_none());
-        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(f.app.focus, Focus::List);
         assert_eq!(f.app.pane().cwd, f.home);
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
         assert!(f.system.previewed.borrow().is_empty());
@@ -6018,7 +5599,7 @@ mod tests {
         select(&mut f.app, "notes (copy).txt");
         pick(&mut f.app, "Move to Trash");
         assert_eq!(on_disk(&f.trash), ["notes (copy).txt"]);
-        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        assert_eq!(said(&f.app), ("Moved 1 item to Trash", false));
         assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
 
         select(&mut f.app, "notes.txt");
@@ -6097,16 +5678,15 @@ mod tests {
         assert_eq!(chosen(&f.app), ["Documents", "Pictures"]);
         f.app.handle_key(alt(KeyCode::Enter));
         assert_eq!(menu(&f.app), FOLDER_MENU);
-        assert_eq!(dim(&f.app), ["Rename", "Paste Into Folder", "Pin"]);
+        assert_eq!(dim(&f.app), ["Rename", "Paste Into Folder"]);
         press(&mut f.app, &[KeyCode::Esc]);
-        for refused in ["Rename", "Paste Into Folder", "Pin"] {
+        for refused in ["Rename", "Paste Into Folder"] {
             pick(&mut f.app, refused);
             assert!(f.app.menu.is_some(), "{refused}");
             assert!(f.app.dialog.is_none() && f.app.working().is_none());
             press(&mut f.app, &[KeyCode::Esc]);
         }
         assert_eq!(chosen(&f.app), ["Documents", "Pictures"]);
-        assert_eq!(sections(&f.app), [home_places(), views()]);
 
         // What a search found in several folders has no one folder for an archive.
         fs::write(f.home.join("Pictures").join("b.txt"), "b").unwrap();
@@ -6120,8 +5700,10 @@ mod tests {
         assert_eq!(dim(&f.app), ["Rename", "Compress"]);
         press(&mut f.app, &[KeyCode::Esc, KeyCode::Esc]);
 
-        // Recents with nothing in them: nothing is pasted or made there.
-        open_place(&mut f.app, "Recents");
+        // A search that found nothing: nothing is pasted or made there.
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "zzz");
+        finish_search(&mut f.app);
         assert!(names(&f.app).is_empty());
         f.app.handle_key(alt(KeyCode::Enter));
         let nothing = ["Paste", "New Folder", "Open Terminal Here"];
@@ -6130,43 +5712,6 @@ mod tests {
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
         assert!(f.app.dialog.is_none() && f.app.menu.is_some());
         assert_eq!(on_disk(&f.home).len(), 8);
-    }
-
-    #[test]
-    fn in_the_sidebar_the_menu_is_for_the_place_under_the_cursor() {
-        let mut f = fixture();
-        let trip = f.home.join("Pictures").join("Trip");
-        f.app.navigate(&trip);
-        pin(&mut f.app);
-        for (place, lines) in [
-            ("Documents", vec!["Open"]),
-            ("Trip", vec!["Open", "-", "Unpin"]),
-            ("Recents", vec!["Open"]),
-            ("Trash", vec!["Open", "-", "Empty Trash…"]),
-        ] {
-            go_to_place(&mut f.app, place);
-            f.app.handle_key(alt(KeyCode::Enter));
-            assert_eq!(menu(&f.app), lines, "{place}");
-            assert!(dim(&f.app).is_empty());
-            press(&mut f.app, &[KeyCode::Esc]);
-            assert_eq!(f.app.focus, Focus::Sidebar);
-        }
-        assert_eq!(f.app.pane().cwd, trip, "nothing was opened yet");
-
-        // Open goes there, as Enter does.
-        go_to_place(&mut f.app, "Documents");
-        pick(&mut f.app, "Open");
-        assert_eq!(f.app.pane().cwd, f.home.join("Documents"));
-        assert_eq!(f.app.focus, Focus::Files);
-        go_to_place(&mut f.app, "Recents");
-        pick(&mut f.app, "Open");
-        assert!(f.app.pane().recents());
-
-        // Unpin takes the pin away, as Delete does there.
-        go_to_place(&mut f.app, "Trip");
-        pick(&mut f.app, "Unpin");
-        assert_eq!(sections(&f.app), [home_places(), views()]);
-        assert!(trip.is_dir(), "the folder itself is left alone");
     }
 
     #[test]
@@ -6191,30 +5736,6 @@ mod tests {
         pick(&mut f.app, "Open Terminal Here");
         assert_eq!(said(&f.app), ("Couldn't start a terminal.", true));
         assert_eq!(f.system.terminals.borrow().len(), 3);
-    }
-
-    #[test]
-    fn pin_in_the_menu_pins_the_folder_under_the_cursor() {
-        let mut f = fixture();
-        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
-        assert_eq!(selected_name(&f.app), Some("Trip"));
-        pick(&mut f.app, "Pin");
-        assert_eq!(sections(&f.app)[1], ("Pinned", vec!["Trip"]));
-        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-
-        // Pinned, the line takes the pin away again.
-        f.app.handle_key(alt(KeyCode::Enter));
-        assert!(menu(&f.app).contains(&"Unpin") && !menu(&f.app).contains(&"Pin"));
-        press(&mut f.app, &[KeyCode::Esc]);
-        pick(&mut f.app, "Unpin");
-        assert_eq!(sections(&f.app), [home_places(), views()]);
-
-        // What Home already lists is refused in the words Ctrl+P uses.
-        press(&mut f.app, &[KeyCode::Backspace]);
-        select(&mut f.app, "Documents");
-        pick(&mut f.app, "Pin");
-        assert_eq!(said(&f.app), ("Documents is already under Home.", false));
-        assert_eq!(sections(&f.app), [home_places(), views()]);
     }
 
     #[test]
@@ -6248,7 +5769,7 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('z')));
         assert_eq!(on_disk(&f.home), ["Documents", "Pictures", "notes.txt"]);
         assert_eq!(read(f.trash.join("notes.txt.zip")), "notes.txt");
-        let undid = "Undid compressing into notes.txt.zip.";
+        let undid = "Undid the compress";
         assert_eq!(said(&f.app), (undid, false));
         // There it is known like anything else this app moved to the trash.
         let known = f.app.trashed(&f.trash.join("notes.txt.zip"));
@@ -6414,7 +5935,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::Delete]);
         assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
 
-        open_place(&mut f.app, "Trash");
+        open_trash(&mut f.app);
         assert_eq!(names(&f.app), ["a.jpg", "notes.txt"]);
         f.app.handle_key(alt(KeyCode::Enter));
         assert_eq!(menu(&f.app), TRASH_MENU);
@@ -6432,7 +5953,7 @@ mod tests {
 
         // Undone, they are in the trash again, and still known there.
         f.app.handle_key(ctrl(KeyCode::Char('z')));
-        assert_eq!(said(&f.app), ("Undid restoring 2 items.", false));
+        assert_eq!(said(&f.app), ("Undid the restore", false));
         assert_eq!(on_disk(&f.trash), ["a.jpg", "notes.txt"]);
         assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
         assert_eq!(on_disk(&pictures), ["Trip"]);
@@ -6468,7 +5989,7 @@ mod tests {
         // Something else put it in the trash.
         fs::write(f.trash.join("stray.txt"), "stray").unwrap();
 
-        open_place(&mut f.app, "Trash");
+        open_trash(&mut f.app);
         let in_trash = ["day.jpg", "notes.txt", "stray.txt"];
         assert_eq!(names(&f.app), in_trash);
         let home = f.home.file_name().unwrap().to_string_lossy().into_owned();
@@ -6515,7 +6036,7 @@ mod tests {
         assert_eq!(on_disk(&f.trash), held);
         assert_eq!(state::load_trashed(&state).len(), 2);
 
-        open_place(&mut app, "Trash");
+        open_trash(&mut app);
         pick(&mut app, "Empty Trash…");
         let Some(Dialog::EmptyTrash { paths, armed }) = &app.dialog else {
             panic!("it didn't ask");
@@ -6554,18 +6075,19 @@ mod tests {
     }
 
     #[test]
-    fn emptying_the_trash_from_the_sidebar_says_one_item_for_one() {
+    fn emptying_the_trash_says_one_item_for_one() {
         let mut f = fixture();
         select(&mut f.app, "notes.txt");
         press(&mut f.app, &[KeyCode::Delete]);
-        go_to_place(&mut f.app, "Trash");
+        open_trash(&mut f.app);
         pick(&mut f.app, "Empty Trash…");
         assert!(matches!(f.app.dialog, Some(Dialog::EmptyTrash { .. })));
         press(&mut f.app, &[KeyCode::Tab, KeyCode::Enter]);
         assert_eq!(said(&f.app), ("Emptied the trash: 1 item deleted.", false));
         assert!(on_disk(&f.trash).is_empty());
         assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
-        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(f.app.pane().cwd, f.trash);
+        assert!(names(&f.app).is_empty());
     }
 
     #[test]
@@ -6573,7 +6095,7 @@ mod tests {
         let mut f = fixture();
         let already = ("The trash is already empty.", false);
         // One nothing was ever moved to.
-        go_to_place(&mut f.app, "Trash");
+        open_trash(&mut f.app);
         pick(&mut f.app, "Empty Trash…");
         assert!(f.app.dialog.is_none());
         assert_eq!(said(&f.app), already);
@@ -6594,7 +6116,7 @@ mod tests {
         assert!(f.trash.join(".DS_Store").exists());
 
         // One macOS keeps the terminal out of: nothing is deleted, and it
-        // says what the sidebar says.
+        // says how to allow it.
         fs::write(f.trash.join("notes.txt"), "still here").unwrap();
         fs::set_permissions(&f.trash, fs::Permissions::from_mode(0o000)).unwrap();
         pick(&mut f.app, "Empty Trash…");
@@ -6643,7 +6165,7 @@ mod tests {
         assert!(f.app.menu.is_none());
 
         // Ctrl+V pastes into the folder that is showing, whatever is under
-        // the cursor; Ctrl+P pins that folder.
+        // the cursor.
         f.app.handle_key(ctrl(KeyCode::Char('c')));
         f.app.navigate(&pictures);
         assert_eq!(selected_name(&f.app), Some("Trip"));
@@ -6651,30 +6173,22 @@ mod tests {
         finish_work(&mut f.app);
         assert_eq!(on_disk(&pictures), ["Trip", "a.jpg", "notes.txt"]);
         assert!(on_disk(&pictures.join("Trip")).is_empty());
-        f.app.navigate(&pictures.join("Trip"));
-        pin(&mut f.app);
-        assert_eq!(sections(&f.app)[1], ("Pinned", vec!["Trip"]));
-
-        // Enter in the sidebar goes to the place, and Delete there unpins.
-        open_place(&mut f.app, "Documents");
+        f.app.navigate(&documents);
         assert_eq!(
             (f.app.pane().cwd.clone(), f.app.focus),
-            (documents, Focus::Files)
+            (documents, Focus::List)
         );
-        go_to_place(&mut f.app, "Trip");
-        press(&mut f.app, &[KeyCode::Delete]);
-        assert_eq!(sections(&f.app), [home_places(), views()]);
 
         // Delete moves to the trash, and asks in the trash itself.
-        open_place(&mut f.app, "Pictures");
+        f.app.navigate(&pictures);
         select(&mut f.app, "notes.txt");
         press(&mut f.app, &[KeyCode::Delete]);
         assert_eq!(on_disk(&f.trash), ["notes.txt"]);
-        assert_eq!(said(&f.app), ("Moved 1 item to the trash.", false));
+        assert_eq!(said(&f.app), ("Moved 1 item to Trash", false));
         // Escape dismisses what was said, then has nothing left to do.
         press(&mut f.app, &[KeyCode::Esc]);
         assert_eq!(f.app.message, None);
-        open_place(&mut f.app, "Trash");
+        open_trash(&mut f.app);
         press(&mut f.app, &[KeyCode::Delete]);
         assert!(matches!(f.app.dialog, Some(Dialog::Delete { .. })));
         press(&mut f.app, &[KeyCode::Esc]);
@@ -6774,19 +6288,26 @@ mod mouse_tests {
 
     const VIEWS: [char; 3] = ['2', '1', '3'];
 
+    /// The columns a view draws a single pane's items in, at 120 across:
+    /// the list between the parent's column and the preview, the others
+    /// the whole width.
+    fn files(view: char) -> Range<u16> {
+        if view == '2' { 26..73 } else { 0..120 }
+    }
+
     #[test]
     fn a_click_on_an_item_puts_the_keyboard_and_the_cursor_on_it_alone_in_every_view() {
         for view in VIEWS {
             let mut f = several();
             f.app.handle_key(ctrl(KeyCode::Char(view)));
             f.app.handle_key(shift(KeyCode::Down));
-            press(&mut f.app, &[KeyCode::BackTab]);
-            assert_eq!(f.app.focus, Focus::Sidebar);
-            let (x, y) = spot(&mut f.app, "c.txt", 24..86);
+            // The keyboard elsewhere: in the preview.
+            f.app.focus = Focus::Preview;
+            let (x, y) = spot(&mut f.app, "c.txt", files(view));
             // A tile is its picture as much as its name.
             let at = if view == '1' { (x, y - 3) } else { (x, y) };
             click(&mut f.app, at);
-            assert_eq!(f.app.focus, Focus::Files, "view {view}");
+            assert_eq!(f.app.focus, Focus::List, "view {view}");
             assert_eq!(f.app.active, 0);
             assert_eq!(cursor_name(&f.app), "c.txt", "view {view}");
             assert_eq!(selection(&f.app), ["c.txt"], "view {view}");
@@ -6803,26 +6324,16 @@ mod mouse_tests {
             split(&mut f.app);
             press(&mut f.app, &[KeyCode::Down]);
             assert_eq!(f.app.active, 1);
-            let at = spot(&mut f.app, "a.txt", 24..55);
+            let at = spot(&mut f.app, "a.txt", 0..60);
             click(&mut f.app, at);
-            assert_eq!(
-                (f.app.active, f.app.focus),
-                (0, Focus::Files),
-                "view {view}"
-            );
+            assert_eq!((f.app.active, f.app.focus), (0, Focus::List), "view {view}");
             assert_eq!(cursor_name(&f.app), "a.txt", "view {view}");
             assert_eq!(f.app.panes[1].cursor, 1, "the other pane's cursor stays");
 
             // Empty space in the right pane: active, its cursor where it was.
-            press(&mut f.app, &[KeyCode::BackTab]);
-            assert_eq!(f.app.focus, Focus::Sidebar);
             draw(&mut f.app);
-            click(&mut f.app, (57, 36));
-            assert_eq!(
-                (f.app.active, f.app.focus),
-                (1, Focus::Files),
-                "view {view}"
-            );
+            click(&mut f.app, (90, 36));
+            assert_eq!((f.app.active, f.app.focus), (1, Focus::List), "view {view}");
             assert_eq!(f.app.panes[1].cursor, 1, "view {view}");
             assert_eq!(f.app.panes[0].cursor, 2, "view {view}");
         }
@@ -6834,11 +6345,10 @@ mod mouse_tests {
             let mut f = several();
             f.app.handle_key(ctrl(KeyCode::Char(view)));
             f.app.handle_key(shift(KeyCode::Down));
-            press(&mut f.app, &[KeyCode::Tab]);
-            assert_eq!(f.app.focus, Focus::Details);
+            f.app.focus = Focus::Preview;
             draw(&mut f.app);
-            click(&mut f.app, (25, 37));
-            assert_eq!(f.app.focus, Focus::Files, "view {view}");
+            click(&mut f.app, (40, 37));
+            assert_eq!(f.app.focus, Focus::List, "view {view}");
             assert_eq!(selection(&f.app), ["Documents", "Pictures"], "view {view}");
             assert_eq!(cursor_name(&f.app), "Pictures", "view {view}");
         }
@@ -6850,8 +6360,8 @@ mod mouse_tests {
         f.app.handle_key(ctrl(KeyCode::Char('3')));
         press(&mut f.app, &[KeyCode::Down, KeyCode::Right]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-        let trip = spot(&mut f.app, "Trip", 51..86);
-        let jpg = spot(&mut f.app, "a.jpg", 51..86);
+        let trip = spot(&mut f.app, "Trip", 27..53);
+        let jpg = spot(&mut f.app, "a.jpg", 27..53);
         click(&mut f.app, jpg);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
         assert_eq!(cursor_name(&f.app), "a.jpg");
@@ -6859,11 +6369,11 @@ mod mouse_tests {
         assert_eq!(cursor_name(&f.app), "Trip");
 
         // The home column, left of it: there, with the row clicked selected.
-        let notes = spot(&mut f.app, "notes.txt", 24..51);
+        let notes = spot(&mut f.app, "notes.txt", 0..26);
         click(&mut f.app, notes);
         assert_eq!(f.app.pane().cwd, f.home);
         assert_eq!(cursor_name(&f.app), "notes.txt");
-        assert_eq!(f.app.focus, Focus::Files);
+        assert_eq!(f.app.focus, Focus::List);
         // Ordinary navigation: Back returns.
         f.app.handle_key(alt(KeyCode::Left));
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
@@ -6875,7 +6385,7 @@ mod mouse_tests {
             let mut f = fixture();
             let now = clock(&mut f.app);
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            let pictures = spot(&mut f.app, "Pictures", 24..86);
+            let pictures = spot(&mut f.app, "Pictures", files(view));
             click(&mut f.app, pictures);
             wait(&now, 400);
             draw(&mut f.app);
@@ -6884,7 +6394,7 @@ mod mouse_tests {
             assert_eq!(f.app.pane().back.len(), 1, "in the history");
 
             // A file opens with its app.
-            let jpg = spot(&mut f.app, "a.jpg", 24..86);
+            let jpg = spot(&mut f.app, "a.jpg", files(view));
             click(&mut f.app, jpg);
             wait(&now, 150);
             draw(&mut f.app);
@@ -6901,7 +6411,7 @@ mod mouse_tests {
             assert_eq!(*f.system.opened.borrow(), opened, "view {view}");
 
             // Quick, on two different items: two clicks.
-            let trip = spot(&mut f.app, "Trip", 24..86);
+            let trip = spot(&mut f.app, "Trip", files(view));
             wait(&now, 1000);
             click(&mut f.app, trip);
             wait(&now, 100);
@@ -6918,9 +6428,9 @@ mod mouse_tests {
         for view in VIEWS {
             let mut f = several();
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            let a = spot(&mut f.app, "a.txt", 24..86);
-            let b = spot(&mut f.app, "b.txt", 24..86);
-            let d = spot(&mut f.app, "d.txt", 24..86);
+            let a = spot(&mut f.app, "a.txt", files(view));
+            let b = spot(&mut f.app, "b.txt", files(view));
+            let d = spot(&mut f.app, "d.txt", files(view));
             click(&mut f.app, a);
             click_with(&mut f.app, d, KeyModifiers::SHIFT);
             assert_eq!(selection(&f.app), ["a.txt", "b.txt", "c.txt", "d.txt"]);
@@ -6948,7 +6458,7 @@ mod mouse_tests {
         for view in VIEWS {
             let mut f = several();
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            let at = |f: &mut Fixture, name| spot(&mut f.app, name, 24..86);
+            let at = |f: &mut Fixture, name| spot(&mut f.app, name, files(view));
             let (a, c, e) = (
                 at(&mut f, "a.txt"),
                 at(&mut f, "c.txt"),
@@ -6976,7 +6486,7 @@ mod mouse_tests {
         for view in VIEWS {
             let mut f = several();
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            let at = |f: &mut Fixture, name| spot(&mut f.app, name, 24..86);
+            let at = |f: &mut Fixture, name| spot(&mut f.app, name, files(view));
             let (a, b, c, e) = (
                 at(&mut f, "a.txt"),
                 at(&mut f, "b.txt"),
@@ -6990,7 +6500,7 @@ mod mouse_tests {
             let at = (e.0 + 2, e.1);
             right_click(&mut f.app, at);
             assert_eq!(selection(&f.app), ["e.txt"], "view {view}");
-            assert_eq!(f.app.focus, Focus::Files);
+            assert_eq!(f.app.focus, Focus::List);
             assert_eq!(&labels(&f.app)[..4], ["Open", "Preview", "-", "Rename"]);
             // Right under the click, or right above it without room below.
             let drawn = draw(&mut f.app);
@@ -7022,13 +6532,13 @@ mod mouse_tests {
 
         // Alt+Enter after it opens next to the item again, not at the click.
         let mut f = several();
-        let e = spot(&mut f.app, "e.txt", 24..86);
+        let e = spot(&mut f.app, "e.txt", 26..73);
         right_click(&mut f.app, (e.0 + 10, e.1));
         press(&mut f.app, &[KeyCode::Esc]);
         f.app.handle_key(alt(KeyCode::Enter));
         let drawn = draw(&mut f.app);
         assert_eq!(drawn[(e.0, e.1 + 1)].symbol(), "┌");
-        assert_eq!(find(&drawn, "Open", 24..86), Some((e.0 + 2, e.1 + 2)));
+        assert_eq!(find(&drawn, "Open", 26..73), Some((e.0 + 2, e.1 + 2)));
     }
 
     #[test]
@@ -7043,18 +6553,18 @@ mod mouse_tests {
         assert_eq!(cursor_name(&f.app), "Documents", "nothing selected anew");
 
         // Paste is dim with nothing copied: a click on it does nothing.
-        let paste = spot(&mut f.app, "Paste", 24..86);
+        let paste = spot(&mut f.app, "Paste", 26..73);
         click(&mut f.app, paste);
         assert!(f.app.menu.is_some() && f.app.message.is_none());
         // The terminal opens in the folder showing, not the one under the cursor.
-        let terminal = spot(&mut f.app, "Open Terminal Here", 24..86);
+        let terminal = spot(&mut f.app, "Open Terminal Here", 26..73);
         click(&mut f.app, terminal);
         assert!(f.app.menu.is_none());
         assert_eq!(*f.system.terminals.borrow(), [f.home.clone()]);
 
         draw(&mut f.app);
         right_click(&mut f.app, (40, 30));
-        let new = spot(&mut f.app, "New Folder", 24..86);
+        let new = spot(&mut f.app, "New Folder", 26..73);
         click(&mut f.app, new);
         assert!(matches!(f.app.dialog, Some(Dialog::NewFolder { .. })));
     }
@@ -7064,7 +6574,7 @@ mod mouse_tests {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(alt(KeyCode::Enter));
-        let documents = spot(&mut f.app, "Documents", 24..86);
+        let documents = spot(&mut f.app, "Documents", 26..73);
         click(&mut f.app, documents);
         assert!(f.app.menu.is_none());
         assert_eq!(
@@ -7074,7 +6584,7 @@ mod mouse_tests {
         );
 
         f.app.handle_key(alt(KeyCode::Enter));
-        let copy_path = spot(&mut f.app, "Copy Path", 24..86);
+        let copy_path = spot(&mut f.app, "Copy Path", 26..73);
         click(&mut f.app, copy_path);
         assert!(f.app.menu.is_none());
         let path = f.home.join("notes.txt").display().to_string();
@@ -7089,35 +6599,12 @@ mod mouse_tests {
     }
 
     #[test]
-    fn right_click_on_a_place_opens_its_menu_and_a_click_on_one_opens_it() {
-        let mut f = fixture();
-        let place = spot(&mut f.app, "Pictures", 0..24);
-        right_click(&mut f.app, place);
-        assert_eq!(f.app.focus, Focus::Sidebar);
-        assert_eq!(labels(&f.app), ["Open"]);
-        assert_eq!(f.app.pane().cwd, f.home, "not opened yet");
-        let open = spot(&mut f.app, "Open", 0..86);
-        assert_eq!(open, (place.0 + 2, place.1 + 2), "at the click");
-        click(&mut f.app, open);
-        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-        assert_eq!(f.app.focus, Focus::Files);
-
-        // A plain click opens a place, the way Enter in the sidebar does.
-        let documents = spot(&mut f.app, "Documents", 0..24);
-        click(&mut f.app, documents);
-        assert_eq!(f.app.pane().cwd, f.home.join("Documents"));
-        assert_eq!(f.app.focus, Focus::Files);
-        f.app.handle_key(alt(KeyCode::Left));
-        assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-    }
-
-    #[test]
     fn a_click_on_a_breadcrumb_goes_there_and_back_returns() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Enter]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
         let crumb = spot(&mut f.app, "Pictures", 0..86);
-        assert_eq!(crumb.1, 0, "in the top bar");
+        assert_eq!(crumb.1, 0, "in the header");
         click(&mut f.app, crumb);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
         f.app.handle_key(alt(KeyCode::Left));
@@ -7136,58 +6623,8 @@ mod mouse_tests {
         assert_eq!(f.app.active, 1);
     }
 
-    #[test]
-    fn the_top_bar_toggles_do_what_their_keys_do() {
-        let mut f = fixture();
-        for (now, next) in [
-            ("≡", ViewMode::Columns),
-            ("▥", ViewMode::Grid),
-            ("▦", ViewMode::List),
-        ] {
-            let toggle = spot(&mut f.app, now, 86..120);
-            click(&mut f.app, toggle);
-            assert_eq!(f.app.view, next);
-        }
-        let sort = spot(&mut f.app, "⇅", 86..120);
-        click(&mut f.app, sort);
-        assert_eq!(f.app.sort, SortMode::Name.step(1));
-        assert_eq!(said(&f.app), Some(SortMode::Name.step(1).tip()));
-        let hidden = spot(&mut f.app, "◉", 86..120);
-        click(&mut f.app, hidden);
-        assert!(f.app.show_hidden && names(&f.app).contains(&".hidden".to_string()));
-        let details = spot(&mut f.app, "◨", 86..120);
-        click(&mut f.app, details);
-        assert!(!f.app.details_visible);
-    }
-
-    #[test]
-    fn the_split_toggle_opens_and_closes_the_second_pane_and_is_lit_while_split() {
-        let mut f = fixture();
-        let toggle = spot(&mut f.app, "◫", 86..120);
-        assert_eq!(draw(&mut f.app)[toggle].bg, crate::theme::BACKGROUND);
-
-        click(&mut f.app, toggle);
-        assert_eq!(f.app.panes.len(), 2);
-        assert_eq!(f.app.active, 1);
-        assert_eq!(draw(&mut f.app)[toggle].bg, crate::theme::SELECTION);
-
-        click(&mut f.app, toggle);
-        assert_eq!(f.app.panes.len(), 1);
-        assert_eq!(f.app.active, 0);
-        assert_eq!(draw(&mut f.app)[toggle].bg, crate::theme::BACKGROUND);
-    }
-
     fn said(app: &App) -> Option<&str> {
         app.message.as_ref().map(|message| message.text.as_str())
-    }
-
-    #[test]
-    fn the_open_button_of_the_details_opens_the_item_under_the_cursor() {
-        let mut f = fixture();
-        press(&mut f.app, &[KeyCode::End]);
-        let open = spot(&mut f.app, "Open", 86..120);
-        click(&mut f.app, open);
-        assert_eq!(*f.system.opened.borrow(), [f.home.join("notes.txt")]);
     }
 
     #[test]
@@ -7197,65 +6634,70 @@ mod mouse_tests {
             fs::write(f.home.join(format!("{n}.txt")), "").unwrap();
         }
         press(&mut f.app, &[KeyCode::F(5)]);
-        // 63 items, 37 rows.
-        let top = spot(&mut f.app, "Documents", 24..86);
+        // 63 items, 36 rows.
+        let top = spot(&mut f.app, "Documents", 26..73);
         wheel(&mut f.app, top, true);
         assert_eq!(f.app.pane().offset, 3);
         assert_eq!(f.app.pane().cursor, 3, "moved down into sight");
         let drawn = draw(&mut f.app);
         assert_eq!(
-            find(&drawn, "11.txt", 24..86),
-            Some((28, 3)),
+            find(&drawn, "11.txt", 26..73),
+            Some((29, 2)),
             "the fourth item on top"
         );
         for _ in 0..20 {
             wheel(&mut f.app, top, true);
         }
-        assert_eq!(f.app.pane().offset, 26, "as far as it goes");
-        assert_eq!(f.app.pane().cursor, 26);
+        assert_eq!(f.app.pane().offset, 27, "as far as it goes");
+        assert_eq!(f.app.pane().cursor, 27);
         wheel(&mut f.app, top, false);
-        assert_eq!(f.app.pane().offset, 23);
-        assert_eq!(f.app.pane().cursor, 26, "still in sight: left alone");
+        assert_eq!(f.app.pane().offset, 24);
+        assert_eq!(f.app.pane().cursor, 27, "still in sight: left alone");
         draw(&mut f.app);
         press(&mut f.app, &[KeyCode::Down]);
         draw(&mut f.app);
-        assert_eq!((f.app.pane().offset, f.app.pane().cursor), (23, 27));
+        assert_eq!((f.app.pane().offset, f.app.pane().cursor), (24, 28));
+    }
+
+    #[test]
+    fn the_wheel_over_the_preview_scrolls_it_and_a_click_gives_it_the_keyboard() {
+        let mut f = fixture();
+        let lines: String = (1..=80).map(|n| format!("line {n}\n")).collect();
+        fs::write(f.home.join("notes.txt"), lines).unwrap();
+        press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
+        f.app.tick();
+        draw(&mut f.app);
+        wheel(&mut f.app, (100, 20), true);
+        wheel(&mut f.app, (100, 20), true);
+        assert_eq!(f.app.preview_scroll, 6);
+        let drawn = draw(&mut f.app);
+        assert_eq!(find(&drawn, "7 line 7", 74..120).map(|(_, y)| y), Some(5));
+        wheel(&mut f.app, (100, 20), false);
+        assert_eq!(f.app.preview_scroll, 3);
+        assert_eq!(
+            f.app.focus,
+            Focus::List,
+            "the wheel leaves the keyboard alone"
+        );
+        click(&mut f.app, (100, 20));
+        assert_eq!(f.app.focus, Focus::Preview);
+        assert_eq!(cursor_name(&f.app), "notes.txt");
     }
 
     #[test]
     fn the_wheel_scrolls_the_grid_by_a_row_of_tiles() {
         let mut f = grid_fixture();
         // Ten tiles, three across: four rows, two showing.
-        let drawn = buffer(&mut f.app, 120, 24);
-        let first = find(&drawn, "Documents", 24..86).unwrap();
+        let drawn = buffer(&mut f.app, 62, 26);
+        let first = find(&drawn, "Documents", 0..62).unwrap();
         wheel(&mut f.app, first, true);
         assert_eq!((f.app.pane().offset, f.app.pane().cursor), (1, 3));
-        buffer(&mut f.app, 120, 24);
+        buffer(&mut f.app, 62, 26);
         wheel(&mut f.app, first, true);
         wheel(&mut f.app, first, true);
         assert_eq!((f.app.pane().offset, f.app.pane().cursor), (2, 6));
         wheel(&mut f.app, first, false);
         assert_eq!((f.app.pane().offset, f.app.pane().cursor), (1, 6));
-    }
-
-    #[test]
-    fn the_wheel_over_the_sidebar_scrolls_it() {
-        let mut f = fixture();
-        for n in 0..20 {
-            fs::create_dir(f.home.join(format!("Folder {n:02}"))).unwrap();
-        }
-        press(&mut f.app, &[KeyCode::F(5)]);
-        let row = |drawn: &Buffer, text: &str| find(drawn, text, 0..23).map(|(_, y)| y);
-        let drawn = buffer(&mut f.app, 120, 14);
-        assert_eq!(row(&drawn, "HOME"), Some(3));
-        wheel(&mut f.app, (5, 8), true);
-        let drawn = buffer(&mut f.app, 120, 14);
-        assert_eq!(row(&drawn, "HOME"), None);
-        assert_eq!(row(&drawn, "Folder 00"), Some(2));
-        assert_eq!(f.app.focus, Focus::Files, "the keyboard stays");
-        wheel(&mut f.app, (5, 8), false);
-        let drawn = buffer(&mut f.app, 120, 14);
-        assert_eq!(row(&drawn, "HOME"), Some(3));
     }
 
     #[test]
@@ -7279,7 +6721,7 @@ mod mouse_tests {
         }
         assert!(f.app.help_visible && f.app.menu.is_none());
         assert_eq!(crate::ui::testing::screen(&mut f.app, 120, 24), wheeled);
-        assert_eq!((f.app.pane().cursor, f.app.focus), (0, Focus::Files));
+        assert_eq!((f.app.pane().cursor, f.app.focus), (0, Focus::List));
         assert_eq!(f.app.pane().cwd, f.home);
     }
 
@@ -7288,7 +6730,7 @@ mod mouse_tests {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(shift(KeyCode::Delete));
-        let documents = spot(&mut f.app, "Documents", 24..86);
+        let documents = spot(&mut f.app, "Documents", 26..73);
         click(&mut f.app, documents);
         right_click(&mut f.app, documents);
         assert!(matches!(
@@ -7298,13 +6740,13 @@ mod mouse_tests {
         assert!(f.app.menu.is_none());
         assert_eq!(cursor_name(&f.app), "notes.txt");
 
-        let cancel = spot(&mut f.app, "Cancel", 24..96);
+        let cancel = spot(&mut f.app, "Cancel", 0..120);
         click(&mut f.app, cancel);
         assert!(f.app.dialog.is_none());
         assert!(f.home.join("notes.txt").exists());
 
         f.app.handle_key(shift(KeyCode::Delete));
-        let delete = spot(&mut f.app, "Delete  ", 24..96);
+        let delete = spot(&mut f.app, "Delete  ", 0..120);
         click(&mut f.app, delete);
         assert!(f.app.dialog.is_none());
         assert!(!f.home.join("notes.txt").exists());
@@ -7312,11 +6754,11 @@ mod mouse_tests {
 
         // A name: Apply and Cancel are what Enter and Escape are.
         press(&mut f.app, &[KeyCode::Home, KeyCode::F(2)]);
-        let cancel = spot(&mut f.app, "Esc Cancel", 24..96);
+        let cancel = spot(&mut f.app, "Esc Cancel", 0..120);
         click(&mut f.app, cancel);
         assert!(f.app.dialog.is_none());
         press(&mut f.app, &[KeyCode::F(2), KeyCode::Char('s')]);
-        let apply = spot(&mut f.app, "⏎ Apply", 24..96);
+        let apply = spot(&mut f.app, "⏎ Apply", 0..120);
         click(&mut f.app, apply);
         assert!(f.app.dialog.is_none());
         assert!(f.home.join("Documentss").is_dir());
@@ -7326,7 +6768,7 @@ mod mouse_tests {
     fn a_click_in_the_files_closes_the_path_field_or_hands_the_search_over_then_acts() {
         let mut f = fixture();
         f.app.handle_key(ctrl(KeyCode::Char('l')));
-        let notes = spot(&mut f.app, "notes.txt", 24..86);
+        let notes = spot(&mut f.app, "notes.txt", 26..73);
         click(&mut f.app, notes);
         assert!(f.app.field.is_none());
         assert_eq!(cursor_name(&f.app), "notes.txt");
@@ -7334,7 +6776,7 @@ mod mouse_tests {
         press(&mut f.app, &[KeyCode::Char('/')]);
         type_text(&mut f.app, "jpg");
         finish_search(&mut f.app);
-        let found = spot(&mut f.app, "a.jpg", 24..86);
+        let found = spot(&mut f.app, "a.jpg", 26..73);
         click(&mut f.app, found);
         assert!(f.app.field.is_none(), "the keyboard is with what was found");
         assert!(f.app.pane().results().is_some(), "still showing it");
@@ -7348,7 +6790,7 @@ mod mouse_tests {
     #[test]
     fn drags_moves_releases_and_the_middle_button_do_nothing() {
         let mut f = fixture();
-        let notes = spot(&mut f.app, "notes.txt", 24..86);
+        let notes = spot(&mut f.app, "notes.txt", 26..73);
         for kind in [
             MouseEventKind::Up(MouseButton::Left),
             MouseEventKind::Drag(MouseButton::Left),
@@ -7358,7 +6800,7 @@ mod mouse_tests {
         ] {
             mouse(&mut f.app, kind, notes, KeyModifiers::NONE);
         }
-        assert_eq!((f.app.pane().cursor, f.app.focus), (0, Focus::Files));
+        assert_eq!((f.app.pane().cursor, f.app.focus), (0, Focus::List));
         assert!(f.app.menu.is_none() && f.app.field.is_none());
     }
 

@@ -1,14 +1,16 @@
 # filefinder-tui
 
-A keyboard-first terminal file manager for macOS, written in Rust with [ratatui](https://ratatui.rs/). It follows the looks and behavior of Omarchy's [folio](https://github.com/omacom/folio): one quiet window with breadcrumbs, a sidebar, a roomy grid with real previews, and a details pane.
+A keyboard-first terminal file manager for macOS, written in Rust with [ratatui](https://ratatui.rs/). It follows the terminal interface of [flea](https://github.com/thisisgm/flea): a header with the path and the sort order, then three columns (the parent folder, the list, and a preview), and a footer with the counts, what just happened and the free space. There is no sidebar; colours are flea's quiet grey palette on your terminal's own background.
 
 Nothing runs in the background. Folders are read when you open them, and thumbnails are made when a tile needs one.
 
-- **Three views**: a grid with real thumbnails, a list with permissions (`drwx------`), size and date, and Finder-style columns. Ctrl+1/2/3 switches; the choice is remembered.
-- **Details pane**: a large preview, the kind and size, the modified date, picture dimensions, and the opening lines of text files. Space opens Quick Look.
-- **Sidebar**: every folder in your home, pinned folders, Recents (from Spotlight), the Trash with Restore and Empty Trash, and mounted drives.
+- **The screen**: the parent folder's items on the left (the folder you are in lifted), the list in the middle with a glyph, the name and the size on each row, and the preview on the right. Links show in cyan with where they point, programs in green. Alt+P hides or shows the preview, and the choice is remembered.
+- **Preview pane**: the name, kind, size and date, then a folder's items, a text file's lines with line numbers, a picture with its pixel size, or what several selected items add up to. Tab moves the keyboard into it to scroll. Space opens Quick Look.
+- **Other views**: a grid with real thumbnails and Finder-style columns. Ctrl+1/2/3 switches between the grid, the list and the columns; the choice is remembered.
+- **Colours**: truecolor when `COLORTERM` says so, the nearest of 256 colours otherwise, and none with `NO_COLOR` (the cursor row is then reverse video and marked rows underlined). `FILEFINDER_ICONS=plain` replaces the Nerd Font glyphs with plain marks.
+- **Trash**: `~/.Trash`, with Restore and Empty Trash in its menu; reach it with Ctrl+L.
 - **File operations** that never overwrite: copy, cut, paste, duplicate, rename, new folder, compress, move to the trash, and delete permanently after asking. Everything except a permanent delete can be undone.
-- **Split** the window in two with `|` or Alt+1 (or the ◫ icon in the top bar) to move things between folders; the same key or icon closes it again.
+- **Split** the window in two with `|` or Alt+1 to move things between folders; the same key closes it again.
 - **Search** this folder and below with `/`, or type a path with Ctrl+L.
 - **Mouse friendly**: click, double-click, right-click for the menu, Shift+click for a range.
 
@@ -61,7 +63,7 @@ From a clone, without installing: `cargo run --release -- ~/Pictures`.
 | → / ← | In list and columns: into a folder / back out |
 | Shift+arrows, Ctrl+A | Select a range, select everything |
 | Space | Preview with Quick Look |
-| Alt+⏎ | The menu: everything else, for files and for places in the sidebar |
+| Alt+⏎ | The menu: everything else, for what is selected |
 | Backspace, Alt+← / Alt+→, Alt+Home | Up, back, forward, home |
 | Ctrl+L | Type a path (Tab completes) |
 | / | Search this folder and below |
@@ -69,16 +71,15 @@ From a clone, without installing: `cargo run --release -- ~/Pictures`.
 | Ctrl+Shift+C | Copy the path as text |
 | F2, Ctrl+Shift+D | Rename, duplicate |
 | Ctrl+Shift+N | New folder |
-| Delete (fn+⌫) or ⌘⌫ | Move to the trash (in the sidebar: unpin) |
+| Delete (fn+⌫) or ⌘⌫ | Move to the trash |
 | Shift+Delete | Delete permanently (asks first) |
 | Ctrl+Z, Ctrl+Shift+Z or Ctrl+Y | Undo, redo |
-| Ctrl+P | Pin or unpin the folder |
 | `\|` or Alt+1 | Split into two panes, or close the right one (on a Spanish Mac keyboard `\|` is Option+1) |
 | Ctrl+Alt+N, Ctrl+W | Split into two panes, close the right one |
-| Tab, Shift+Tab | Sidebar, panes and details |
+| Tab, Shift+Tab | The list and the preview, or the two panes |
 | Ctrl+1 / 2 / 3 | Grid, list, columns |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Bigger, smaller, normal tiles |
-| Ctrl+I | Show or hide the details pane |
+| Alt+P | Show or hide the preview pane |
 | S, Shift+S | Sort: name, kind, newest, oldest, size |
 | Ctrl+H | Show hidden files |
 | F5 | Reload |
@@ -90,7 +91,7 @@ With the mouse on, select text in the terminal with its own modifier: Shift-drag
 
 ## Where it keeps things
 
-- `~/.config/filefinder-tui/`: the chosen view and tile size (`state`), pinned folders (`pinned`, one path per line), and where trashed items came from (`trashed`).
+- `~/.config/filefinder-tui/`: the chosen view, tile size and whether the preview shows (`state`), and where trashed items came from (`trashed`).
 - `~/Library/Caches/filefinder-tui/`: Quick Look thumbnails.
 - The Trash is `~/.Trash`. Restore works for items this app moved there.
 

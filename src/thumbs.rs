@@ -19,10 +19,10 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{FilterType, Resize};
 
-use crate::model::{self, Category, Entry};
+use crate::model::{self, Category, Entry, SortMode};
 use crate::system::quiet;
 
-/// The longest side of a thumbnail, in pixels: enough for the details pane.
+/// The longest side of a thumbnail, in pixels: enough for the preview pane.
 const THUMB_PIXELS: u32 = 512;
 /// Pictures kept ready to draw, each fitted to one size in cells.
 const READY: usize = 256;
@@ -37,6 +37,8 @@ const QUICK_LOOK_PATIENCE: Duration = Duration::from_secs(4);
 /// How much of a text file is read for its opening lines.
 const OPENING_BYTES: u64 = 4096;
 const OPENING_LINES: usize = 40;
+/// The most items of a folder the preview lists.
+const CHILDREN: usize = 1000;
 
 /// The port that turns a file into a small picture. It is called on a worker
 /// thread, never while drawing.
@@ -372,23 +374,30 @@ fn work(shared: &Shared, thumbnailer: &dyn Thumbnailer, picker: &Picker, results
     }
 }
 
-/// What the details pane says about a file beyond its listing.
+/// What the preview pane shows of an item beyond its listing.
 pub struct Facts {
     path: PathBuf,
     modified: Option<SystemTime>,
+    /// Whether hidden items were listed among a folder's, and in what order.
+    listed: (bool, SortMode),
     /// A picture's width and height in pixels.
     pub dimensions: Option<(u32, u32)>,
     /// The first lines of a text file; none for anything else.
     pub opening: Vec<String>,
+    /// A folder's items, the first thousand of them, or why they couldn't
+    /// be listed; `None` for anything but a folder.
+    pub children: Option<Result<Vec<Entry>, String>>,
 }
 
 impl Facts {
-    /// Reads them from the file: a picture's header, a text's first few kilobytes.
-    pub fn read(entry: &Entry) -> Self {
+    /// Reads them from the item: a picture's header, a text's first few
+    /// kilobytes, a folder's items listed the way the list lists them.
+    pub fn read(entry: &Entry, show_hidden: bool, sort: SortMode) -> Self {
         let category = entry.category();
         Self {
             path: entry.path.clone(),
             modified: entry.modified,
+            listed: (show_hidden, sort),
             dimensions: (category == Category::Image)
                 .then(|| dimensions(&entry.path))
                 .flatten(),
@@ -397,12 +406,31 @@ impl Facts {
             } else {
                 Vec::new()
             },
+            children: entry
+                .is_dir
+                .then(|| children(&entry.path, show_hidden, sort)),
         }
     }
 
-    /// Whether they were read from this file as it is now.
-    pub fn describes(&self, entry: &Entry) -> bool {
-        self.path == entry.path && self.modified == entry.modified
+    /// Whether they were read from this item as it is now, listed this way.
+    pub fn describes(&self, entry: &Entry, show_hidden: bool, sort: SortMode) -> bool {
+        self.path == entry.path
+            && self.modified == entry.modified
+            && self.listed == (show_hidden, sort)
+    }
+}
+
+/// A folder's items for the preview, or flea's words for why they can't be shown.
+fn children(folder: &Path, show_hidden: bool, sort: SortMode) -> Result<Vec<Entry>, String> {
+    match model::list_dir(folder, show_hidden, sort) {
+        Ok(mut entries) => {
+            entries.truncate(CHILDREN);
+            Ok(entries)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err("You don’t have permission to open this folder.".to_string())
+        }
+        Err(_) => Err("That folder could not be read.".to_string()),
     }
 }
 
@@ -581,15 +609,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let picture = dir.path().join("harbour.png");
         GrayImage::new(1600, 1200).save(&picture).unwrap();
-        assert_eq!(Facts::read(&entry(picture)).dimensions, Some((1600, 1200)));
+        assert_eq!(read(&entry(picture)).dimensions, Some((1600, 1200)));
 
         // Named like a picture without being one, and a text file.
         let fake = dir.path().join("fake.jpg");
         fs::write(&fake, "jpg").unwrap();
-        assert_eq!(Facts::read(&entry(fake)).dimensions, None);
+        assert_eq!(read(&entry(fake)).dimensions, None);
         let text = dir.path().join("notes.txt");
         fs::write(&text, "hello").unwrap();
-        assert_eq!(Facts::read(&entry(text)).dimensions, None);
+        assert_eq!(read(&entry(text)).dimensions, None);
+    }
+
+    fn read(entry: &Entry) -> Facts {
+        Facts::read(entry, false, SortMode::Name)
+    }
+
+    #[test]
+    fn a_folder_lists_its_items_or_says_why_it_cannot() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Trip");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("b.txt"), "b").unwrap();
+        fs::write(folder.join(".hidden"), "").unwrap();
+        fs::create_dir(folder.join("Day")).unwrap();
+        let names = |facts: &Facts| -> Vec<String> {
+            let listed = facts.children.as_ref().unwrap().as_ref().unwrap();
+            listed.iter().map(|entry| entry.name.clone()).collect()
+        };
+        let trip = entry(folder.clone());
+        assert_eq!(names(&read(&trip)), ["Day", "b.txt"]);
+        let all = Facts::read(&trip, true, SortMode::Name);
+        assert_eq!(names(&all), ["Day", ".hidden", "b.txt"]);
+        assert!(all.describes(&trip, true, SortMode::Name));
+        assert!(!all.describes(&trip, false, SortMode::Name));
+        assert!(read(&entry(folder.join("b.txt"))).children.is_none());
+
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = read(&trip).children;
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            locked.unwrap().unwrap_err(),
+            "You don’t have permission to open this folder."
+        );
     }
 
     #[test]
@@ -598,7 +660,7 @@ mod tests {
         let facts = |name: &str, bytes: &[u8]| {
             let path = dir.path().join(name);
             fs::write(&path, bytes).unwrap();
-            Facts::read(&entry(path))
+            read(&entry(path))
         };
         let notes = facts("notes.md", b"# Title\r\n\tindented\n\nlast");
         assert_eq!(notes.opening, ["# Title", "    indented", "", "last"]);

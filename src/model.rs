@@ -68,6 +68,8 @@ pub struct Entry {
     /// The item's own type and permission bits (`st_mode`); for a link,
     /// the link's, the way `ls -l` shows it.
     pub mode: u32,
+    /// Where a symbolic link points, as it is written; `None` for anything else.
+    pub link: Option<PathBuf>,
     items: OnceCell<Option<usize>>,
 }
 
@@ -92,10 +94,21 @@ impl Entry {
             size: meta.len(),
             modified: meta.modified().ok(),
             mode,
+            link: is_symlink.then(|| fs::read_link(&path).ok()).flatten(),
             items: OnceCell::new(),
             name,
             path,
         })
+    }
+
+    /// Whether it can't be read: a folder that can't be listed, or a file
+    /// with no read permission for anyone.
+    pub fn unreadable(&self) -> bool {
+        if self.is_dir {
+            self.item_count().is_none()
+        } else {
+            self.mode & 0o444 == 0
+        }
     }
 
     /// How many things a folder holds; read once, the first time it's asked.
@@ -347,7 +360,6 @@ mod tests {
 
     #[test]
     fn entries_keep_their_own_permissions_and_type() {
-        use crate::format::permissions;
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         let dir = tempfile::tempdir().unwrap();
@@ -360,12 +372,12 @@ mod tests {
         symlink(&folder, dir.path().join("shortcut")).unwrap();
 
         let entry = |name: &str| Entry::from_path(dir.path().join(name)).unwrap();
-        assert_eq!(permissions(entry("private").mode), "drwx------");
-        assert_eq!(permissions(entry("notes.txt").mode), "-rw-r-----");
+        assert_eq!(entry("private").mode & 0o170777, 0o040700);
+        assert_eq!(entry("notes.txt").mode & 0o170777, 0o100640);
         // A link is shown as the link itself, the way `ls -l` shows it,
         // while it still opens like the folder it points at.
         let shortcut = entry("shortcut");
-        assert!(permissions(shortcut.mode).starts_with('l'));
+        assert_eq!(shortcut.mode & 0o170000, 0o120000);
         assert!(shortcut.is_dir);
     }
 
@@ -374,5 +386,30 @@ mod tests {
         assert_eq!(SortMode::Name.step(1), SortMode::Kind);
         assert_eq!(SortMode::Name.step(-1), SortMode::Size);
         assert_eq!(SortMode::Size.step(1), SortMode::Name);
+    }
+
+    #[test]
+    fn a_link_knows_where_it_points_and_an_unreadable_item_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = sample();
+        let link = dir.path().join("to-alpha");
+        std::os::unix::fs::symlink("Alpha", &link).unwrap();
+        let entry = Entry::from_path(link).unwrap();
+        assert_eq!(entry.link, Some(PathBuf::from("Alpha")));
+        assert!(entry.is_dir);
+        let file = Entry::from_path(dir.path().join("b.txt")).unwrap();
+        assert_eq!(file.link, None);
+        assert!(!file.unreadable());
+
+        let locked = dir.path().join("locked.txt");
+        write(&locked, 1, 0);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o200)).unwrap();
+        assert!(Entry::from_path(locked).unwrap().unreadable());
+        let shut = dir.path().join("zeta");
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o000)).unwrap();
+        let folder = Entry::from_path(shut.clone()).unwrap();
+        let unreadable = folder.unreadable();
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(unreadable);
     }
 }

@@ -1,6 +1,6 @@
-//! The menu: what can be done with the selection, or with a place in the
-//! sidebar. It looks like the dialogs, a dark panel with a hairline border,
-//! and opens next to what it is about.
+//! The menu: what can be done with the selection, or with the folder. It
+//! looks like the dialogs, a frame in the card's rule, and opens next to
+//! what it is about.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -29,8 +29,8 @@ pub fn draw(frame: &mut Frame, menu: &Menu, anchor: Rect, area: Rect, hits: &mut
     let outer = place(anchor, width, height, area);
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(theme::rule())
-        .style(theme::panel());
+        .border_style(theme::card_rule())
+        .style(theme::base());
     let inner = block.inner(outer);
     frame.render_widget(Clear, outer);
     frame.render_widget(block, outer);
@@ -44,7 +44,7 @@ pub fn draw(frame: &mut Frame, menu: &Menu, anchor: Rect, area: Rect, hits: &mut
             let style = theme::menu_item(index == menu.cursor, *enabled);
             Line::from(Span::styled(pad(&format!(" {label}"), cells), style))
         }
-        MenuRow::Separator => Line::from(Span::styled("─".repeat(cells), theme::rule())),
+        MenuRow::Separator => Line::from(Span::styled("─".repeat(cells), theme::card_rule())),
     };
     let showing = menu.rows.iter().enumerate().skip(first).take(rows);
     let lines: Vec<Line> = showing.map(line).collect();
@@ -78,6 +78,7 @@ mod tests {
     use crate::theme;
     use crate::ui::testing::{buffer, find};
     use ratatui::crossterm::event::KeyCode;
+    use ratatui::style::Color;
     use std::fs;
 
     #[test]
@@ -86,88 +87,76 @@ mod tests {
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(alt(KeyCode::Enter));
         let drawn = buffer(&mut f.app, 120, 30);
-        let (name_x, name_y) = find(&drawn, "notes.txt", 24..86).expect("the item");
-        // A hairline border starting under the name, on the darkest background.
+        let (name_x, name_y) = find(&drawn, "notes.txt", 26..73).expect("the item");
+        // A frame in the card's rule starting under the name, on the
+        // terminal's own background.
         let corner = (name_x, name_y + 1);
         assert_eq!(drawn[corner].symbol(), "┌");
-        assert_eq!(drawn[corner].fg, theme::RULE);
-        assert_eq!(drawn[corner].bg, theme::DARK_BACKGROUND);
-        // The first line has the keyboard: the selection's colors.
-        let open = find(&drawn, "Open", 24..86).expect("the first line");
+        assert_eq!(drawn[corner].fg, theme::CARD_RULE);
+        assert_eq!(drawn[corner].bg, Color::Reset);
+        // The first line has the keyboard: on the tab fill.
+        let open = find(&drawn, "Open", 26..73).expect("the first line");
         assert_eq!(open, (name_x + 2, name_y + 2));
-        assert_eq!(drawn[open].fg, theme::ACCENT);
-        assert_eq!(drawn[open].bg, theme::SELECTION);
-        assert_eq!(drawn[(open.0 - 1, open.1)].bg, theme::SELECTION);
-        let preview = find(&drawn, "Preview", 24..86).expect("the second line");
+        assert_eq!(drawn[open].fg, theme::FOREGROUND);
+        assert_eq!(drawn[open].bg, theme::TAB);
+        assert_eq!(drawn[(open.0 - 1, open.1)].bg, theme::TAB);
+        let preview = find(&drawn, "Preview", 26..73).expect("the second line");
         assert_eq!(preview, (open.0, open.1 + 1));
         assert_eq!(drawn[preview].fg, theme::FOREGROUND);
-        assert_eq!(drawn[preview].bg, theme::DARK_BACKGROUND);
-        // A hairline between two groups, from border to border.
+        assert_eq!(drawn[preview].bg, Color::Reset);
+        // A rule between two groups, from border to border.
         let hairline = (open.0 - 1, open.1 + 2);
         assert_eq!(drawn[hairline].symbol(), "─");
-        assert_eq!(drawn[hairline].fg, theme::RULE);
-        assert_eq!(drawn[hairline].bg, theme::DARK_BACKGROUND);
-        assert_eq!(find(&drawn, "Rename", 24..86), Some((open.0, open.1 + 3)));
-        let last = find(&drawn, "Delete…", 24..86).expect("the last line");
+        assert_eq!(drawn[hairline].fg, theme::CARD_RULE);
+        assert_eq!(drawn[hairline].bg, Color::Reset);
+        assert_eq!(find(&drawn, "Rename", 26..73), Some((open.0, open.1 + 3)));
+        let last = find(&drawn, "Delete…", 26..73).expect("the last line");
         assert_eq!(last, (open.0, open.1 + 15));
         assert_eq!(drawn[(name_x, last.1 + 1)].symbol(), "└");
 
         // Down moves the colors along.
         press(&mut f.app, &[KeyCode::Down]);
         let drawn = buffer(&mut f.app, 120, 30);
-        assert_eq!(drawn[preview].bg, theme::SELECTION);
-        assert_eq!(drawn[open].bg, theme::DARK_BACKGROUND);
+        assert_eq!(drawn[preview].bg, theme::TAB);
+        assert_eq!(drawn[open].bg, Color::Reset);
 
         // Closed, it is gone.
         press(&mut f.app, &[KeyCode::Esc]);
         let drawn = buffer(&mut f.app, 120, 30);
-        assert_eq!(find(&drawn, "Preview", 24..86), None);
-        assert_eq!(find(&drawn, "notes.txt", 24..86), Some((name_x, name_y)));
+        assert_eq!(find(&drawn, "Preview", 26..73), None);
+        assert_eq!(find(&drawn, "notes.txt", 26..73), Some((name_x, name_y)));
     }
 
     #[test]
-    fn a_line_that_cannot_be_used_is_dim_wherever_the_keyboard_is() {
+    fn a_line_that_cannot_be_used_is_muted_wherever_the_keyboard_is() {
         let mut f = fixture();
         // A folder, with nothing copied to paste into it.
         press(&mut f.app, &[KeyCode::Down]);
         f.app.handle_key(alt(KeyCode::Enter));
         let drawn = buffer(&mut f.app, 120, 30);
-        let paste = find(&drawn, "Paste Into Folder", 24..86).expect("the line");
-        assert_eq!(drawn[paste].fg, theme::DIM);
-        assert_eq!(drawn[paste].bg, theme::DARK_BACKGROUND);
-        let copy = find(&drawn, "Copy", 24..86).expect("a line that can be used");
+        let paste = find(&drawn, "Paste Into Folder", 26..73).expect("the line");
+        assert_eq!(drawn[paste].fg, theme::MUTED);
+        assert_eq!(drawn[paste].bg, Color::Reset);
+        let copy = find(&drawn, "Copy", 26..73).expect("a line that can be used");
         assert_eq!(drawn[copy].fg, theme::FOREGROUND);
 
-        // With the keyboard on it, it is still dim.
+        // With the keyboard on it, it is still muted.
         press(&mut f.app, &[KeyCode::Down; 6]);
         let drawn = buffer(&mut f.app, 120, 30);
-        assert_eq!(drawn[paste].fg, theme::DIM);
-        assert_eq!(drawn[paste].bg, theme::SELECTION);
-    }
-
-    #[test]
-    fn in_the_sidebar_the_menu_opens_under_the_place() {
-        let mut f = fixture();
-        press(&mut f.app, &[KeyCode::BackTab, KeyCode::Down]);
-        f.app.handle_key(alt(KeyCode::Enter));
-        let drawn = buffer(&mut f.app, 120, 30);
-        let (_, place_y) = find(&drawn, "Pictures", 0..24).expect("the place");
-        assert_eq!(find(&drawn, "Open", 0..86), Some((4, place_y + 2)));
-        assert_eq!(drawn[(2, place_y + 1)].symbol(), "┌");
-        // The files underneath are not what it is about.
-        assert_eq!(find(&drawn, "Preview", 0..120), None);
+        assert_eq!(drawn[paste].fg, theme::MUTED);
+        assert_eq!(drawn[paste].bg, theme::TAB);
     }
 
     #[test]
     fn in_the_grid_and_in_columns_the_menu_opens_at_the_selected_item() {
         let mut f = grid_fixture();
         f.app.handle_key(alt(KeyCode::Enter));
-        let first = buffer(&mut f.app, 120, 24);
-        let at_first = find(&first, "Open Folder", 24..86).expect("the menu");
+        let first = buffer(&mut f.app, 62, 26);
+        let at_first = find(&first, "Open Folder", 0..62).expect("the menu");
         press(&mut f.app, &[KeyCode::Esc, KeyCode::Right]);
         f.app.handle_key(alt(KeyCode::Enter));
-        let second = buffer(&mut f.app, 120, 24);
-        let at_second = find(&second, "Open Folder", 24..86).expect("the menu");
+        let second = buffer(&mut f.app, 62, 26);
+        let at_second = find(&second, "Open Folder", 0..62).expect("the menu");
         // One tile further right, and so is the menu.
         assert_eq!(at_second.0, at_first.0 + 20);
         assert_eq!(at_second.1, at_first.1);
@@ -179,9 +168,9 @@ mod tests {
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
         f.app.handle_key(alt(KeyCode::Enter));
         let columns = buffer(&mut f.app, 120, 30);
-        let (name_x, name_y) = find(&columns, "Trip", 24..86).expect("the item");
-        assert!(name_x > 24 + 27, "in the second column");
-        let open = find(&columns, "Open Folder", 24..86).expect("the menu");
+        let (name_x, name_y) = find(&columns, "Trip", 0..120).expect("the item");
+        assert!(name_x > 27, "in the second column");
+        let open = find(&columns, "Open Folder", 0..120).expect("the menu");
         assert_eq!(open, (name_x + 2, name_y + 2));
     }
 
@@ -194,15 +183,15 @@ mod tests {
         press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
         f.app.handle_key(alt(KeyCode::Enter));
         let drawn = buffer(&mut f.app, 120, 40);
-        let (name_x, name_y) = find(&drawn, "notes.txt", 24..86).expect("the item");
+        let (name_x, name_y) = find(&drawn, "notes.txt", 26..73).expect("the item");
         assert!(name_y > 30, "near the bottom");
         assert_eq!(drawn[(name_x, name_y - 1)].symbol(), "└");
         assert_eq!(
-            find(&drawn, "Delete…", 24..86),
+            find(&drawn, "Delete…", 26..73),
             Some((name_x + 2, name_y - 2))
         );
         assert_eq!(
-            find(&drawn, "Open", 24..86),
+            find(&drawn, "Open", 26..73),
             Some((name_x + 2, name_y - 17))
         );
         press(&mut f.app, &[KeyCode::Esc]);
@@ -213,18 +202,18 @@ mod tests {
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(alt(KeyCode::Enter));
         let drawn = buffer(&mut f.app, 120, 24);
-        assert!(find(&drawn, "Open", 24..86).is_some());
-        assert_eq!(find(&drawn, "Delete…", 24..86).map(|at| at.1), Some(22));
+        assert!(find(&drawn, "Open", 26..73).is_some());
+        assert_eq!(find(&drawn, "Delete…", 26..73).map(|at| at.1), Some(22));
 
         // A window shorter than the menu shows the lines around the keyboard.
         let short = buffer(&mut f.app, 120, 10);
-        assert!(find(&short, "Cut", 24..86).is_some());
-        assert_eq!(find(&short, "Delete…", 24..86), None);
+        assert!(find(&short, "Cut", 26..73).is_some());
+        assert_eq!(find(&short, "Delete…", 26..73), None);
         press(&mut f.app, &[KeyCode::Down; 30]);
         let short = buffer(&mut f.app, 120, 10);
-        let last = find(&short, "Delete…", 24..86).expect("the last line");
-        assert_eq!(short[last].bg, theme::SELECTION);
-        assert_eq!(find(&short, "Rename", 24..86), None);
+        let last = find(&short, "Delete…", 26..73).expect("the last line");
+        assert_eq!(short[last].bg, theme::TAB);
+        assert_eq!(find(&short, "Rename", 26..73), None);
 
         // And one too small for anything is still drawn.
         for (width, height) in [(3, 2), (20, 5), (40, 3)] {

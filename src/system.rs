@@ -1,11 +1,9 @@
 //! The port to everything outside the folder tree: launching apps, previews,
-//! terminals, the program that zips, and what Spotlight knows.
+//! terminals, the program that zips, and the volume a folder is on.
 
 use std::cell::RefCell;
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,31 +26,33 @@ pub trait System {
     /// Puts text on the system clipboard, for other apps to paste.
     fn copy_text(&self, text: &str) -> io::Result<()>;
 
-    /// The files used lately, the newest first and at most `limit` of them.
-    fn recents(&self, limit: usize) -> Vec<PathBuf>;
-
     /// Opens a terminal window in a folder.
     fn open_terminal(&self, folder: &Path) -> io::Result<()>;
 
     /// What zips these items, which are all in one folder, into one archive.
     fn archiver(&self, items: &[PathBuf]) -> Archiver;
+
+    /// The volume a folder is on; `None` when that can't be told.
+    fn volume(&self, folder: &Path) -> Option<Volume>;
 }
 
-/// What Spotlight is asked for: everything opened in the last thirty days.
-const USED_LATELY: &str = "kMDItemLastUsedDate >= $time.today(-30)";
+/// A volume as the footer names it: its file-system type and the space left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    /// Like `apfs`.
+    pub kind: String,
+    /// Bytes free for this user.
+    pub free: u64,
+}
 
+#[derive(Default)]
 pub struct MacSystem {
-    /// Where Spotlight looks for the files used lately.
-    home: PathBuf,
     preview: Preview,
 }
 
 impl MacSystem {
-    pub fn new(home: &Path) -> Self {
-        Self {
-            home: home.to_path_buf(),
-            preview: Preview::default(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -76,12 +76,6 @@ impl System for MacSystem {
         pipe_into(&mut Command::new("pbcopy"), text)
     }
 
-    fn recents(&self, limit: usize) -> Vec<PathBuf> {
-        let mut spotlight = Command::new("mdfind");
-        spotlight.arg("-onlyin").arg(&self.home).arg(USED_LATELY);
-        found(&mut spotlight, limit)
-    }
-
     fn open_terminal(&self, folder: &Path) -> io::Result<()> {
         let program = std::env::var("TERM_PROGRAM").ok();
         let app = terminal_app(program.as_deref());
@@ -97,6 +91,38 @@ impl System for MacSystem {
         let items = items.to_vec();
         Box::new(move |archive, stop| run_until(&mut zip_command(&items, archive)?, stop))
     }
+
+    fn volume(&self, folder: &Path) -> Option<Volume> {
+        volume_of(folder)
+    }
+}
+
+/// Asks the system about the volume a folder is on.
+#[cfg(target_os = "macos")]
+fn volume_of(folder: &Path) -> Option<Volume> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(folder.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` ends in a NUL and `stats` is room for one `statfs`,
+    // which the call fills in whenever it returns 0.
+    let stats = unsafe {
+        if libc::statfs(path.as_ptr(), stats.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stats.assume_init()
+    };
+    // SAFETY: the type's name is NUL-terminated within its array.
+    let kind = unsafe { CStr::from_ptr(stats.f_fstypename.as_ptr()) };
+    Some(Volume {
+        kind: kind.to_string_lossy().into_owned(),
+        free: stats.f_bavail.saturating_mul(u64::from(stats.f_bsize)),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn volume_of(_folder: &Path) -> Option<Volume> {
+    None
 }
 
 /// The app that opens a terminal window: the one this runs in, going by what
@@ -169,32 +195,6 @@ fn run_until(command: &mut Command, stop: &AtomicBool) -> io::Result<()> {
     Err(ended)
 }
 
-/// Runs a command that prints one path per line and returns the files among
-/// them that are there, the last modified first and at most `limit` of them.
-/// A command that fails found nothing.
-fn found(command: &mut Command, limit: usize) -> Vec<PathBuf> {
-    let printed = command
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| output.stdout)
-        .unwrap_or_default();
-    let mut files: Vec<_> = printed
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| PathBuf::from(OsStr::from_bytes(line)))
-        .filter_map(|path| {
-            let meta = path.metadata().ok().filter(|meta| meta.is_file())?;
-            Some((meta.modified().ok(), path))
-        })
-        .collect();
-    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    files.truncate(limit);
-    files.into_iter().map(|(_, path)| path).collect()
-}
-
 /// Runs a command with `text` as its input and waits for it to take it.
 fn pipe_into(command: &mut Command, text: &str) -> io::Result<()> {
     let mut child = quiet(command).stdin(Stdio::piped()).spawn()?;
@@ -264,6 +264,7 @@ pub fn quiet(command: &mut Command) -> &mut Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn a_preview_opens_without_waiting_and_asking_again_closes_it() {
@@ -321,35 +322,12 @@ mod tests {
     }
 
     #[test]
-    fn what_spotlight_finds_comes_back_newest_first_without_what_is_gone() {
-        use std::fs::{self, File};
-        use std::time::{Duration, SystemTime};
+    fn a_folder_is_on_a_volume_with_a_type_and_free_space() {
         let dir = tempfile::tempdir().unwrap();
-        let aged = |name: &str, secs: u64| {
-            let path = dir.path().join(name);
-            let file = File::create(&path).unwrap();
-            file.set_modified(SystemTime::now() - Duration::from_secs(secs))
-                .unwrap();
-            path
-        };
-        let (old, new, mid) = (
-            aged("old.txt", 300),
-            aged("new.txt", 10),
-            aged("mid.txt", 100),
-        );
-        let folder = dir.path().join("Folder");
-        fs::create_dir(&folder).unwrap();
-        let gone = dir.path().join("gone.txt");
-
-        // Stands in for `mdfind`: prints the paths it is given, one per line.
-        let mut find = Command::new("printf");
-        find.arg("%s\n").args([&old, &gone, &folder, &new, &mid]);
-        assert_eq!(found(&mut find, 200), [new.clone(), mid.clone(), old]);
-        assert_eq!(found(&mut find, 2), [new, mid]);
-
-        // A Spotlight that fails or isn't there finds nothing.
-        assert!(found(&mut Command::new("false"), 200).is_empty());
-        assert!(found(&mut Command::new("/nonexistent/mdfind"), 200).is_empty());
+        let volume = volume_of(dir.path()).expect("the volume");
+        assert!(!volume.kind.is_empty(), "{volume:?}");
+        assert!(volume.free > 0, "{volume:?}");
+        assert_eq!(volume_of(&dir.path().join("missing")), None);
     }
 
     fn args(command: &Command) -> Vec<&OsStr> {

@@ -672,6 +672,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "image",
+ "libc",
  "ratatui",
  "ratatui-image",
  "tempfile",

@@ -1,5 +1,5 @@
-//! What is remembered between launches: the view, the size of the tiles, the
-//! pinned folders and where what is in the trash came from.
+//! What is remembered between launches: the view, the size of the tiles,
+//! whether the preview pane shows, and where what is in the trash came from.
 
 use std::fs;
 use std::io;
@@ -9,20 +9,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::app::{TileSize, ViewMode};
 
 const FILE: &str = "state";
-const PINS: &str = "pinned";
 const TRASHED: &str = "trashed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Saved {
     pub view: ViewMode,
     pub tile: TileSize,
+    /// Whether the preview pane shows beside the list.
+    pub preview: bool,
 }
 
 impl Default for Saved {
     fn default() -> Self {
         Self {
-            view: ViewMode::Grid,
+            view: ViewMode::List,
             tile: TileSize::Normal,
+            preview: true,
         }
     }
 }
@@ -43,6 +45,8 @@ pub fn load(dir: &Path) -> Saved {
             ("tiles", "small") => saved.tile = TileSize::Small,
             ("tiles", "normal") => saved.tile = TileSize::Normal,
             ("tiles", "large") => saved.tile = TileSize::Large,
+            ("preview", "on") => saved.preview = true,
+            ("preview", "off") => saved.preview = false,
             _ => {}
         }
     }
@@ -61,28 +65,12 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
         TileSize::Normal => "normal",
         TileSize::Large => "large",
     };
+    let preview = if saved.preview { "on" } else { "off" };
     fs::create_dir_all(dir)?;
-    fs::write(dir.join(FILE), format!("view={view}\ntiles={tiles}\n"))
-}
-
-/// Reads the pinned folders, one path per line; none when the file is
-/// missing or unreadable.
-pub fn load_pins(dir: &Path) -> Vec<PathBuf> {
-    let text = fs::read_to_string(dir.join(PINS)).unwrap_or_default();
-    text.lines()
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect()
-}
-
-/// Writes the pinned folders, making the folder of the file the first time.
-pub fn save_pins(dir: &Path, pins: &[PathBuf]) -> io::Result<()> {
-    let lines: String = pins
-        .iter()
-        .map(|path| format!("{}\n", path.display()))
-        .collect();
-    fs::create_dir_all(dir)?;
-    fs::write(dir.join(PINS), lines)
+    fs::write(
+        dir.join(FILE),
+        format!("view={view}\ntiles={tiles}\npreview={preview}\n"),
+    )
 }
 
 /// Something this app moved to the trash: what Restore goes by.
@@ -160,13 +148,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_first_launch_starts_with_the_grid_and_normal_tiles() {
+    fn a_first_launch_starts_with_the_list_normal_tiles_and_the_preview() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             load(&dir.path().join("never-written")),
             Saved {
-                view: ViewMode::Grid,
+                view: ViewMode::List,
                 tile: TileSize::Normal,
+                preview: true,
             }
         );
     }
@@ -179,13 +168,20 @@ mod tests {
         let saved = Saved {
             view: ViewMode::Columns,
             tile: TileSize::Small,
+            preview: false,
         };
         save(&folder, saved).unwrap();
         assert_eq!(
             fs::read_to_string(folder.join("state")).unwrap(),
-            "view=columns\ntiles=small\n"
+            "view=columns\ntiles=small\npreview=off\n"
         );
         assert_eq!(load(&folder), saved);
+        let shown = Saved {
+            preview: true,
+            ..saved
+        };
+        save(&folder, shown).unwrap();
+        assert_eq!(load(&folder), shown);
     }
 
     #[test]
@@ -193,35 +189,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("state"),
-            "nonsense\nview=sideways\ntiles = large \nlater=thing\n",
+            "nonsense\nview=sideways\ntiles = large \npreview=maybe\nlater=thing\n",
         )
         .unwrap();
         assert_eq!(
             load(dir.path()),
             Saved {
-                view: ViewMode::Grid,
+                view: ViewMode::List,
                 tile: TileSize::Large,
+                preview: true,
             }
         );
-    }
-
-    #[test]
-    fn pins_are_kept_one_path_per_line() {
-        let dir = tempfile::tempdir().unwrap();
-        // The folder is made on the first save.
-        let folder = dir.path().join("filefinder-tui");
-        assert!(load_pins(&folder).is_empty());
-        let pins = [PathBuf::from("/a/Lisbon 2026"), PathBuf::from("/b")];
-        save_pins(&folder, &pins).unwrap();
-        assert_eq!(
-            fs::read_to_string(folder.join("pinned")).unwrap(),
-            "/a/Lisbon 2026\n/b\n"
-        );
-        assert_eq!(load_pins(&folder), pins);
-
-        // A blank line is no pin.
-        fs::write(folder.join("pinned"), "\n/b\n\n").unwrap();
-        assert_eq!(load_pins(&folder), [PathBuf::from("/b")]);
     }
 
     #[test]
