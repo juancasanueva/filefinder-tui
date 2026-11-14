@@ -4,6 +4,8 @@ A keyboard-first terminal file manager for macOS, written in Rust with [ratatui]
 
 Nothing runs in the background. Folders are read when you open them, and thumbnails are made when a tile needs one.
 
+![The list view: places panel, tabs, colour tags and a Markdown preview](docs/screenshots/list.png)
+
 - **The screen**: the places panel on the left, the list in the middle with a glyph and the name on each row, then the columns Size, User, Permissions, Kind and Modified, coloured the way [eza](https://github.com/eza-community/eza) colours them (the mode letter by letter, `r` yellow, `w` red, `x` green; a size's number green; your own name yellow; the kind in its glyph's colour; the date blue), under a header (the ones chosen in Settings › View › List view columns; bold titles on a fill of their own, the sorted one lit with its arrow, a click on a title sorts by it and a second click the other way; when the list is narrow the last ones make way, so the name keeps at least 20 cells), and the preview on the right. Links show in cyan with where they point, programs in green. The area with the keyboard (the panel, a pane or the preview) has its frame lit: its stretch of the rules above and below it and the lines on its sides. Alt+P hides or shows the preview, and the choice is remembered. The header has the path, the tabs, four view buttons (list, columns, grid, two panes; the one showing lit, a click switches like Ctrl+Opt+1–4; resting the pointer on one says which; dropped first when the window is narrow) and the sort order.
 - **Places panel**, in every view, as wide as its longest name needs (with five cells of air, at most 22% of the window; the list takes the rest): PLACES (Applications when `/Applications` exists; Home; Desktop, Documents, Downloads, Music, Pictures, Movies and Projects when they exist; the Trash), PINNED (the folders you pinned with Ctrl+P or the menu, in the order pinned; kept in `~/.config/filefinder-tui/pinned`, one path per line, and left out of sight while a folder is gone), TAGS (the colour tags some file carries, in Finder's order, as Spotlight knows them at start, on Ctrl+R and after you tag something; opening one lists everything carrying it, everywhere) and DEVICES (the system's own volume, which opens `/`; iCloud Drive when it is on; then the other mounted volumes). The place you are in is lifted. Tab (or Shift+Tab) moves the keyboard into it; `j`/`k` move, ⏎ or `l` opens a place and gives the keyboard back to the list; a click opens one. Ctrl+B hides or shows it, and the choice is remembered. It is read at start, on Ctrl+R and when the keyboard enters it.
 - **Preview pane**: the name, kind, size and date, then a folder's items, a text file's lines with line numbers (code coloured by `bat` with its ANSI theme, once it is ready; a file without an extension, like `pinned` or `.zshrc`, counts as text when its start is UTF-8 with no NUL byte), a picture with its pixel size, a PDF's first page, an app's icon, or what several selected items add up to. Tab moves the keyboard into it to scroll. Space opens a Quick Look card over the window.
@@ -20,6 +22,42 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 - **Filter and Find**, both typed on the bottom row. The filter (`/`) narrows the folder you are looking at as you type: part of a name in any case, or a `*` / `?` pattern; close matches (a letter or two off, depending on how long the text is) show only when nothing matches exactly. Tab widens it to every folder below. Find (`f` or Ctrl+F) walks the folders below and ranks what it finds: the whole name, then its start, the start of a word, the letters in order, and typos last. Tab looks in this folder, home, or everywhere; Ctrl+G looks inside files instead, through [ripgrep](https://github.com/BurntSushi/ripgrep) when it is installed. Go to a path with `:`.
 - **Settings** (`,` or the gear after the view buttons), in a card: a rail with View and About on the left, the rows on the right. View holds what the keys already change — Last-used view, Preview pane, Places panel, Detail column, which of the list's columns show (Size, User, Permissions, Kind, Modified), Sort by, Order, Show hidden files, and Space previews in (the terminal, or macOS Quick Look) — each row doing what its key does and remembered the same way; About has the version, the license, the GitHub repository (Enter opens it), the key sheet and a link to report an issue. Tab moves between the rail and the rows, `j`/`k` between rows, `h`/`l` (or Enter) change a choice, Space (or Enter) a check, Esc or a click outside closes it.
 - **Mouse friendly**: click, double-click, right-click for the menu, Ctrl+click for one more, Shift+click for a range, the wheel to move.
+
+## Screenshots
+
+**Miller columns** (Ctrl+Opt+2), with code coloured by `bat` in the preview.
+
+![Miller columns with a Rust file's preview](docs/screenshots/columns.png)
+
+**The grid** (Ctrl+Opt+3): real thumbnails where the terminal draws pictures (here WezTerm), and the picture in the preview.
+
+![The grid of thumbnails in Pictures](docs/screenshots/grid.png)
+
+**Two panes** (Ctrl+Opt+4 or `|`), each under its own path, with the function key bar; F2 is muted because two items are selected.
+
+![Two panes with the function key bar](docs/screenshots/two-panes.png)
+
+**The menu** (`m`, Menu, Shift+F10 or a right click), at the item.
+
+![The menu open on a Markdown file](docs/screenshots/menu.png)
+
+**Quick Look** (Space): the item in a card over the window.
+
+![Quick Look showing a photo](docs/screenshots/quick-look.png)
+
+**Find** (`f`): the matches as you type, each with its folder, from the folder you are in down.
+
+![Find listing Rust files with their folders](docs/screenshots/find.png)
+
+**Keyboard Shortcuts** (`?`), with the keys from your `keys.toml`.
+
+![The key sheet](docs/screenshots/keys.png)
+
+**Settings** (`,` or the gear).
+
+![The settings card](docs/screenshots/settings.png)
+
+The screenshots were taken in WezTerm with JetBrains Mono Nerd Font and the Tokyo Night colours, on a sample home folder.
 
 ## Requirements
 
