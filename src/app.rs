@@ -1305,6 +1305,10 @@ impl App {
             app.show_folder(&home, None);
         }
         app.read_places();
+        // The app opens in two panes on the start folder, the left one with
+        // the keyboard; the view remembered is the one Ctrl+4 goes back to.
+        app.split();
+        app.tab_mut().active = 0;
         app
     }
 
@@ -4574,7 +4578,9 @@ pub mod testing {
             depth: Depth::Truecolor,
         };
         let mut app = App::new(config, Box::new(system.clone()));
-        // The tests written against the list keep it; the others switch with Ctrl+1 or Ctrl+3.
+        // The app opens in two panes; the tests written against one list
+        // keep it, and the others switch with Ctrl+2, Ctrl+3 or Ctrl+4.
+        app.close_split();
         app.tab_mut().view = ViewMode::List;
         Fixture {
             app,
@@ -4601,6 +4607,14 @@ pub mod testing {
             depth: Depth::Truecolor,
         };
         App::new(config, Box::new(FakeSystem::new()))
+    }
+
+    /// Starts the app the way `main` does, then closes the second pane it
+    /// opens in, without saving anything: for tests about one pane.
+    pub fn launch_one_pane(home: &Path, state_dir: Option<&Path>) -> App {
+        let mut app = launch(home, state_dir);
+        app.close_split();
+        app
     }
 
     /// The fixture as a grid three tiles across and two rows tall, holding ten items:
@@ -4943,7 +4957,7 @@ mod tests {
         let home = dir.path().join("home");
         fs::create_dir(&home).unwrap();
         let state = dir.path().join("state");
-        let mut app = launch(&home, Some(&state));
+        let mut app = launch_one_pane(&home, Some(&state));
         assert!(app.preview_visible, "shown at first");
         press(&mut app, &[KeyCode::Tab]);
         assert_eq!(app.focus, Focus::Preview);
@@ -5093,7 +5107,7 @@ mod tests {
     fn the_view_starts_as_the_list_and_ctrl_1_2_3_switch_and_remember_it() {
         let f = fixture();
         let state = tempfile::tempdir().unwrap();
-        let mut app = launch(&f.home, Some(state.path()));
+        let mut app = launch_one_pane(&f.home, Some(state.path()));
         assert_eq!(app.view(), ViewMode::List);
         assert!(
             !state.path().join("state").exists(),
@@ -5103,9 +5117,9 @@ mod tests {
         app.handle_key(ctrl(KeyCode::Char('2')));
         assert_eq!(app.view(), ViewMode::Columns);
         assert_eq!(
-            launch(&f.home, Some(state.path())).view(),
+            launch_one_pane(&f.home, Some(state.path())).view(),
             ViewMode::Columns,
-            "the next launch opens in the same view"
+            "the next launch keeps the same view under its two panes"
         );
         app.handle_key(ctrl(KeyCode::Char('1')));
         assert_eq!(app.view(), ViewMode::List);
@@ -5116,7 +5130,10 @@ mod tests {
         );
         app.handle_key(ctrl(KeyCode::Char('3')));
         assert_eq!(app.view(), ViewMode::Grid);
-        assert_eq!(launch(&f.home, Some(state.path())).view(), ViewMode::Grid);
+        assert_eq!(
+            launch_one_pane(&f.home, Some(state.path())).view(),
+            ViewMode::Grid
+        );
     }
 
     #[test]
@@ -7019,6 +7036,41 @@ mod tests {
     /// Where the keyboard is: the region, and the pane that is the active one.
     fn keyboard(app: &App) -> (Focus, usize) {
         (app.focus, app.active())
+    }
+
+    #[test]
+    fn the_app_opens_in_two_panes_and_ctrl_4_returns_to_the_remembered_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        fs::create_dir(home.join("Pictures")).unwrap();
+        let state = tempfile::tempdir().unwrap();
+
+        // A first start, nothing remembered: two panes, both on the start
+        // folder, the left one with the keyboard; one pane is the list.
+        let mut app = launch(&home, Some(state.path()));
+        assert_eq!(app.view(), ViewMode::Dual);
+        assert_eq!(app.panes().len(), 2);
+        assert!(app.panes().iter().all(|pane| pane.cwd == home));
+        assert_eq!((app.focus, app.active()), (Focus::List, 0));
+        assert_eq!(app.tab().single_view(), ViewMode::List);
+        assert!(
+            !state.path().join("state").exists(),
+            "starting saves nothing"
+        );
+
+        // The grid remembered: still two panes, and Ctrl+4 goes to the grid.
+        app.handle_key(ctrl(KeyCode::Char('4')));
+        app.handle_key(ctrl(KeyCode::Char('3')));
+        assert_eq!(state::load(state.path()).view, ViewMode::Grid);
+        let mut again = launch(&home, Some(state.path()));
+        assert_eq!((again.view(), again.panes().len()), (ViewMode::Dual, 2));
+        assert_eq!(
+            state::load(state.path()).view,
+            ViewMode::Grid,
+            "kept as it was"
+        );
+        again.handle_key(ctrl(KeyCode::Char('4')));
+        assert_eq!((again.view(), again.panes().len()), (ViewMode::Grid, 1));
     }
 
     #[test]
@@ -9024,7 +9076,7 @@ mod tests {
         use crate::ui::testing::screen;
         let f = fixture();
         let state = tempfile::tempdir().unwrap();
-        let mut app = launch(&f.home, Some(state.path()));
+        let mut app = launch_one_pane(&f.home, Some(state.path()));
         fs::set_permissions(f.home.join("Documents"), fs::Permissions::from_mode(0o700)).unwrap();
         app.handle_key(KeyEvent::from(KeyCode::F(5)));
         // The list's own cells on the first row, between the parent's

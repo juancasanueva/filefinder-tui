@@ -121,7 +121,7 @@ fn place_row(place: &places::Place, width: usize, cursor: bool, here: bool) -> L
 #[cfg(test)]
 mod tests {
     use crate::app::Focus;
-    use crate::app::testing::{Fixture, alt, ctrl, fixture, key, launch};
+    use crate::app::testing::{Fixture, alt, ctrl, fixture, key, launch, launch_one_pane};
     use crate::icons;
     use crate::theme;
     use crate::ui::testing::{buffer, find, screen};
@@ -301,7 +301,7 @@ mod tests {
         let home = dir.path().canonicalize().unwrap();
         fs::write(home.join("notes.txt"), "hello").unwrap();
         let state = home.join(".config");
-        let mut app = launch(&home, Some(&state));
+        let mut app = launch_one_pane(&home, Some(&state));
         assert!(app.places_visible);
         // The keyboard in the panel goes to the list when it hides.
         app.handle_key(key(KeyCode::BackTab));
