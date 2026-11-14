@@ -4344,7 +4344,7 @@ impl App {
                 }
                 return;
             }
-            Setting::Version | Setting::BasedOn => return,
+            Setting::Version | Setting::License | Setting::BasedOn => return,
         }
         if let Some(open) = &mut self.settings {
             open.saved = true;

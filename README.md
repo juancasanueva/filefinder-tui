@@ -175,3 +175,7 @@ cargo fmt --check
 ```
 
 The plan, the specification and the log of decisions live in `odd/tasks/folio-tui.md`.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The look, the keys and the interface's strings follow [flea](https://github.com/thisisgm/flea), by GM, also MIT.

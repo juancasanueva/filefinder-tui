@@ -9,6 +9,8 @@ use crate::model::SortKey;
 pub const NAME: &str = "filefinder-tui";
 /// What it is, under its name.
 pub const TAGLINE: &str = "A keyboard-first terminal file manager for macOS";
+/// The license, as the LICENSE file grants it.
+pub const LICENSE: &str = "MIT, © 2026 Juan Casanueva";
 /// Where "Report an issue" goes.
 pub const ISSUES: &str = "https://github.com/juancasanueva/filefinder-tui/issues";
 
@@ -44,6 +46,7 @@ pub enum Setting {
     Column(usize),
     Space,
     Version,
+    License,
     BasedOn,
     Keys,
     Issue,
@@ -72,7 +75,7 @@ impl Setting {
                 Kind::Check
             }
             Setting::Keys | Setting::Issue => Kind::Action,
-            Setting::Version | Setting::BasedOn => Kind::Fact,
+            Setting::Version | Setting::License | Setting::BasedOn => Kind::Fact,
         }
     }
 }
@@ -232,6 +235,11 @@ pub fn rows(app: &App, section: Section) -> Vec<Row> {
                 Setting::Version,
                 "Version",
                 Value::Text(env!("CARGO_PKG_VERSION").to_string()),
+            ),
+            item(
+                Setting::License,
+                "License",
+                Value::Text(LICENSE.to_string()),
             ),
             item(
                 Setting::BasedOn,
@@ -512,14 +520,17 @@ mod tests {
             }
         );
         // Enter goes into the rows; the issues page opens.
-        press(
-            &mut f.app,
-            &[KeyCode::Enter, KeyCode::Char('j'), KeyCode::Char('j')],
-        );
-        press(&mut f.app, &[KeyCode::Char('j'), KeyCode::Enter]);
+        press(&mut f.app, &[KeyCode::Enter]);
+        reach(&mut f.app, Setting::Issue);
+        press(&mut f.app, &[KeyCode::Enter]);
         assert_eq!(*f.system.opened.borrow(), [PathBuf::from(ISSUES)]);
+        // The license and the rest say something, and Enter does nothing.
+        reach(&mut f.app, Setting::License);
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert!(f.app.settings.is_some() && !f.app.help_visible);
         // The key sheet takes the card's place.
-        press(&mut f.app, &[KeyCode::Char('k'), KeyCode::Enter]);
+        reach(&mut f.app, Setting::Keys);
+        press(&mut f.app, &[KeyCode::Enter]);
         assert!(f.app.help_visible);
         assert_eq!(f.app.settings, None);
         // `k` in the rail goes back to View; each opening starts there.
