@@ -2067,7 +2067,8 @@ fn mount_point(folder: &Path) -> io::Result<PathBuf> {
     Ok(top.to_path_buf())
 }
 
-fn user_id() -> u32 {
+/// The number of the user running the app.
+pub fn user_id() -> u32 {
     unsafe extern "C" {
         safe fn getuid() -> u32;
     }

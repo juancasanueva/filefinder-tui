@@ -823,7 +823,9 @@ mod tests {
         assert_eq!(find(&drawn, "a.jpg", files.clone()), Some((name, 4)));
         assert_eq!(drawn[(name, 4)].fg, theme::FOREGROUND);
         assert_eq!(find(&drawn, "3 B", files.clone()), Some((size_end - 3, 4)));
-        assert_eq!(drawn[(size_end - 3, 4)].fg, theme::MUTED);
+        // Its number green, its unit in the metadata ink.
+        assert_eq!(drawn[(size_end - 3, 4)].fg, theme::TAGS[3]);
+        assert_eq!(drawn[(size_end - 1, 4)].fg, theme::MUTED);
         assert_eq!(drawn[(name + 11, 4)].bg, Color::Reset);
 
         // With the keyboard in the preview the cursor row loses its edge.
@@ -945,7 +947,11 @@ mod tests {
         let (edge, name) = (files.start, files.start + 3);
         let (size, _) = find(&drawn, "3 B", files.clone()).expect("a.jpg's size");
         assert_eq!(drawn[(name, 4)].fg, Color::Indexed(252), "a.jpg");
-        assert_eq!(drawn[(size, 4)].fg, Color::Indexed(246), "its size");
+        assert_eq!(
+            drawn[(size + 2, 4)].fg,
+            Color::Indexed(246),
+            "its size's unit"
+        );
         assert_eq!(
             drawn[(name, 3)].bg,
             Color::Indexed(236),

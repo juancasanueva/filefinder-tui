@@ -44,7 +44,26 @@ pub fn row(
     query: &str,
     folder: Option<&str>,
 ) -> Line<'static> {
+    let detail = size.map(|size| vec![(size.to_string(), None)]);
+    painted_row(entry, width, detail.as_deref(), look, query, folder)
+}
+
+/// A piece of a row's detail and its colour; with none, the metadata ink.
+pub type Piece = (String, Option<Color>);
+
+/// A row like [`row`], its detail in pieces, each in its own colour (the
+/// metadata ink for those without one, and for all of an item that can't
+/// be read).
+pub fn painted_row(
+    entry: &Entry,
+    width: usize,
+    detail: Option<&[Piece]>,
+    look: Look,
+    query: &str,
+    folder: Option<&str>,
+) -> Line<'static> {
     let (ink, meta) = inks(entry, look);
+    let plain = !look.parent && !look.quiet && entry.unreadable();
     let fill = theme::row_fill(look.cursor, look.focused, look.marked);
     let text = |color| fill.fg(theme::ink(color));
     if width == 0 {
@@ -60,8 +79,9 @@ pub fn row(
         let name = fit(&entry.name, width - 1);
         return Line::from(vec![edge, Span::styled(name, text(ink))]);
     }
-    let size = size.filter(|size| !size.is_empty() && size.width() + 6 <= width);
-    let name_width = width - 3 - size.map_or(1, |size| size.width() + 3);
+    let cells = |pieces: &[Piece]| pieces.iter().map(|(text, _)| text.width()).sum::<usize>();
+    let size = detail.filter(|pieces| cells(pieces) > 0 && cells(pieces) + 6 <= width);
+    let name_width = width - 3 - size.map_or(1, |pieces| cells(pieces) + 3);
     // The tags go right after the name, when two cells of it still show.
     let marks = Some(tag_width(entry.tags)).filter(|marks| marks + 2 <= name_width);
     let marks_width = marks.unwrap_or(0);
@@ -85,9 +105,13 @@ pub fn row(
     spans.push(Span::styled(after, text(meta)));
     spans.push(Span::styled(" ".repeat(room - after_width), text(ink)));
     match size {
-        Some(size) => {
+        Some(pieces) => {
             spans.push(Span::styled(" ", text(ink)));
-            spans.push(Span::styled(format!("{size}  "), text(meta)));
+            for (piece, color) in pieces {
+                let color = color.filter(|_| !plain).unwrap_or(meta);
+                spans.push(Span::styled(piece.clone(), text(color)));
+            }
+            spans.push(Span::styled("  ", text(meta)));
         }
         None => spans.push(Span::styled(" ", text(ink))),
     }
@@ -217,6 +241,66 @@ fn set(table: &[(Column, usize)], texts: impl Iterator<Item = String>) -> String
         })
         .collect();
     cells.join(&" ".repeat(GAP))
+}
+
+/// An item's values set in a table's columns like [`set`], in eza's
+/// colours: a mode letter by letter (`d` blue, `l` the link colour, `r`
+/// yellow, `w` red, `x` green, `-` dimmed), a size's number green and its
+/// unit muted (a folder's count muted), its owner yellow when it is the user
+/// running the app, its kind in its glyph's colour, its date blue.
+pub fn paint(
+    table: &[(Column, usize)],
+    entry: &Entry,
+    now: std::time::SystemTime,
+    style: DateStyle,
+    me: u32,
+) -> Vec<Piece> {
+    let (red, yellow, green, blue) = (
+        theme::TAGS[0],
+        theme::TAGS[2],
+        theme::TAGS[3],
+        theme::TAGS[4],
+    );
+    let mut pieces = Vec::new();
+    for (at, &(column, width)) in table.iter().enumerate() {
+        if at > 0 {
+            pieces.push((" ".repeat(GAP), None));
+        }
+        let text = fit(&column.value(entry, now, style), width);
+        let pad = (" ".repeat(width - text.width()), None);
+        if column.right() {
+            pieces.push(pad.clone());
+        }
+        let cut = text.ends_with('…');
+        match column {
+            Column::Size if entry.is_dir || cut => pieces.push((text, None)),
+            Column::Size => match text.split_once(' ') {
+                Some((number, unit)) => {
+                    pieces.push((number.to_string(), Some(green)));
+                    pieces.push((format!(" {unit}"), None));
+                }
+                None => pieces.push((text, Some(green))),
+            },
+            Column::User => pieces.push((text, (entry.uid == me).then_some(yellow))),
+            Column::Permissions => pieces.extend(text.chars().enumerate().map(|(at, c)| {
+                let color = match c {
+                    'd' if at == 0 => theme::TAGS[4],
+                    'l' if at == 0 => theme::SYMLINK,
+                    'r' => yellow,
+                    'w' => red,
+                    'x' | 's' | 't' | 'S' | 'T' => green,
+                    _ => theme::DIMMED,
+                };
+                (c.to_string(), Some(color))
+            })),
+            Column::Kind => pieces.push((text, Some(icons::tint(entry)))),
+            Column::Modified => pieces.push((text, Some(blue))),
+        }
+        if !column.right() {
+            pieces.push(pad);
+        }
+    }
+    pieces
 }
 
 /// A title, with `▴` or `▾` after it when the items are sorted by it.
@@ -387,6 +471,7 @@ pub fn draw(
     let caption = app.caption;
     let (sort, style) = (app.sort, app.date_style);
     let now = std::time::SystemTime::now();
+    let me = crate::ops::user_id();
     let pane = &mut app.tab_mut().panes[index];
     // The header takes the top row once there is a row for items under it.
     let header = area.height >= 2;
@@ -443,12 +528,11 @@ pub fn draw(
         };
         // What was found below says which folder it is in.
         let folder = pane.place_of(entry);
-        let values = (table.iter()).map(|(column, _)| column.value(entry, now, style));
-        let value = set(&table, values);
-        lines.push(row(
+        let detail = paint(&table, entry, now, style, me);
+        lines.push(painted_row(
             entry,
             width,
-            Some(&value),
+            Some(&detail),
             look,
             &query,
             folder.as_deref(),
@@ -693,6 +777,73 @@ mod tests {
         assert_eq!(click(&mut app, "Name ▴"), (SortKey::Name, true));
         let again = launch(&f.home, Some(state.path()));
         assert_eq!((again.sort.key, again.sort.reversed), (SortKey::Name, true));
+    }
+
+    #[test]
+    fn the_columns_are_coloured_like_eza() {
+        use crate::app::testing::fixture;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = fixture();
+        let path = f.home.join("report.pdf");
+        fs::write(&path, vec![0u8; 2048]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o754)).unwrap();
+        let locked = f.home.join("locked.txt");
+        fs::write(&locked, "x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        f.app.handle_key(key(KeyCode::F(5)));
+        let report = entry(&f.home, "report.pdf");
+        let user = model::owner(report.uid);
+        let drawn = buffer(&mut f.app, 200, 30);
+        let files = panes(&f.app, 200).files;
+        let (_, top) = find(&drawn, "Permissions", files.clone()).expect("the header");
+        let title = |text: &str| x_in(&drawn, top, text, files.clone()).expect(text);
+        let ink = |x: u16, y: u16| drawn[(x, y)].fg;
+        let (_, y) = find(&drawn, "report.pdf", files.clone()).expect("the row");
+        let (red, yellow, green, blue) = (
+            theme::TAGS[0],
+            theme::TAGS[2],
+            theme::TAGS[3],
+            theme::TAGS[4],
+        );
+        // Permissions letter by letter: -rwxr-xr--
+        let mode = title("Permissions");
+        let expected = [
+            theme::DIMMED,
+            yellow,
+            red,
+            green,
+            yellow,
+            theme::DIMMED,
+            green,
+            yellow,
+            theme::DIMMED,
+            theme::DIMMED,
+        ];
+        let shown: Vec<_> = (0..10).map(|at| ink(mode + at, y)).collect();
+        assert_eq!(shown, expected);
+        // The size's number green, its unit muted.
+        let size = x_in(&drawn, y, "2.0 KB", files.clone()).expect("the size");
+        assert_eq!(ink(size, y), green);
+        assert_eq!(ink(size + 4, y), theme::MUTED);
+        // Its owner, who is the user running it, yellow.
+        assert_eq!(x_in(&drawn, y, &user, files.clone()), Some(title("User")));
+        assert_eq!(ink(title("User"), y), yellow);
+        // The kind in its glyph's colour, the date blue.
+        assert_eq!(ink(title("Kind"), y), icons::tint(&report));
+        assert_eq!(ink(title("Modified"), y), blue);
+        // A folder away from the cursor: `d` blue, its item count muted.
+        let (_, folder) = find(&drawn, "Pictures", files.clone()).expect("a folder");
+        assert_eq!(ink(mode, folder), blue);
+        let (count, _) = (x_in(&drawn, folder, "items", files.clone()))
+            .map(|x| (x, folder))
+            .expect("its count");
+        assert_eq!(ink(count, folder), theme::MUTED);
+        // What can't be read stays muted throughout.
+        let (_, locked) = find(&drawn, "locked.txt", files.clone()).expect("the locked row");
+        for at in 0..10 {
+            assert_eq!(ink(mode + at, locked), theme::MUTED, "{at}");
+        }
+        assert_eq!(ink(title("User"), locked), theme::MUTED);
     }
 
     #[test]
