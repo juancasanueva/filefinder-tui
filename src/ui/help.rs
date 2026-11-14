@@ -1,5 +1,5 @@
 //! The `?` sheet: the card "Keyboard Shortcuts" between the window's rules,
-//! with every key the app has in flea's four groups, each group whole, in
+//! with every key the app has in four groups, each group whole, in
 //! up to three columns four cells apart. It scrolls when they don't fit.
 
 use ratatui::Frame;
@@ -15,11 +15,11 @@ use crate::theme;
 
 pub const TITLE: &str = "Keyboard Shortcuts";
 
-/// The groups, as flea heads them.
+/// The groups, as their headings spell them.
 pub const GROUPS: [&str; 4] = ["MOVE", "LOOK", "FIND", "CHANGE"];
 
-/// Each key the app has: its group, the keys as flea's sheet spells them,
-/// and what they do in flea's words where flea has them.
+/// Each key the app has: its group, the keys as the sheet spells them,
+/// and what they do.
 pub const ROWS: &[(usize, &str, &str)] = &[
     (0, "j / down", "Cursor down"),
     (0, "k / up", "Cursor up"),
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sheet_is_a_card_from_row_3_to_the_bottom_rule_with_flea_s_groups_in_columns() {
+    fn the_sheet_is_a_card_from_row_3_to_the_bottom_rule_with_its_groups_in_columns() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Char('?')]);
         let drawn = buffer(&mut f.app, 140, 40);
@@ -378,13 +378,13 @@ mod tests {
         );
         assert_eq!(says("ctrl-b"), Some(&(1, "ctrl-b", "Places panel")));
         let words: Vec<&str> = ROWS.iter().map(|(_, _, does)| *does).collect();
-        for flea in [
+        for does in [
             "Close or go back",
             "Quick Look",
             "Go to folder",
             "Delete permanently",
         ] {
-            assert!(words.contains(&flea), "{flea}");
+            assert!(words.contains(&does), "{does}");
         }
     }
 

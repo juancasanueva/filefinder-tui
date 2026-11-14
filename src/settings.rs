@@ -1,5 +1,4 @@
-//! The Settings card: flea's sections and rows (its window's Settings; its
-//! terminal interface has none), for what this app already does. Every row
+//! The Settings card: sections and rows for what this app already does. Every row
 //! reads the app's own state, so the card never says something it isn't.
 
 use crate::app::{App, Detail, ViewMode};
@@ -404,7 +403,7 @@ mod tests {
     fn space_previews_in_the_terminal_or_in_macos_quick_look_as_chosen() {
         let mut f = fixture();
         let notes = f.home.join("notes.txt");
-        // At first, as since the flea port: the card in the terminal.
+        // At first: the card in the terminal.
         assert_eq!(f.app.space_look, SpaceLook::Terminal);
         press(&mut f.app, &[KeyCode::End, KeyCode::Char(' ')]);
         assert!(f.app.look.is_some());
@@ -439,7 +438,7 @@ mod tests {
         // again closes it.
         press(&mut f.app, &[KeyCode::Esc, KeyCode::Char(' ')]);
         assert!(f.app.look.is_none());
-        assert_eq!(*f.system.previewed.borrow(), [notes.clone()]);
+        assert_eq!(*f.system.previewed.borrow(), std::slice::from_ref(&notes));
         press(&mut f.app, &[KeyCode::Char(' ')]);
         assert_eq!(*f.system.previewed.borrow(), [notes.clone(), notes]);
         // And back.

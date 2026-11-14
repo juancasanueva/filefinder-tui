@@ -1,24 +1,24 @@
 # filefinder-tui
 
-A keyboard-first terminal file manager for macOS, written in Rust with [ratatui](https://ratatui.rs/). It follows the terminal interface of [flea](https://github.com/thisisgm/flea): a header with the path and the sort order, then three columns (the parent folder, the list, and a preview), and a footer with the counts, what just happened and the free space. There is no sidebar; colours are flea's quiet grey palette on your terminal's own background.
+A keyboard-first terminal file manager for macOS, written in Rust with [ratatui](https://ratatui.rs/). It has a header with the path and the sort order, then three columns (the parent folder, the list, and a preview), and a footer with the counts, what just happened and the free space. There is no sidebar; colours are a quiet grey palette on your terminal's own background.
 
 Nothing runs in the background. Folders are read when you open them, and thumbnails are made when a tile needs one.
 
 - **The screen**: the places panel on the left, the list in the middle with a glyph and the name on each row, then the columns Size, User, Permissions, Kind and Modified, coloured the way [eza](https://github.com/eza-community/eza) colours them (the mode letter by letter, `r` yellow, `w` red, `x` green; a size's number green; your own name yellow; the kind in its glyph's colour; the date blue), under a header (the ones chosen in Settings › View › List view columns; bold titles on a fill of their own, the sorted one lit with its arrow, a click on a title sorts by it and a second click the other way; when the list is narrow the last ones make way, so the name keeps at least 20 cells), and the preview on the right. Links show in cyan with where they point, programs in green. The area with the keyboard (the panel, a pane or the preview) has its frame lit: its stretch of the rules above and below it and the lines on its sides. Alt+P hides or shows the preview, and the choice is remembered. The header has the path, the tabs, four view buttons (list, columns, grid, two panes; the one showing lit, a click switches like Ctrl+Opt+1–4; resting the pointer on one says which; dropped first when the window is narrow) and the sort order.
 - **Places panel**, in every view, as wide as its longest name needs (with five cells of air, at most 22% of the window; the list takes the rest): PLACES (Applications when `/Applications` exists; Home; Desktop, Documents, Downloads, Music, Pictures, Movies and Projects when they exist; the Trash), PINNED (the folders you pinned with Ctrl+P or the menu, in the order pinned; kept in `~/.config/filefinder-tui/pinned`, one path per line, and left out of sight while a folder is gone), TAGS (the colour tags some file carries, in Finder's order, as Spotlight knows them at start, on F5 and after you tag something; opening one lists everything carrying it, everywhere) and DEVICES (the system's own volume, which opens `/`; iCloud Drive when it is on; then the other mounted volumes). The place you are in is lifted. Tab (or Shift+Tab) moves the keyboard into it; `j`/`k` move, ⏎ or `l` opens a place and gives the keyboard back to the list; a click opens one. Ctrl+B hides or shows it, and the choice is remembered. It is read at start, on F5 and when the keyboard enters it.
-- **Preview pane**: the name, kind, size and date, then a folder's items, a text file's lines with line numbers (code coloured the way flea colours it, by `bat` with its ANSI theme, once it is ready), a picture with its pixel size, a PDF's first page, an app's icon, or what several selected items add up to. Tab moves the keyboard into it to scroll. Space opens flea's Quick Look card over the window.
+- **Preview pane**: the name, kind, size and date, then a folder's items, a text file's lines with line numbers (code coloured by `bat` with its ANSI theme, once it is ready), a picture with its pixel size, a PDF's first page, an app's icon, or what several selected items add up to. Tab moves the keyboard into it to scroll. Space opens a Quick Look card over the window.
 - **Four views**: Ctrl+Opt+1 the list; Ctrl+Opt+2 Miller columns from home down to the folder, then the preview; Ctrl+Opt+3 a grid of real thumbnails with two-line names, beside the preview (apps show their own icon, from the `.icns` file their `Info.plist` names, and in the list, the columns and the two panes too, in place of their glyph, where the terminal draws real pictures); Ctrl+4 two lists side by side, each under its own path. **The app opens in two panes**, both on the start folder with the left one active; Ctrl+4 (or `|`, Alt+1) goes to the one-pane view you used last, which is remembered (the list the first time).
 - **Tabs**: `t` opens one in the folder you are in, `O` the folder under the cursor; `[` / `]` go round them, `1`–`9` jump to one, `{` / `}` move it, `w` closes it (the last one quits). Each tab keeps its own folder, view, panes, marks and history; the strip in the header shows once there are two, at most nine.
 - **Colours**: truecolor when `COLORTERM` says so, the nearest of 256 colours otherwise, and none with `NO_COLOR` (the cursor row is then reverse video and marked rows underlined). `FILEFINDER_ICONS=plain` replaces the Nerd Font glyphs with plain marks.
 - **Trash**: `~/.Trash`, with Restore and Empty Trash in its menu; reach it from the places panel, the menu or `:`.
 - **File operations** that never overwrite: copy, cut, paste, duplicate, rename, new folder, compress, extract, edit in `$EDITOR`, move to the trash, and delete permanently after asking. Everything except a permanent delete can be undone.
-- **Finder tags**: `T` opens flea's seven tags (Red, Orange, Yellow, Green, Blue, Purple, Gray); `1`–`7` turns one on, or off where every selected item already has it, and Remove All Tags takes the seven off. They are real Finder tags, kept in the `com.apple.metadata:_kMDItemUserTags` attribute exactly as Finder writes it, so Finder, Spotlight and `mdfind` see them, and tags of your own stay as they are. They show as coloured squares after the name (their digits without colour), and Find takes `tag:red` (any case; every tag named must be there, and the rest of the text is looked for as usual: `tag:red holiday`). Tags alone in the everywhere scope ask Spotlight, so the whole Mac answers at once; in a folder or home the walk reads each file's tags, exact where Spotlight doesn't index. An item that loses the tag leaves the results. Undo takes a change back exactly. A drive whose file system has no room for them says "This filesystem does not support file tags."
+- **Finder tags**: `T` opens the seven Finder tags (Red, Orange, Yellow, Green, Blue, Purple, Gray); `1`–`7` turns one on, or off where every selected item already has it, and Remove All Tags takes the seven off. They are real Finder tags, kept in the `com.apple.metadata:_kMDItemUserTags` attribute exactly as Finder writes it, so Finder, Spotlight and `mdfind` see them, and tags of your own stay as they are. They show as coloured squares after the name (their digits without colour), and Find takes `tag:red` (any case; every tag named must be there, and the rest of the text is looked for as usual: `tag:red holiday`). Tags alone in the everywhere scope ask Spotlight, so the whole Mac answers at once; in a folder or home the walk reads each file's tags, exact where Spotlight doesn't index. An item that loses the tag leaves the results. Undo takes a change back exactly. A drive whose file system has no room for them says "This filesystem does not support file tags."
 - **Bulk rename**: `r` with several items marked puts their names in `$EDITOR`, one a line, in a private file of the system's temporary folder. Change the lines, save and quit; the renames run together, so names can swap (`a` ↔ `b`) or go round, and one undo takes them all back. The same number of lines in the same order is needed; a line that is empty, holds `/`, is `.` or `..`, is too long, repeats another, or names something else already there refuses the lot with the line it is about, and nothing is renamed. Quitting the editor with an error renames nothing either.
 - **Compress and Extract**, in the menu (`m`). Compress writes zip, tar, tar.gz, tar.bz2 or tar.xz (and 7z when [7-Zip](https://www.7-zip.org/) is installed as `7zz` or `7z`), named after the item without its extension, or after the folder several are in. Extract unpacks a zip, tar, tar.gz/.tgz, tar.bz2, tar.xz (or 7z) into a new folder beside it named after it without its ending. A name in use is never written over: the next free copy name is taken (`pack copy.tar.gz`, `pack copy 2.tar.gz`, `pack copy`). An archive holding a name from the root, one with `..`, or a link that leads out of its folder is refused with nothing written; one that is damaged or needs a password says so and leaves nothing behind; Escape stops either. Undo moves what was made to the Trash.
 - **Two panes** with Ctrl+Opt+4, `|` or Alt+1 to move things between folders (`y`/`x` in one, `p` or `M` in the other); the same key goes back to the view you came from.
 - **Filter and Find**, both typed on the bottom row. The filter (`/`) narrows the folder you are looking at as you type: part of a name in any case, or a `*` / `?` pattern; close matches (a letter or two off, depending on how long the text is) show only when nothing matches exactly. Tab widens it to every folder below. Find (`f` or Ctrl+F) walks the folders below and ranks what it finds: the whole name, then its start, the start of a word, the letters in order, and typos last. Tab looks in this folder, home, or everywhere; Ctrl+G looks inside files instead, through [ripgrep](https://github.com/BurntSushi/ripgrep) when it is installed. Go to a path with `:`.
-- **Settings** (`,` or the gear after the view buttons), in a card laid out like flea's: a rail with View and About on the left, the rows on the right. View holds what the keys already change — Last-used view, Preview pane, Places panel, Detail column, which of the list's columns show (Size, User, Permissions, Kind, Modified), Sort by, Order, Show hidden files, and Space previews in (the terminal, or macOS Quick Look) — each row doing what its key does and remembered the same way; About has the version, the license, the GitHub repository (Enter opens it), the key sheet and a link to report an issue. Tab moves between the rail and the rows, `j`/`k` between rows, `h`/`l` (or Enter) change a choice, Space (or Enter) a check, Esc or a click outside closes it.
-- **Mouse friendly**, by flea's rules: click, double-click, right-click for the menu, Ctrl+click for one more, Shift+click for a range, the wheel to move.
+- **Settings** (`,` or the gear after the view buttons), in a card: a rail with View and About on the left, the rows on the right. View holds what the keys already change — Last-used view, Preview pane, Places panel, Detail column, which of the list's columns show (Size, User, Permissions, Kind, Modified), Sort by, Order, Show hidden files, and Space previews in (the terminal, or macOS Quick Look) — each row doing what its key does and remembered the same way; About has the version, the license, the GitHub repository (Enter opens it), the key sheet and a link to report an issue. Tab moves between the rail and the rows, `j`/`k` between rows, `h`/`l` (or Enter) change a choice, Space (or Enter) a check, Esc or a click outside closes it.
+- **Mouse friendly**: click, double-click, right-click for the menu, Ctrl+click for one more, Shift+click for a range, the wheel to move.
 
 ## Requirements
 
@@ -64,7 +64,7 @@ From a clone, without installing: `cargo run --release -- ~/Pictures`.
 
 ## Keys
 
-flea's own terminal keys. Digits are never counts.
+Digits are never counts.
 
 | Key | Does |
 | --- | --- |
@@ -83,7 +83,7 @@ flea's own terminal keys. Digits are never counts.
 | Ctrl+G | In Find's field: names or what files hold (needs `rg`) |
 | `tag:red` | In Find's field: only what carries that tag |
 | `o` | Show what Find found under the cursor in its own folder |
-| Space | Quick Look, in the terminal (see below), or in macOS's Quick Look window as before the flea port: Settings › View › Space previews in |
+| Space | Quick Look, in the terminal (see below), or in macOS's Quick Look window: Settings › View › Space previews in |
 | `.` | Show hidden files (remembered) |
 | `s` / `S` | Next sort key (name, size, modified, kind) / reverse the sort |
 | `I` | The columns view's detail column: size, modified, mode (`drwx------`), owner |
@@ -108,7 +108,7 @@ flea's own terminal keys. Digits are never counts.
 | `Y`, Ctrl+Shift+C | Copy the folder's path, the item's path |
 | `m`, Menu, Shift+F10 | The menu (see below) |
 | Alt+T, Ctrl+T | Open a terminal here |
-| Ctrl+Opt+1 / 2 / 3 (or Ctrl+1 / 2 / 3) | List, columns, grid. Ctrl+Opt because window managers such as Terrazzo take Ctrl+1–9 for their workspaces and Ctrl+T for themselves; flea's Ctrl keys still work where nothing takes them |
+| Ctrl+Opt+1 / 2 / 3 (or Ctrl+1 / 2 / 3) | List, columns, grid. Ctrl+Opt because window managers such as Terrazzo take Ctrl+1–9 for their workspaces and Ctrl+T for themselves; the Ctrl keys still work where nothing takes them |
 | Ctrl+Opt+4 (or Ctrl+4), `\|`, Alt+1 | Two panes, or back to the view before (on a Spanish Mac keyboard `\|` is Option+1) |
 | `+` / `-` | Bigger, smaller tiles |
 | `t` | New tab, in the folder you are in |
@@ -125,7 +125,7 @@ Rename, Folder name and Go to ask on the bottom row. A paste that meets names al
 
 ### The menu
 
-`m` (or Menu, Shift+F10, a right click on an item) opens flea's menu under the item, at its name, or above it when there is no room below:
+`m` (or Menu, Shift+F10, a right click on an item) opens the menu under the item, at its name, or above it when there is no room below:
 
 - Open, Open With › (Default app, and Quick Look in macOS's own window)
 - Compress › (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, and `.7z` with 7-Zip installed), Extract (for an archive)
@@ -151,7 +151,7 @@ Space (unless Settings say macOS Quick Look) opens a card over the window with t
 - A click on a tab's label shows that tab; one on a view button switches the view; one on a place opens it. The wheel over the places panel scrolls it.
 - A click outside the menu or a card closes it; a card's buttons can be clicked, and moving over the menu's rows or a card's buttons puts the keyboard there.
 
-The mouse is tracked as flea does: presses and drags, and every move only while a menu or a card is open. Select text in the terminal with its own modifier: Shift-drag in Ghostty, Option-drag in Terminal.
+The mouse is tracked for presses and drags, and every move only while a menu or a card is open. Select text in the terminal with its own modifier: Shift-drag in Ghostty, Option-drag in Terminal.
 
 ## Where it keeps things
 
@@ -174,8 +174,8 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The plan, the specification and the log of decisions live in `odd/tasks/folio-tui.md`.
+The plan, the specification and the log of decisions live in `odd/tasks/`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The look, the keys and the interface's strings follow [flea](https://github.com/thisisgm/flea), by GM, also MIT.
+MIT — see [LICENSE](LICENSE).

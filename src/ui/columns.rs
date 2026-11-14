@@ -10,7 +10,7 @@ use super::list::{self, Look, detail_text};
 use super::{AppRows, NAME_INDENT, app_icon, note_app, scroll, separator};
 use crate::app::{App, HitMap, Spot};
 
-/// How many columns a window `width` cells wide has room for, flea's way:
+/// How many columns a window `width` cells wide has room for:
 /// three at the usual widths, two when narrow, up to five when wide.
 pub fn track_count(width: u16) -> usize {
     match width {

@@ -1,4 +1,4 @@
-//! Finder tags: the seven colours flea names, kept where macOS keeps them,
+//! Finder tags: the seven colours Finder names, kept where macOS keeps them,
 //! in the `com.apple.metadata:_kMDItemUserTags` attribute, so that Finder
 //! shows the same tags. No terminal types in here.
 //!
@@ -9,7 +9,7 @@
 use std::io;
 use std::path::Path;
 
-/// flea's seven tags, in menu order, which is also the order of keys 1 to 7.
+/// The seven tags, in menu order, which is also the order of keys 1 to 7.
 pub const NAMES: [&str; 7] = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "Gray"];
 
 /// Finder's colour number for each of the seven, in the same order.
@@ -26,7 +26,7 @@ pub const FINDER_INFO: &str = "com.apple.FinderInfo";
 /// The Finder flags' colour bits, in byte 9 of `com.apple.FinderInfo`.
 const COLOUR_BITS: u8 = 0x0E;
 
-/// What is said when the disk can't keep tags, in flea's words.
+/// What is said when the disk can't keep tags.
 pub const UNSUPPORTED: &str = "This filesystem does not support file tags.";
 
 /// The name of a stored tag: what comes before its colour number.

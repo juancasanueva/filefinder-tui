@@ -120,7 +120,7 @@ fn left_runs(app: &App) -> Vec<Run> {
     runs
 }
 
-/// flea's runs for a filter, muted `Filter q` and what it shows; or for
+/// The runs for a filter, muted `Filter q` and what it shows; or for
 /// what Find found, how many (and how many items it looked at while it
 /// looks), then muted what it looked for and where. None otherwise.
 fn lead(app: &App) -> Vec<Run> {

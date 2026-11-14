@@ -1,4 +1,4 @@
-//! FileFinder: a keyboard-first terminal file manager for macOS, after flea.
+//! FileFinder: a keyboard-first terminal file manager for macOS.
 
 mod app;
 mod format;
@@ -121,7 +121,7 @@ fn query_picker() -> Picker {
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     // Whether every move of the mouse is reported: while a menu or a card
-    // is open, as flea does, and while the view buttons show, for their
+    // is open, and while the view buttons show, for their
     // tooltips.
     let mut motion = false;
     while !app.should_quit {

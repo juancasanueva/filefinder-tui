@@ -75,8 +75,8 @@ pub enum Focus {
 }
 
 /// What the list's right-hand column shows: `I` goes round them.
-/// Where Space shows the item under the cursor: the card in the terminal
-/// (flea's), or macOS's Quick Look window (as before the port). A setting.
+/// Where Space shows the item under the cursor: the card in the terminal,
+/// or macOS's Quick Look window. A setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SpaceLook {
     #[default]
@@ -226,7 +226,7 @@ impl Action {
     }
 }
 
-/// Which of flea's menus is showing: the item's own, or a submenu of it.
+/// Which menu is showing: the item's own, or a submenu of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sub {
     Root,
@@ -376,7 +376,7 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    /// What the prompt is called on the row, in flea's words.
+    /// What the prompt is called on the row.
     pub fn label(&self) -> &'static str {
         match self.asking {
             Asking::Rename(_) => "Rename",
@@ -398,7 +398,7 @@ pub struct PasteQuestion {
 }
 
 impl PasteQuestion {
-    /// The question, in flea's words.
+    /// The question.
     pub fn text(&self) -> String {
         let folder = match self.folder.file_name() {
             Some(name) => name.to_string_lossy().into_owned(),
@@ -627,7 +627,7 @@ impl Search {
     }
 }
 
-/// What is said when Ctrl+G finds no ripgrep, in flea's words.
+/// What is said when Ctrl+G finds no ripgrep.
 pub const NO_RIPGREP: &str = "ripgrep is unavailable.";
 
 /// What Ctrl+C or Ctrl+X took, waiting for Ctrl+V.
@@ -1611,7 +1611,7 @@ impl App {
         self.command_key(key, armed);
     }
 
-    /// flea's keys, over the files of the active pane.
+    /// The command keys, over the files of the active pane.
     fn command_key(&mut self, key: KeyEvent, armed: Option<Instant>) {
         let held = key.modifiers;
         let alt = held.contains(KeyModifiers::ALT) && !held.contains(KeyModifiers::CONTROL);
@@ -1745,7 +1745,7 @@ impl App {
         }
     }
 
-    /// The mouse twin of `handle_key`, by flea's rules: a click, a double
+    /// The mouse twin of `handle_key`: a click, a double
     /// click, a right click or a turn of the wheel lands on what the last
     /// frame drew under it and does what the key for the same thing does.
     /// While a menu or a card is open, moving over its lines and buttons
@@ -2163,7 +2163,7 @@ impl App {
         }
     }
 
-    /// A left click on an item, by flea's rules: the cursor there and the
+    /// A left click on an item: the cursor there and the
     /// marks cleared; with Shift the range from the cursor to it is what is
     /// selected; with Ctrl (or Cmd) it alone is marked or unmarked. A second
     /// plain click on it within 400 ms opens it like Enter, or among what
@@ -2301,7 +2301,7 @@ impl App {
         self.note(&said);
     }
 
-    /// `m`, Menu and Shift+F10, and a right click: flea's menu for the
+    /// `m`, Menu and Shift+F10, and a right click: the menu for the
     /// selection, under the item at the cursor.
     fn open_menu(&mut self) {
         let menu = Menu::new(Sub::Root, self.root_menu());
@@ -2310,9 +2310,8 @@ impl App {
         }
     }
 
-    /// The menu's lines for what is selected in the active pane, in flea's
-    /// groups and order. What can't apply to it is left out, or dim where
-    /// flea dims it.
+    /// The menu's lines for what is selected in the active pane, in its
+    /// groups and order. What can't apply to it is left out, or dimmed.
     fn root_menu(&self) -> Vec<Vec<MenuRow>> {
         let hidden = if self.show_hidden {
             "Hide Hidden Files"
@@ -2517,7 +2516,7 @@ impl App {
         self.menu = Some(Menu::new(Sub::Tags, self.tag_rows()));
     }
 
-    /// Changes the tags of the selection and says what it did, in flea's words.
+    /// Changes the tags of the selection and says what it did.
     fn retag(&mut self, tagging: ops::Tagging) {
         if self.busy() {
             return;
@@ -2955,7 +2954,7 @@ impl App {
         self.run_search();
     }
 
-    /// Where Find looks, in flea's words: `in ~/x`, `everywhere`, with
+    /// Where Find looks: `in ~/x`, `everywhere`, with
     /// `contents` in front when it looks in what files hold.
     pub fn scope_label(&self, search: &Search) -> String {
         let root = self.scope_root(&search.origin.path, search.scope);
@@ -3928,7 +3927,7 @@ impl App {
         after.or(before).map(|entry| entry.path.clone())
     }
 
-    /// Escape, "Close or go back" in flea's order: the keyboard back from
+    /// Escape, "Close or go back" in this order: the keyboard back from
     /// the preview to the list; an error dismissed; the filter cleared;
     /// Find's walk stopped, then Find left; the file work under way
     /// stopped; and with none of that, the marks cleared.
@@ -4594,7 +4593,7 @@ fn find_terms(text: &str) -> (Vec<String>, String) {
     }
 }
 
-/// Why a name typed in a prompt can't be one, in flea's words.
+/// Why a name typed in a prompt can't be one.
 fn name_refusal(name: &str) -> Option<String> {
     let why = if name.trim().is_empty() {
         "A name cannot be empty."
@@ -5327,7 +5326,7 @@ mod tests {
             assert_eq!(f.app.pane().cwd, f.home, "{out:?}");
             assert_eq!(selected_name(&f.app), Some("Pictures"));
         }
-        // On a file they open it, as flea's browse in does.
+        // On a file they open it, as browsing in does.
         press(
             &mut f.app,
             &[KeyCode::End, KeyCode::Right, KeyCode::Char('l')],
@@ -5350,7 +5349,7 @@ mod tests {
         f.app.handle_key(key(KeyCode::Char('L')));
         f.app.handle_key(shift(KeyCode::Char('L')));
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures").join("Trip"));
-        // Alt with the arrows, and Option's b and f, are folio's: gone.
+        // Alt with the arrows, and Option's b and f, are not keys here.
         for chord in [
             alt(KeyCode::Left),
             alt(KeyCode::Char('b')),
@@ -5786,7 +5785,7 @@ mod tests {
             sizes.push(app.tile);
         }
         use TileSize::{Large, Normal, Small};
-        // 0 and folio's Ctrl+= and Ctrl+0 are no longer tile keys.
+        // 0, Ctrl+= and Ctrl+0 are no longer tile keys.
         assert_eq!(
             sizes,
             [Large, Large, Normal, Small, Small, Small, Small, Normal]
@@ -6290,7 +6289,7 @@ mod tests {
         finish_work(&mut f.app);
         assert_eq!(read(f.home.join("notes copy 2.txt")), "hello");
 
-        // folio's Ctrl+Shift+D is gone, and Ctrl+D pages.
+        // Ctrl+Shift+D is not a key here, and Ctrl+D pages.
         let spelled = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
         f.app.handle_key(KeyEvent::new(KeyCode::Char('d'), spelled));
         f.app.handle_key(ctrl_shift('d'));
@@ -6352,7 +6351,7 @@ mod tests {
         assert_eq!(read(f.trash.join("notes.txt")), "hello");
         assert_eq!(selected_name(&f.app), Some("Documents"));
 
-        // folio's Command+Backspace is gone.
+        // Command+Backspace is not a key here.
         let command = KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER);
         f.app.handle_key(command);
         assert_eq!(names(&f.app), ["Documents"]);
@@ -6919,7 +6918,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::Down]);
         open_path_field(&mut f.app);
         clear_field(&mut f.app);
-        // flea's keys are only letters here.
+        // The command keys are only letters here.
         type_text(&mut f.app, "qsS/? ");
         assert_eq!(path_field(&f.app), ("qsS/? ".to_string(), 6));
         for letter in "djkhlyxpvVMUrNzEI.:".chars() {
@@ -7519,7 +7518,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::Esc]);
         assert!(
             f.app.pane().search().is_none(),
-            "flea's order: the search first"
+            "Escape's order: the search first"
         );
         assert_eq!(names(&f.app), FOLDER);
         assert_eq!(f.app.working(), Some("Duplicating trip-plan.md…"));
@@ -7548,8 +7547,8 @@ mod tests {
         press(&mut f.app, &[KeyCode::Backspace]);
         assert_eq!(f.app.pane().cwd, f.home);
         assert_eq!(selected_name(&f.app), Some("Pictures"));
-        // In the preview (a click, Tab passing it by), a key flea leaves
-        // free is nothing.
+        // In the preview (a click, Tab passing it by), a key with no
+        // command there is nothing.
         click_preview(&mut f.app);
         press(&mut f.app, &[KeyCode::Char('e')]);
         assert_eq!(f.app.focus, Focus::Preview);
@@ -7994,7 +7993,7 @@ mod tests {
             chosen(&f.app),
             ["Pictures", "a.txt", "b.txt", "c.txt", "d.txt", "e.txt"]
         );
-        // Shift with Home and End only moves, as flea's keys do.
+        // Shift with Home and End only moves the cursor; the marks stay.
         f.app.handle_key(shift(KeyCode::End));
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
         assert_eq!(chosen(&f.app).len(), 6);
@@ -8456,7 +8455,7 @@ mod tests {
         names
     }
 
-    /// flea's menu for one file or folder that is not an archive.
+    /// The menu for one file or folder that is not an archive.
     const FILE_MENU: [&str; 16] = [
         "Open",
         "Open With",
@@ -8477,7 +8476,7 @@ mod tests {
     ];
 
     #[test]
-    fn m_menu_and_shift_f10_open_flea_s_menu_with_its_rows_in_groups() {
+    fn m_menu_and_shift_f10_open_the_menu_with_its_rows_in_groups() {
         let mut f = fixture();
         select(&mut f.app, "notes.txt");
         f.app.handle_key(key(KeyCode::Char('m')));
@@ -9362,7 +9361,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_both_pastes_under_flea_copy_names_and_undo_takes_it_back() {
+    fn keep_both_pastes_under_copy_names_and_undo_takes_it_back() {
         for answer in [KeyCode::Enter, KeyCode::Char('b')] {
             let mut f = clash();
             let documents = f.home.join("Documents");
@@ -9778,7 +9777,7 @@ mod tests {
             assert!(f.app.menu.is_some(), "{opens:?}");
             press(&mut f.app, &[KeyCode::Esc]);
         }
-        // folio's Alt+Enter is gone.
+        // Alt+Enter is not a key here.
         f.app.handle_key(alt(KeyCode::Enter));
         assert!(f.app.menu.is_none());
     }
@@ -9815,7 +9814,7 @@ mod tests {
             names(&f.app),
             ["Documents", "Pictures", "later.txt", "notes.txt"]
         );
-        // folio's Ctrl+H is gone.
+        // Ctrl+H is not a key here.
         f.app.handle_key(ctrl(KeyCode::Char('h')));
         assert!(!f.app.show_hidden);
     }
@@ -9830,7 +9829,7 @@ mod tests {
     }
 
     #[test]
-    fn compress_offers_flea_formats_and_names_the_archive_after_the_item() {
+    fn compress_offers_its_formats_and_names_the_archive_after_the_item() {
         let mut f = fixture();
         select(&mut f.app, "notes.txt");
         pick(&mut f.app, "Compress");
@@ -10756,7 +10755,7 @@ mod mouse_tests {
             click_with(&mut f.app, e, KeyModifiers::CONTROL);
             assert_eq!(selection(&f.app), ["e.txt"], "view {view}");
             assert_eq!(f.app.pane().marks.len(), 1);
-            // Alt is not a modifier of flea's: a plain click.
+            // Alt is not a click modifier here: a plain click.
             click_with(&mut f.app, a, KeyModifiers::ALT);
             assert_eq!(selection(&f.app), ["a.txt"], "view {view}");
             assert!(f.app.pane().marks.is_empty());

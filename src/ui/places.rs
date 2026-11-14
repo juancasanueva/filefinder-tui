@@ -1,4 +1,4 @@
-//! The places panel left of the files, flea's rail: PLACES and DEVICES
+//! The places panel left of the files, a rail: PLACES and DEVICES
 //! under muted headings, a row for each place, the one holding the folder
 //! on the selected fill and, while the panel has the keyboard, its cursor
 //! row on the cursor fill with the accent edge.

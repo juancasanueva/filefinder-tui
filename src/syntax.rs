@@ -1,4 +1,4 @@
-//! Code coloured the way flea colours it: `bat`, with its ANSI theme, over
+//! Code coloured with `bat`, with its ANSI theme, over
 //! the preview's own lines, its colours read back as six roles. Made off the
 //! UI thread; until it is ready, and without `bat`, the text shows plain.
 
@@ -25,10 +25,10 @@ pub trait Colourer: Send + Sync {
     fn colour(&self, name: &str, text: &str) -> Option<String>;
 }
 
-/// `bat`, the way flea runs it.
+/// `bat`, run with the flags below.
 pub struct Bat;
 
-/// flea's flags: no user config, the ANSI theme, colours only.
+/// The flags: no user config, the ANSI theme, colours only.
 const BAT_FLAGS: [&str; 7] = [
     "--no-config",
     "--no-custom-assets",
@@ -135,7 +135,7 @@ fn push(runs: &mut Runs, role: u8, text: &str) {
     }
 }
 
-/// flea's terminal rule: a magenta run of nothing but operators is drawn in
+/// A terminal rule: a magenta run of nothing but operators is drawn in
 /// the foreground, so `=` and `->` don't shout like keywords.
 pub fn calm_operators(line: &mut Runs) {
     let operator = |c: char| "=+-*%<>!&|^~?:".contains(c);

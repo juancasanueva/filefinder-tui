@@ -1,4 +1,4 @@
-//! flea's menu: a framed box under the item it is about, at its name
+//! The menu: a framed box under the item it is about, at its name
 //! column (above it when the body has no room below), with a ` glyph
 //! label` row for each thing to do, rules between the groups, and a `›`
 //! on the rows that open a submenu, which is titled in muted capitals.

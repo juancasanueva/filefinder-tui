@@ -74,7 +74,7 @@ pub enum Format {
 }
 
 impl Format {
-    /// What Compress always offers, in flea's order; 7z follows when
+    /// What Compress always offers, in order; 7z follows when
     /// 7-Zip is installed.
     pub const WRITTEN: [Format; 5] = [
         Format::Zip,
@@ -196,8 +196,8 @@ impl Change {
 const NAME_MAX: usize = 255;
 
 /// Bulk rename: the items' new names, a line each, as they came back from
-/// the editor, made into renames. Every line is checked first, in flea's
-/// words, and with one wrong nothing is renamed. Unchanged names are left
+/// the editor, made into renames. Every line is checked first,
+/// and with one wrong nothing is renamed. Unchanged names are left
 /// out; a name may be one another item of the batch is giving up.
 pub fn plan_renames(items: &[PathBuf], names: &[String]) -> Result<Vec<(PathBuf, PathBuf)>, Error> {
     if names.len() != items.len() {
@@ -813,9 +813,9 @@ pub fn delete(items: &[PathBuf]) -> Deleted {
     Deleted { done, error }
 }
 
-/// The name the archive of these items would get right now, flea's way:
+/// The name the archive of these items would get right now:
 /// one item's name without its extension, or the name of the folder
-/// several are in, then the format's ending; or the first of flea's copy
+/// several are in, then the format's ending; or the first of the copy
 /// names after that which is free in their folder (`pack copy.tar.gz`).
 pub fn archive_name(items: &[PathBuf], format: Format) -> Result<String, Error> {
     let named = archive_place(items).and_then(|(folder, stem)| {
@@ -829,7 +829,7 @@ pub fn archive_name(items: &[PathBuf], format: Format) -> Result<String, Error> 
     }
 }
 
-/// An archive's name, then flea's copy names: `pack.tar.gz`,
+/// An archive's name, then its copy names: `pack.tar.gz`,
 /// `pack copy.tar.gz`, `pack copy 2.tar.gz` and so on.
 fn archive_candidates(stem: &str, format: Format) -> impl Iterator<Item = OsString> {
     let (stem, extension) = (stem.to_string(), format.extension());
@@ -2150,7 +2150,7 @@ fn rename_held(from: &Path, to: &Path) -> io::Result<()> {
     })
 }
 
-/// flea's "keep both" names: the name itself, then `name copy.ext`,
+/// The "keep both" names: the name itself, then `name copy.ext`,
 /// `name copy 2.ext` and so on.
 fn candidates(name: &OsStr, is_dir: bool) -> impl Iterator<Item = OsString> {
     let plain = name.to_os_string();
@@ -3921,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_both_names_the_newcomer_like_flea_never_touching_the_one_there() {
+    fn keep_both_names_the_newcomer_a_copy_never_touching_the_one_there() {
         let w = world();
         let a = w.file("a.txt", "new");
         let into = w.folder("Into");
@@ -4577,7 +4577,7 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_of_names_is_refused_in_flea_words_before_anything_is_renamed() {
+    fn a_batch_of_names_is_refused_with_the_reason_before_anything_is_renamed() {
         let w = world();
         let a = w.file("a.txt", "alpha");
         let b = w.file("b.txt", "beta");
@@ -4705,7 +4705,7 @@ mod tests {
             name(&[notes.clone(), pack.clone()], Format::TarXz),
             "Work.tar.xz"
         );
-        // Taken: flea's copy names, the format's whole extension kept.
+        // Taken: the copy names, the format's whole extension kept.
         w.file("Work/pack.tar.gz", "taken");
         assert_eq!(
             name(std::slice::from_ref(&pack), Format::TarGz),

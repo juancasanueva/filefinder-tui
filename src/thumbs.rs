@@ -482,7 +482,7 @@ impl Facts {
     }
 }
 
-/// A folder's items for the preview, or flea's words for why they can't be shown.
+/// A folder's items for the preview, or why they can't be shown.
 fn children(folder: &Path, show_hidden: bool, sort: SortMode) -> Result<Vec<Entry>, String> {
     match model::list_dir(folder, show_hidden, sort) {
         Ok(mut entries) => {

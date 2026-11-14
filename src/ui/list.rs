@@ -1,4 +1,4 @@
-//! The list: flea's rows, an edge, a glyph, the name and the detail column
+//! The list: rows of an edge, a glyph, the name and the detail column
 //! (`I`).
 
 use ratatui::Frame;
@@ -581,7 +581,7 @@ pub fn size_text(entry: &Entry) -> String {
     }
 }
 
-/// What a pane with no items says, in the middle: a glyph over flea's
+/// What a pane with no items says, in the middle: a glyph over a
 /// caption for an empty folder, or the search mark over what matched nothing.
 pub fn empty(frame: &mut Frame, area: Rect, pane: &Pane, caption: usize) {
     let text = empty_text(pane, caption);

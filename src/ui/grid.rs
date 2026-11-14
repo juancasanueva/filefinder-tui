@@ -1,5 +1,5 @@
 //! The grid view, Ctrl+3: tiles with a thumbnail over a caption of two
-//! lines, wrapped and cut flea's way, in flea's colours: the cursor's tile
+//! lines, wrapped and cut at word breaks, in the palette's colours: the cursor's tile
 //! on the cursor fill with the accent edge, marked tiles on the marked fill.
 
 use ratatui::Frame;
@@ -239,8 +239,8 @@ pub(super) fn stand_in(frame: &mut Frame, thumb: Rect, visible: Rect, entry: &En
 /// when a break fits.
 const BREAKS: [char; 4] = [' ', '-', '_', '.'];
 
-/// A name as a caption of at most `count` lines of `per_line` cells, flea's
-/// way: each line breaks after the last space, `-`, `_` or `.` that leaves
+/// A name as a caption of at most `count` lines of `per_line` cells:
+/// each line breaks after the last space, `-`, `_` or `.` that leaves
 /// the rest room to fit, the extension's own dot only when no other will
 /// do; a name too long for all of them is cut in the middle with `…`, its
 /// extension kept whole when it fits on a line.

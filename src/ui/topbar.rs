@@ -67,7 +67,7 @@ pub fn tab_label(app: &App, index: usize) -> String {
     format!(" {} {name} ", index + 1)
 }
 
-/// The tab strip in `inner` cells of header, flea's way: none with one tab;
+/// The tab strip in `inner` cells of header: none with one tab;
 /// else the room left of the view buttons and the sort label, the path's
 /// share first and then
 /// the labels, as many as fit from the one before the tab showing, the last

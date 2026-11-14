@@ -1,4 +1,4 @@
-//! The settings card: flea's rail of sections on the left, the section's
+//! The settings card: a rail of sections on the left, the section's
 //! rows on the right, label and value, in a framed card over the window.
 
 use ratatui::Frame;
@@ -49,7 +49,7 @@ fn ink(color: Color) -> Style {
 }
 
 /// Draws the settings card when it is open: in the middle, its title the
-/// section's name, flea's rail on the left and the section's rows on the
+/// section's name, the rail on the left and the section's rows on the
 /// right. Each section and row is a spot for the mouse, and so is the card.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some(open) = app.settings else { return };

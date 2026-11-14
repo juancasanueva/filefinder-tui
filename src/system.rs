@@ -49,7 +49,7 @@ pub trait System {
     /// archive of a format.
     fn archiver(&self, items: &[PathBuf], format: Format) -> Archiver;
 
-    /// The formats Compress offers: flea's, and 7z when 7-Zip is installed.
+    /// The formats Compress offers: the written ones, and 7z when 7-Zip is installed.
     fn formats(&self) -> Vec<Format>;
 
     /// What lists and unpacks an archive of a format; `None` when nothing
@@ -394,7 +394,7 @@ fn editor_of(editor: Option<String>) -> String {
         .unwrap_or_else(|| "vi".to_string())
 }
 
-/// The mouse the way flea asks for it: presses, releases and drags
+/// The mouse as the app asks for it: presses, releases and drags
 /// (button-event tracking, 1002) in SGR form (1006), and every move as well
 /// (any-motion tracking, 1003) only while `motion` is asked for, for a menu
 /// or a card whose lines follow the pointer, or the view buttons' tooltips. crossterm's
@@ -1045,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn compress_offers_flea_formats_in_order_and_seven_zip_only_when_installed() {
+    fn compress_offers_its_formats_in_order_and_seven_zip_only_when_installed() {
         let formats = MacSystem::default().formats();
         let written = [
             Format::Zip,

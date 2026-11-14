@@ -1,4 +1,4 @@
-//! flea's terminal palette: its fallback colours, since macOS has no Omarchy
+//! The terminal palette: fixed colours, since macOS has no Omarchy
 //! theme to follow, drawn at the colour depth the terminal offers. The
 //! background is always the terminal's own; only the fills below paint one.
 
@@ -20,7 +20,7 @@ pub const MARKED: Color = Color::Rgb(0x51, 0x54, 0x55);
 /// The current tab, and the menu's cursor row.
 pub const TAB: Color = Color::Rgb(0x1f, 0x22, 0x24);
 /// Behind a match.
-#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+#[allow(dead_code)] // The palette in full; matches, prompts and cards come later.
 pub const MATCH: Color = Color::Rgb(0x2a, 0x2d, 0x2f);
 /// The rules and the lines between panes.
 pub const BORDER: Color = Color::Rgb(0x26, 0x29, 0x2b);
@@ -31,14 +31,14 @@ pub const WASH: Color = Color::Rgb(0x2a, 0x2d, 0x2f);
 /// Behind a prompt's field.
 pub const FIELD: Color = Color::Rgb(0x1d, 0x20, 0x22);
 /// Behind the selected part of a field.
-#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+#[allow(dead_code)] // The palette in full; matches, prompts and cards come later.
 pub const FIELD_SELECTION: Color = Color::Rgb(0x47, 0x49, 0x4b);
 /// A file's extension.
-#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+#[allow(dead_code)] // The palette in full; matches, prompts and cards come later.
 pub const EXTENSION: Color = Color::Rgb(0x90, 0x92, 0x92);
 pub const ERROR: Color = Color::Rgb(0xb0, 0x69, 0x69);
 /// What can't be used right now.
-#[allow(dead_code)] // flea's palette in full; matches, prompts and cards come later.
+#[allow(dead_code)] // The palette in full; matches, prompts and cards come later.
 pub const UNAVAILABLE: Color = Color::Rgb(0x68, 0x42, 0x43);
 pub const SYMLINK: Color = Color::Rgb(0x94, 0xe2, 0xd5);
 pub const EXECUTABLE: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
@@ -59,7 +59,7 @@ pub const ACCENT: Color = FOREGROUND;
 
 /// The seven Finder tags' colours, in their order: Red, Orange, Yellow,
 /// Green, Blue, Purple, Gray.
-/// Code's colours by `bat`'s role: the foreground, then flea's red, green,
+/// Code's colours by `bat`'s role: the foreground, then the palette's red, green,
 /// yellow, blue, magenta and cyan.
 pub const SYNTAX: [Color; 7] = [
     FOREGROUND,
@@ -278,7 +278,7 @@ pub fn frame() -> Style {
     fg(MUTED)
 }
 
-/// The ground a card dims the screen toward: flea's fallback background,
+/// The ground a card dims the screen toward: the palette's fallback background,
 /// since the terminal's own can't be asked.
 const GROUND: [u8; 3] = [0x10, 0x13, 0x15];
 
@@ -287,7 +287,7 @@ const GROUND: [u8; 3] = [0x10, 0x13, 0x15];
 /// fewer colours the text in the dimmed ink, fills as they were.
 pub fn dimmed(style: Style) -> Style {
     let half = |color: Option<Color>| match (depth(), color) {
-        // flea's own figure for the foreground behind a card.
+        // A fixed figure for the foreground behind a card.
         (Depth::Truecolor, Some(FOREGROUND)) => Some(DIMMED),
         (Depth::Truecolor, Some(Color::Rgb(r, g, b))) => {
             let mix = |c: u8, ground: u8| (u16::from(c) + u16::from(ground)).div_ceil(2) as u8;

@@ -29,7 +29,7 @@ pub fn draw(frame: &mut Frame, prompt: &Prompt, area: Rect) {
     row(frame, area, label, field, (after, style, right));
 }
 
-/// Draws the filter's or Find's field the way flea draws its prompts:
+/// Draws the filter's or Find's field the way the prompts are drawn:
 /// after the field, how many the filter shows, or where Find looks and
 /// that Tab changes it, or why Ctrl+G was refused.
 pub fn draw_field(frame: &mut Frame, app: &App, field: &Field, area: Rect) {
@@ -59,7 +59,7 @@ pub fn draw_field(frame: &mut Frame, app: &App, field: &Field, area: Rect) {
     );
 }
 
-/// What the filter shows, in flea's words: `N of M shown`, where it
+/// What the filter shows: `N of M shown`, where it
 /// looks when that is below the folder too, and how many are close matches.
 pub fn shown(app: &App) -> String {
     let pane = app.pane();

@@ -1,4 +1,4 @@
-//! What the places panel lists, flea's way: PLACES (Applications when it
+//! What the places panel lists: PLACES (Applications when it
 //! exists, Home, the usual folders in it that exist, then the Trash),
 //! PINNED (the folders the user pinned that are there), TAGS (the colour tags some file carries, in Finder's order) and
 //! DEVICES (the system's own volume, iCloud Drive when it is on, then the

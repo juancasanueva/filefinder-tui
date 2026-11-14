@@ -1,4 +1,4 @@
-//! flea's name matching: what the filter (`/`) leaves standing and how Find
+//! Name matching: what the filter (`/`) leaves standing and how Find
 //! (`f`) ranks what it finds. No terminal types in here.
 
 use std::cmp::Ordering;
@@ -22,7 +22,7 @@ pub struct Close {
     pub runs: Vec<Run>,
 }
 
-// flea's weights for letters that line up: in a run, at the start of a
+// Weights for letters that line up: in a run, at the start of a
 // word, in the name rather than the folders above it; and a gap's cost.
 const BONUS_CONSECUTIVE: i32 = 8;
 const BONUS_BOUNDARY: i32 = 6;
@@ -73,7 +73,7 @@ impl Query {
         let needle: Vec<char> = text.chars().map(fold).collect();
         let wildcard = needle.iter().any(|c| matches!(c, '*' | '?'));
         let letters = needle.iter().filter(|c| c.is_alphanumeric()).count();
-        // flea's typo budget: none under four letters or digits, one up to
+        // The typo budget: none under four letters or digits, one up to
         // seven, two from eight; none for a pattern or punctuation in front.
         let budget = match letters {
             _ if wildcard || !needle[0].is_alphanumeric() => 0,
@@ -141,7 +141,7 @@ impl Query {
         }
     }
 
-    /// flea's greedy line-up of the query's letters in order, tried from
+    /// A greedy line-up of the query's letters in order, tried from
     /// each of the first places the first letter is: its score and where
     /// each letter landed. Letters at or after `base` are in the name.
     fn align(&self, hay: &[char], words: &[bool], base: usize) -> Option<(i32, Vec<usize>)> {
@@ -333,7 +333,7 @@ pub fn narrow<'a>(text: &str, names: impl IntoIterator<Item = &'a str>) -> Optio
     })
 }
 
-/// How well something Find found matches, worst first: flea's tiers.
+/// How well something Find found matches, worst first: its tiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
     /// Within the typo budget.

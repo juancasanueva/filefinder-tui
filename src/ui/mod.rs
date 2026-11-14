@@ -1,4 +1,4 @@
-//! Drawing: flea's frame of a header, a rule, the body, a rule and the
+//! Drawing: the frame of a header, a rule, the body, a rule and the
 //! footer, with one function per region.
 
 mod card;
@@ -51,7 +51,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// A `│` follows each of the first two.
 pub fn pane_widths(columns: u16, preview: bool, needed: u16) -> (u16, u16, u16) {
     let columns = columns as usize;
-    // flea's shares: the panel 22%, the files 40%, the preview the rest.
+    // The shares: the panel 22%, the files 40%, the preview the rest.
     let most = (columns * 22 / 100).saturating_sub(1);
     let left = most.min(needed as usize);
     let right = if preview {
@@ -392,7 +392,7 @@ pub fn note_app(apps: &mut AppRows, entry: &Entry, row: Rect) {
     }
 }
 
-/// flea's captions for an empty folder, which take turns.
+/// The captions for an empty folder, which take turns.
 pub const CAPTIONS: [&str; crate::app::CAPTIONS] =
     ["NOTHING HERE YET", "A VERY TIDY FOLDER", "QUIET IN HERE"];
 
@@ -629,8 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn panes_take_flea_s_widths_of_the_window() {
-        // A panel that needs all of flea's 22%, or more: cut to it.
+    fn panes_take_their_shares_of_the_window() {
+        // A panel that needs all of its 22%, or more: cut to it.
         assert_eq!(pane_widths(120, true, 40), (25, 47, 46));
         assert_eq!(pane_widths(80, true, 16), (16, 31, 31));
         assert_eq!(pane_widths(120, false, 25), (25, 94, 0));
@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_and_find_fields_sit_on_the_bottom_row_like_flea_s_prompts() {
+    fn the_filter_and_find_fields_sit_on_the_bottom_row_like_the_prompts() {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::Char('/')]);
         type_text(&mut f.app, "no");

@@ -1,4 +1,4 @@
-//! flea's cards: a frame in the frame colour with `┌┐└┘` corners, two
+//! Cards: a frame in the frame colour with `┌┐└┘` corners, two
 //! cells of air inside each side, a bold title with a muted "esc" at its
 //! end, a rule, the body and `[ Label ]` buttons at the bottom right. While
 //! one is open the rest of the screen is dimmed behind it.
@@ -250,8 +250,7 @@ pub fn draw_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, hits: &mut Hi
     }
 }
 
-/// The title, the body and the destructive button of a card that asks, in
-/// flea's words.
+/// The title, the body and the destructive button of a card that asks.
 fn asked(dialog: &Dialog) -> (String, String, &'static str) {
     match dialog {
         Dialog::Delete { paths, .. } => {
@@ -433,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn a_card_is_laid_out_by_flea_s_rules() {
+    fn a_card_is_laid_out_by_its_rules() {
         let area = Rect::new(0, 0, 80, 24);
         let card = layout(area, 30, 2, &[10, 10], 0);
         // 30 cells of text, two of air each side and the frame: 36 by 8.

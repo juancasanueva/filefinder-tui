@@ -22,7 +22,7 @@ pub enum Category {
     Other,
 }
 
-/// What a folder is sorted by: flea's four keys.
+/// What a folder is sorted by: four keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortKey {
     Name,
