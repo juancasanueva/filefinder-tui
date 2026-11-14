@@ -389,3 +389,131 @@ mod tests {
         assert!(launch(&home, Some(&state)).places_visible);
     }
 }
+
+#[cfg(test)]
+mod pinned_tests {
+    use crate::app::Focus;
+    use crate::app::testing::{
+        ctrl, finish_search, fixture, key, launch, launch_one_pane, press, type_text,
+    };
+    use crate::icons;
+    use crate::places::{self, Kind};
+    use crate::theme;
+    use crate::ui::testing::{buffer, panes, screen};
+    use ratatui::crossterm::event::KeyCode;
+    use std::fs;
+
+    fn said(app: &crate::app::App) -> Option<&str> {
+        app.message.as_ref().map(|message| message.text.as_str())
+    }
+
+    /// The panel's headings and names, trimmed, at 120 by 30.
+    fn panel(app: &mut crate::app::App) -> Vec<String> {
+        let width = panes(app, 120).panel.end as usize;
+        let lines = screen(app, 120, 30);
+        (lines[2..28].iter())
+            .map(|line| {
+                line.chars()
+                    .take(width)
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_p_pins_the_folder_showing_under_pinned_between_places_and_the_rest() {
+        let mut f = fixture();
+        let proj = f.home.join("Work").join("Proj");
+        fs::create_dir_all(&proj).unwrap();
+        f.app.navigate(&proj);
+        f.app.handle_key(ctrl(KeyCode::Char('p')));
+        assert_eq!(said(&f.app), Some("Pinned Proj"));
+        let rows = panel(&mut f.app);
+        let trash = rows.iter().position(|row| row.ends_with("Trash")).unwrap();
+        assert_eq!(rows[trash + 1], "PINNED");
+        assert_eq!(rows[trash + 2], format!("{} Proj", icons::PLACE_PIN));
+        // In the folders' blue, lifted while the pane is in it.
+        let drawn = buffer(&mut f.app, 120, 30);
+        // In the panel's rows, below the path in the header.
+        let column = panes(&f.app, 120).panel;
+        let (x, y) = (2..28)
+            .find_map(|y| {
+                let row: String = column.clone().map(|x| drawn[(x, y)].symbol()).collect();
+                row.find("Proj")
+                    .map(|at| (column.start + row[..at].chars().count() as u16, y))
+            })
+            .expect("the pinned row");
+        assert_eq!(drawn[(x - 2, y)].fg, theme::ICON_FOLDER);
+        assert_eq!(drawn[(x, y)].bg, theme::SELECTED);
+        // A folder the panel lists already is not pinned again.
+        f.app.navigate(&f.home.clone());
+        f.app.handle_key(ctrl(KeyCode::Char('p')));
+        assert_eq!(said(&f.app), Some("Home is already in the panel."));
+        assert_eq!(panel_names(&f.app, Kind::Pinned), ["Proj"]);
+        // From the panel it opens like a place, and Ctrl+P unpins it.
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(f.app.focus, Focus::Places);
+        let at = places::flat(&f.app.places)
+            .position(|place| place.kind == Kind::Pinned)
+            .unwrap();
+        while f.app.places_cursor < at {
+            press(&mut f.app, &[KeyCode::Char('j')]);
+        }
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert_eq!(f.app.pane().cwd, proj);
+        f.app.handle_key(key(KeyCode::BackTab));
+        f.app.places_cursor = at;
+        f.app.handle_key(ctrl(KeyCode::Char('p')));
+        assert_eq!(said(&f.app), Some("Unpinned Proj"));
+        assert!(!panel(&mut f.app).contains(&"PINNED".to_string()));
+        // Where no folder shows, nothing is pinned.
+        press(&mut f.app, &[KeyCode::Esc, KeyCode::Char('f')]);
+        type_text(&mut f.app, "notes");
+        finish_search(&mut f.app);
+        // Enter keeps what Find found and moves the keyboard into it.
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert!(f.app.field.is_none());
+        f.app.handle_key(ctrl(KeyCode::Char('p')));
+        assert_eq!(said(&f.app), Some("Only folders can be pinned."));
+    }
+
+    fn panel_names(app: &crate::app::App, kind: Kind) -> Vec<String> {
+        (places::flat(&app.places))
+            .filter(|place| place.kind == kind)
+            .map(|place| place.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn pins_are_remembered_and_one_whose_folder_is_gone_is_kept_out_of_sight() {
+        let f = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let (a, b) = (f.home.join("Alpha"), f.home.join("Beta"));
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let mut app = launch_one_pane(&f.home, Some(state.path()));
+        for folder in [&b, &a] {
+            app.navigate(folder);
+            app.handle_key(ctrl(KeyCode::Char('p')));
+        }
+        // In the order pinned.
+        let again = launch(&f.home, Some(state.path()));
+        assert_eq!(panel_names(&again, Kind::Pinned), ["Beta", "Alpha"]);
+        let file = fs::read_to_string(state.path().join("pinned")).unwrap();
+        assert_eq!(file, format!("{}\n{}\n", b.display(), a.display()));
+        // Gone, it isn't listed; back, it is.
+        fs::remove_dir(&b).unwrap();
+        let again = launch(&f.home, Some(state.path()));
+        assert_eq!(panel_names(&again, Kind::Pinned), ["Alpha"]);
+        assert_eq!(
+            fs::read_to_string(state.path().join("pinned")).unwrap(),
+            file
+        );
+        fs::create_dir(&b).unwrap();
+        let again = launch(&f.home, Some(state.path()));
+        assert_eq!(panel_names(&again, Kind::Pinned), ["Beta", "Alpha"]);
+    }
+}

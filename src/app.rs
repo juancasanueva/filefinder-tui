@@ -202,6 +202,8 @@ pub enum Action {
     /// Remove All Tags: none of the seven on the selection.
     RemoveTags,
     CopyPath,
+    /// Pin or Unpin, for the one folder under the cursor.
+    Pin,
     Rename,
     Duplicate,
     Trash,
@@ -1241,6 +1243,10 @@ pub struct App {
     /// Which of the list's columns show, in their order (Size, User,
     /// Permissions, Kind, Modified): a setting.
     pub columns: [bool; 5],
+    /// Every pinned folder, in the order pinned, the ones that are gone
+    /// included: they keep their line in the file and are only left out of
+    /// the panel.
+    pub pins: Vec<PathBuf>,
     /// How many lines the shortcuts are scrolled down; drawing keeps it in range.
     pub help_scroll: usize,
     /// Lines of shortcuts shown last time, for Page Up and Page Down.
@@ -1330,6 +1336,11 @@ impl App {
             settings: None,
             space_look: saved.space,
             columns: saved.columns,
+            pins: config
+                .state_dir
+                .as_deref()
+                .map(state::load_pins)
+                .unwrap_or_default(),
             help_scroll: 0,
             help_rows: 1,
             dialog: None,
@@ -1647,6 +1658,7 @@ impl App {
             KeyCode::Char('v') if ctrl => self.paste(false),
             KeyCode::Char('z') if ctrl => self.undo(),
             KeyCode::Char('y') if ctrl => self.redo(),
+            KeyCode::Char('p') if ctrl => self.toggle_pin(),
             // Alt+T where a window manager takes Ctrl+T (Terrazzo's float).
             KeyCode::Char('t') if ctrl || alt => self.open_terminal(),
             // Selecting.
@@ -1980,9 +1992,79 @@ impl App {
             &self.trash_dir,
             &self.volumes_dir,
             self.tags_in_use,
+            &self.pins,
         );
         let last = places::flat(&self.places).count().saturating_sub(1);
         self.places_cursor = self.places_cursor.min(last);
+    }
+
+    /// Ctrl+P: pins the folder showing to the panel, or unpins it.
+    fn toggle_pin(&mut self) {
+        if !self.pane().is_folder() || self.pane().search().is_some() {
+            self.note("Only folders can be pinned.");
+            return;
+        }
+        let folder = self.pane().cwd.clone();
+        self.toggle_pin_of(folder);
+    }
+
+    /// Pin or Unpin, in the menu: the folder under the cursor.
+    fn pin_selected(&mut self) {
+        let folder = self.selected().filter(|entry| entry.is_dir);
+        if let Some(folder) = folder.map(|entry| entry.path.clone()) {
+            self.toggle_pin_of(folder);
+        }
+    }
+
+    /// Ctrl+P on a pinned folder in the panel: unpins it.
+    fn unpin_place(&mut self, index: usize) {
+        let place = places::flat(&self.places).nth(index);
+        let Some(place) = place.filter(|place| place.kind == places::Kind::Pinned) else {
+            return;
+        };
+        let folder = place.path.clone();
+        self.toggle_pin_of(folder);
+    }
+
+    /// The name the panel lists a folder under, in PLACES or DEVICES,
+    /// where it needs no pin; none when it isn't there.
+    fn listed_as(&self, folder: &Path) -> Option<String> {
+        places::flat(&self.places)
+            .find(|place| {
+                !matches!(place.kind, places::Kind::Pinned | places::Kind::Tag(_))
+                    && place.path == folder
+            })
+            .map(|place| place.name.clone())
+    }
+
+    /// Pins a folder, or unpins it when it is pinned. One the panel lists
+    /// already, under PLACES or DEVICES, isn't pinned again.
+    fn toggle_pin_of(&mut self, folder: PathBuf) {
+        let name = places::label(&folder);
+        let mut pins = self.pins.clone();
+        let listed = self.listed_as(&folder);
+        let note = if let Some(index) = pins.iter().position(|pin| *pin == folder) {
+            pins.remove(index);
+            format!("Unpinned {name}")
+        } else if let Some(listed) = listed {
+            self.note(&format!("{listed} is already in the panel."));
+            return;
+        } else {
+            pins.push(folder);
+            format!("Pinned {name}")
+        };
+        let saved = match &self.state_dir {
+            Some(dir) => state::save_pins(dir, &pins),
+            None => Ok(()),
+        };
+        match saved {
+            Ok(()) => {
+                self.pins = pins;
+                self.read_places();
+                self.note(&note);
+            }
+            Err(_) => self.fail(format!("Couldn't save the pin to {name}.")),
+        }
     }
 
     /// The place the panel lifts: the deepest one holding the active
@@ -2055,6 +2137,9 @@ impl App {
                 self.open_place(cursor)
             }
             KeyCode::Esc => self.focus = Focus::List,
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                self.unpin_place(cursor)
+            }
             _ if window_key(key) => self.command_key(key, None),
             _ => {}
         }
@@ -2267,10 +2352,21 @@ impl App {
                 item_if(one, "Open With", Action::OpenWith),
             ],
             archives.into_iter().flatten().collect(),
-            vec![
-                item("Tags", Action::Tags),
-                item("Copy Path", Action::CopyPath),
-            ],
+            [
+                Some(item("Tags", Action::Tags)),
+                Some(item("Copy Path", Action::CopyPath)),
+                // For one folder the panel doesn't list already.
+                (one && entry.is_dir && self.listed_as(&entry.path).is_none()).then(|| match self
+                    .pins
+                    .contains(&entry.path)
+                {
+                    true => item("Unpin", Action::Pin),
+                    false => item("Pin", Action::Pin),
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             vec![
                 item("Rename", Action::Rename),
                 item("Duplicate", Action::Duplicate),
@@ -2385,6 +2481,7 @@ impl App {
             Action::Tag(index) => self.retag(ops::Tagging::Toggle(index)),
             Action::RemoveTags => self.retag(ops::Tagging::RemoveAll),
             Action::CopyPath => self.copy_path(),
+            Action::Pin => self.pin_selected(),
             Action::Rename => self.ask_rename(),
             Action::Duplicate => self.duplicate(),
             Action::Trash => self.trash(),
@@ -8293,6 +8390,32 @@ mod tests {
             said(&f.app).0,
             "What the menu was for changed, so it closed."
         );
+    }
+
+    #[test]
+    fn the_menu_pins_and_unpins_the_one_folder_under_the_cursor() {
+        let mut f = fixture();
+        fs::create_dir(f.home.join("Work")).unwrap();
+        press(&mut f.app, &[KeyCode::F(5)]);
+        select(&mut f.app, "Work");
+        f.app.handle_key(key(KeyCode::Char('m')));
+        let lines = menu(&f.app);
+        let copy = lines.iter().position(|line| *line == "Copy Path").unwrap();
+        assert_eq!(lines[copy + 1], "Pin");
+        press(&mut f.app, &[KeyCode::Esc]);
+        pick(&mut f.app, "Pin");
+        assert_eq!(
+            f.app.message.as_ref().map(|m| m.text.as_str()),
+            Some("Pinned Work")
+        );
+        assert_eq!(f.app.pins, [f.home.join("Work")]);
+        // Pinned, the line says Unpin.
+        pick(&mut f.app, "Unpin");
+        assert!(f.app.pins.is_empty());
+        // Not for a file, nor for several.
+        select(&mut f.app, "notes.txt");
+        f.app.handle_key(key(KeyCode::Char('m')));
+        assert!(!menu(&f.app).contains(&"Pin"));
     }
 
     /// `m`, down to the line with this label, and Enter.

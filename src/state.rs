@@ -14,6 +14,8 @@ use crate::model::{SortKey, SortMode};
 
 const FILE: &str = "state";
 const TRASHED: &str = "trashed";
+/// The pinned folders, one path per line.
+const PINS: &str = "pinned";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Saved {
@@ -133,6 +135,26 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
             "view={view}\ntiles={tiles}\npreview={preview}\nsort={sort}\nreverse={reverse}\ndetail={detail}\nplaces={places}\nhidden={hidden}\nspace={space}\ncolumns={columns}\n"
         ),
     )
+}
+
+/// Reads the pinned folders, one path per line; none when the file is
+/// missing or unreadable.
+pub fn load_pins(dir: &Path) -> Vec<PathBuf> {
+    let text = fs::read_to_string(dir.join(PINS)).unwrap_or_default();
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Writes the pinned folders, making the folder of the file the first time.
+pub fn save_pins(dir: &Path, pins: &[PathBuf]) -> io::Result<()> {
+    let lines: String = pins
+        .iter()
+        .map(|path| format!("{}\n", path.display()))
+        .collect();
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join(PINS), lines)
 }
 
 /// Something this app moved to the trash: what Restore goes by.

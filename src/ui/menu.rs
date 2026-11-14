@@ -49,6 +49,7 @@ fn glyph(action: Action, label: &str) -> &'static str {
         Action::CompressAs(_) => FILE,
         Action::Tags | Action::Tag(_) | Action::RemoveTags => TAG,
         Action::CopyPath => COPY,
+        Action::Pin => icons::PLACE_PIN,
         Action::Rename => EDIT,
         Action::Duplicate => FILES,
         Action::Trash | Action::Delete | Action::OpenTrash | Action::EmptyTrash => TRASH,

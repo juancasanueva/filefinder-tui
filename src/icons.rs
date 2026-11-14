@@ -179,6 +179,8 @@ pub const PLACE_TRASH: &str = "\u{f0a79}";
 pub const PLACE_DRIVE: &str = "\u{f02ca}";
 pub const PLACE_CLOUD: &str = "\u{f015f}";
 pub const PLACE_TAG: &str = "\u{f04f9}";
+/// A pinned folder, in the places panel.
+pub const PLACE_PIN: &str = "\u{f0403}";
 
 /// The glyph in front of a place's name in the panel.
 pub fn place(kind: Kind) -> &'static str {
@@ -205,6 +207,7 @@ pub fn place_in(set: IconSet, kind: Kind) -> &'static str {
         (IconSet::Nerd, Kind::Drive) => PLACE_DRIVE,
         (IconSet::Nerd, Kind::Cloud) => PLACE_CLOUD,
         (IconSet::Nerd, Kind::Tag(_)) => PLACE_TAG,
+        (IconSet::Nerd, Kind::Pinned) => PLACE_PIN,
     }
 }
 
@@ -212,9 +215,12 @@ pub fn place_in(set: IconSet, kind: Kind) -> &'static str {
 /// colour of what they hold, the trash and the drives muted.
 pub fn place_tint(kind: Kind) -> Color {
     match kind {
-        Kind::Applications | Kind::Home | Kind::Desktop | Kind::Documents | Kind::Downloads => {
-            theme::ICON_FOLDER
-        }
+        Kind::Applications
+        | Kind::Home
+        | Kind::Desktop
+        | Kind::Documents
+        | Kind::Downloads
+        | Kind::Pinned => theme::ICON_FOLDER,
         Kind::Music => theme::ICON_AUDIO,
         Kind::Pictures => theme::ICON_IMAGE,
         Kind::Movies => theme::ICON_VIDEO,
