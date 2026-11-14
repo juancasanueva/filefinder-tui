@@ -200,6 +200,114 @@ mod tests {
         assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
     }
 
+    /// Every item on the bottom row of a 120 by 30 frame drawn all muted:
+    /// its key in the colour of its label (both dimmed under a card), and
+    /// nothing on the row in the accent colour.
+    fn assert_every_item_muted(app: &mut crate::app::App, open: &str) {
+        let drawn = buffer(app, 120, 30);
+        let row: String = (0..120).map(|x| drawn[(x, 29)].symbol()).collect();
+        let accent = theme::ink(theme::ACCENT);
+        assert!((0..120).all(|x| drawn[(x, 29)].fg != accent), "{open}");
+        for label in LABELS {
+            let x = row
+                .find(label)
+                .unwrap_or_else(|| panic!("{open}: {label} on the bottom row: {row}"));
+            let muted = drawn[(x as u16 + label.len() as u16 - 1, 29)].fg;
+            for dx in 0..label.len() {
+                let fg = drawn[(x as u16 + dx as u16, 29)].fg;
+                assert_eq!(fg, muted, "{open}: {label}, cell {dx}");
+            }
+        }
+    }
+
+    /// A left click in the middle of an item, as the last frame drew it.
+    fn click_item(app: &mut crate::app::App, command: FnKey) {
+        buffer(app, 120, 30);
+        let rect = app.hits.rect_of(&Spot::FnKey(command)).expect("on the bar");
+        left_click(app, (rect.x + rect.width / 2, rect.y));
+    }
+
+    #[test]
+    fn while_a_card_or_quick_look_is_open_every_item_is_muted_and_clicks_run_nothing() {
+        let mut f = fixture();
+        split(&mut f.app);
+        let documents = f.home.join("Documents");
+        // The left pane on home, on notes.txt; the right one on Documents.
+        press(
+            &mut f.app,
+            &[KeyCode::Enter, KeyCode::BackTab, KeyCode::End],
+        );
+        assert_eq!(f.app.panes()[1].cwd, documents);
+        let notes = f.home.join("notes.txt");
+        // Home, Documents and the Trash (made on first use) as they are.
+        let on_disk = || {
+            let folders = [&f.home, &documents, &f.trash];
+            let mut names: Vec<_> = (folders.iter())
+                .flat_map(|folder| std::fs::read_dir(folder).into_iter().flatten())
+                .map(|item| item.unwrap().path())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = on_disk();
+        // Nothing open: every command can run, so every key is lit.
+        assert!(FnKey::ALL.iter().all(|command| f.app.can_run(*command)));
+        let drawn = buffer(&mut f.app, 120, 30);
+        for x in starts(&mut f.app) {
+            assert_eq!(drawn[(x.unwrap(), 29)].fg, theme::ink(theme::ACCENT));
+        }
+
+        // Shift+Delete's card, asking to delete notes.txt for good.
+        f.app
+            .handle_key(crate::app::testing::shift(KeyCode::Delete));
+        assert!(matches!(
+            f.app.dialog,
+            Some(crate::app::Dialog::Delete { .. })
+        ));
+        assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
+        assert_every_item_muted(&mut f.app, "the card");
+        // A click on F8 only closes the card, as one outside it does.
+        click_item(&mut f.app, FnKey::Trash);
+        assert!(f.app.dialog.is_none());
+        assert!(f.app.prompt.is_none() && f.app.question.is_none());
+        assert_eq!(f.app.working(), None);
+        assert_eq!(on_disk(), before);
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "hello");
+        // The card again: a click on F5 copies nothing either.
+        f.app
+            .handle_key(crate::app::testing::shift(KeyCode::Delete));
+        assert!(f.app.dialog.is_some());
+        click_item(&mut f.app, FnKey::Copy);
+        assert!(f.app.dialog.is_none());
+        assert_eq!(f.app.working(), None);
+        assert_eq!(on_disk(), before);
+
+        // Quick Look, in the terminal (the setting's default).
+        press(&mut f.app, &[KeyCode::Char(' ')]);
+        assert!(f.app.look.is_some());
+        assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
+        assert_every_item_muted(&mut f.app, "Quick Look");
+        // A click on F9 only closes it, as one outside it does.
+        click_item(&mut f.app, FnKey::NewMarkdown);
+        assert!(f.app.look.is_none());
+        assert!(f.app.prompt.is_none());
+        assert_eq!(on_disk(), before);
+        press(&mut f.app, &[KeyCode::Char(' ')]);
+        click_item(&mut f.app, FnKey::Move);
+        assert!(f.app.look.is_none());
+        assert_eq!(f.app.working(), None);
+        assert_eq!(on_disk(), before);
+        // The cursor stayed on notes.txt, and the bar is lit again.
+        assert_eq!(
+            f.app.pane().selected().map(|entry| entry.name.as_str()),
+            Some("notes.txt")
+        );
+        let drawn = buffer(&mut f.app, 120, 30);
+        for x in starts(&mut f.app) {
+            assert_eq!(drawn[(x.unwrap(), 29)].fg, theme::ink(theme::ACCENT));
+        }
+    }
+
     #[test]
     fn a_click_on_an_item_does_what_its_key_does() {
         let mut f = fixture();

@@ -12440,6 +12440,210 @@ mod fn_key_tests {
         assert_eq!(f.app.panes()[0].cursor, left);
     }
 
+    /// Nothing marked in any pane of the tab showing.
+    fn nothing_marked(app: &App) -> bool {
+        app.panes().iter().all(|pane| pane.marks.is_empty())
+    }
+
+    /// Two panes with Documents holding `a.txt` and listing it on the
+    /// right, the left pane's cursor on notes.txt.
+    fn two_panes_on_notes() -> Fixture {
+        let mut f = two_panes();
+        fs::write(f.home.join("Documents").join("a.txt"), "a").unwrap();
+        press(&mut f.app, &[KeyCode::Tab]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::BackTab]);
+        select(&mut f.app, "notes.txt");
+        assert_eq!(under(&f.app, 1), Some("a.txt"));
+        f
+    }
+
+    #[test]
+    fn what_f5_brought_is_selected_nowhere_when_its_tab_was_closed() {
+        let mut f = two_panes_on_notes();
+        let documents = f.home.join("Documents");
+        press(&mut f.app, &[KeyCode::F(5)]);
+        // Another tab on Documents, in two panes like the first, then the
+        // first tab closed before the copy lands.
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Char('t')]);
+        split(&mut f.app);
+        assert_eq!(f.app.current, 1);
+        assert_eq!(f.app.panes()[1].cwd, documents);
+        press(&mut f.app, &[KeyCode::Char('1'), KeyCode::Char('w')]);
+        assert_eq!(f.app.tabs.len(), 1);
+        assert_eq!(f.app.current, 0);
+        assert_eq!(f.app.active(), 1);
+        let cursors: Vec<_> = f.app.panes().iter().map(|pane| pane.cursor).collect();
+        finish_work(&mut f.app);
+        assert_eq!(f.app.working(), None);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+        assert_eq!(on_disk(&documents), ["a.txt", "notes.txt"]);
+        // The tab left lists the copy in both its panes, and neither moved.
+        assert_eq!(pane_names(&f.app, 0), ["a.txt", "notes.txt"]);
+        assert_eq!(pane_names(&f.app, 1), ["a.txt", "notes.txt"]);
+        let now: Vec<_> = f.app.panes().iter().map(|pane| pane.cursor).collect();
+        assert_eq!(now, cursors);
+        assert_eq!(under(&f.app, 0), Some("a.txt"));
+        assert_eq!(under(&f.app, 1), Some("a.txt"));
+        assert!(nothing_marked(&f.app));
+        assert_eq!(said(&f.app), ("Copied 1 item", false));
+    }
+
+    #[test]
+    fn what_f5_brought_is_selected_nowhere_when_the_split_was_closed() {
+        let mut f = two_panes_on_notes();
+        let documents = f.home.join("Documents");
+        press(&mut f.app, &[KeyCode::F(5)]);
+        // Back to one pane before the copy lands.
+        press(&mut f.app, &[KeyCode::Char('|')]);
+        assert_eq!(f.app.panes().len(), 1);
+        let left = f.app.panes()[0].cursor;
+        finish_work(&mut f.app);
+        assert_eq!(f.app.working(), None);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+        assert_eq!(on_disk(&documents), ["a.txt", "notes.txt"]);
+        // The one pane left stays on home, where it was.
+        assert_eq!(f.app.panes().len(), 1);
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(f.app.panes()[0].cursor, left);
+        assert_eq!(under(&f.app, 0), Some("notes.txt"));
+        assert!(nothing_marked(&f.app));
+        assert_eq!(said(&f.app), ("Copied 1 item", false));
+    }
+
+    #[test]
+    fn what_f5_brought_is_selected_nowhere_when_its_pane_left_the_folder() {
+        let mut f = two_panes_on_notes();
+        let documents = f.home.join("Documents");
+        press(&mut f.app, &[KeyCode::F(5)]);
+        // The right pane up to home, which lists a notes.txt of its own,
+        // before the copy lands; the keyboard back on the left.
+        press(
+            &mut f.app,
+            &[KeyCode::Tab, KeyCode::Backspace, KeyCode::BackTab],
+        );
+        assert_eq!(f.app.panes()[1].cwd, f.home);
+        assert_eq!(under(&f.app, 1), Some("Documents"));
+        let cursors: Vec<_> = f.app.panes().iter().map(|pane| pane.cursor).collect();
+        finish_work(&mut f.app);
+        assert_eq!(f.app.working(), None);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        assert_eq!(on_disk(&documents), ["a.txt", "notes.txt"]);
+        // Neither pane moved: the right one stays on Documents, not on
+        // home's notes.txt.
+        assert_eq!(f.app.panes()[1].cwd, f.home);
+        let now: Vec<_> = f.app.panes().iter().map(|pane| pane.cursor).collect();
+        assert_eq!(now, cursors);
+        assert_eq!(under(&f.app, 0), Some("notes.txt"));
+        assert_eq!(under(&f.app, 1), Some("Documents"));
+        assert_eq!(f.app.active(), 0);
+        assert!(nothing_marked(&f.app));
+        // Going into Documents, the copy is there.
+        press(&mut f.app, &[KeyCode::Tab, KeyCode::Enter]);
+        assert_eq!(pane_names(&f.app, 1), ["a.txt", "notes.txt"]);
+    }
+
+    #[test]
+    fn what_f5_brought_is_selected_nowhere_when_its_pane_turned_to_a_find() {
+        // A find from home, which the pane went up to, and one from
+        // Documents itself: neither is the folder the copy was sent to.
+        for up in [true, false] {
+            let mut f = two_panes_on_notes();
+            let documents = f.home.join("Documents");
+            // Found first when the find is in Documents.
+            fs::write(documents.join("notes.md"), "md").unwrap();
+            let copy = documents.join("notes.txt");
+            press(&mut f.app, &[KeyCode::F(5)]);
+            // The copy on disk, not yet taken in.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while fs::read_to_string(&copy).ok().as_deref() != Some("hello") {
+                assert!(Instant::now() < deadline, "the copy never landed");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            press(&mut f.app, &[KeyCode::Tab]);
+            if up {
+                press(&mut f.app, &[KeyCode::Backspace]);
+            }
+            let left = f.app.panes()[0].cursor;
+            f.app.handle_key(key(KeyCode::Char('f')));
+            type_text(&mut f.app, "notes");
+            finish_search(&mut f.app);
+            finish_work(&mut f.app);
+            finish_search(&mut f.app);
+            assert_eq!(f.app.working(), None, "up {up}");
+            assert_eq!(read(copy.clone()), "hello", "up {up}");
+            assert_eq!(read(f.home.join("notes.txt")), "hello", "up {up}");
+            // The find lists the copy; its cursor stays on the first found,
+            // and the left pane where it was.
+            let found = f.app.panes()[1].entries.iter();
+            let found: Vec<_> = found.map(|entry| entry.path.clone()).collect();
+            let mut listed = vec![documents.join("notes.md"), copy.clone()];
+            if up {
+                listed.insert(0, f.home.join("notes.txt"));
+            }
+            assert_eq!(found, listed, "up {up}");
+            assert_eq!(f.app.panes()[1].cursor, 0, "up {up}");
+            assert_eq!(f.app.panes()[0].cursor, left, "up {up}");
+            assert_eq!(under(&f.app, 0), Some("notes.txt"), "up {up}");
+            assert!(nothing_marked(&f.app), "up {up}");
+        }
+    }
+
+    #[test]
+    fn what_f6_moved_is_selected_in_the_pane_it_was_sent_to_after_tab() {
+        let mut f = two_panes_on_notes();
+        let documents = f.home.join("Documents");
+        press(&mut f.app, &[KeyCode::F(6), KeyCode::Tab]);
+        assert_eq!(f.app.active(), 1);
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
+        assert_eq!(on_disk(&documents), ["a.txt", "notes.txt"]);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        assert_eq!(said(&f.app), ("Moved 1 item.", false));
+        // Selected on the right, which has the keyboard now.
+        assert_eq!(f.app.active(), 1);
+        assert_eq!(pane_names(&f.app, 1), ["a.txt", "notes.txt"]);
+        assert_eq!(under(&f.app, 1), Some("notes.txt"));
+        // The left pane no longer lists it; its cursor on what is left.
+        assert_eq!(pane_names(&f.app, 0), ["Documents", "Pictures"]);
+        assert!(f.app.panes()[0].cursor < f.app.panes()[0].entries.len());
+        assert_eq!(under(&f.app, 0), Some("Pictures"));
+        assert!(nothing_marked(&f.app));
+    }
+
+    #[test]
+    fn what_f6_moved_is_selected_in_its_pane_once_its_tab_shows_again() {
+        let mut f = two_panes_on_notes();
+        let documents = f.home.join("Documents");
+        press(&mut f.app, &[KeyCode::F(6)]);
+        // A new tab on home before the move lands.
+        press(&mut f.app, &[KeyCode::Char('t')]);
+        assert_eq!(f.app.current, 1);
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert_eq!(under(&f.app, 0), Some("Documents"));
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&f.home), ["Documents", "Pictures"]);
+        assert_eq!(on_disk(&documents), ["a.txt", "notes.txt"]);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        // The new tab's pane lists what is left, its cursor where it was.
+        assert_eq!(pane_names(&f.app, 0), ["Documents", "Pictures"]);
+        assert_eq!(under(&f.app, 0), Some("Documents"));
+        assert!(nothing_marked(&f.app));
+        // Back in the first tab: selected on the right, the left pane's
+        // cursor on what is left.
+        press(&mut f.app, &[KeyCode::Char('1')]);
+        assert_eq!(f.app.current, 0);
+        assert_eq!(f.app.active(), 0);
+        assert_eq!(pane_names(&f.app, 1), ["a.txt", "notes.txt"]);
+        assert_eq!(under(&f.app, 1), Some("notes.txt"));
+        assert_eq!(pane_names(&f.app, 0), ["Documents", "Pictures"]);
+        assert!(f.app.panes()[0].cursor < f.app.panes()[0].entries.len());
+        assert_eq!(under(&f.app, 0), Some("Pictures"));
+        assert!(nothing_marked(&f.app));
+    }
+
     #[test]
     fn while_a_menu_or_the_settings_are_open_the_bar_is_muted_and_its_clicks_run_nothing() {
         let mut f = two_panes();
