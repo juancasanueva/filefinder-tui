@@ -147,8 +147,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
             .and_then(|highlighter| highlighter.get(&entry.path, entry.modified, &facts.opening));
         let rows = text_rows(&facts.opening, width as usize, coloured);
         scrolled(frame, rows, body, &mut look.scroll);
-    } else if matches!(entry.category(), Category::Image | Category::App)
-        && let Some(thumbs) = thumbs.as_mut()
+    } else if matches!(
+        entry.category(),
+        Category::Image | Category::App | Category::Pdf
+    ) && let Some(thumbs) = thumbs.as_mut()
     {
         // The card is in front of everything: its picture may show.
         thumbs.cover(false);
@@ -318,6 +320,31 @@ mod tests {
             .filter(|at| painted(&drawn[*at]))
             .collect();
         assert!(!painted.is_empty(), "the icon");
+        assert!(
+            painted
+                .iter()
+                .all(|(x, y)| (12..108).contains(x) && (6..27).contains(y)),
+            "inside the card's body"
+        );
+    }
+
+    #[test]
+    fn a_pdf_shows_its_first_page_in_the_card() {
+        let (mut f, _thumbnailer) = pictures();
+        // The fake draws any file; Quick Look draws a PDF's first page.
+        fs::write(f.home.join("Pictures").join("report.pdf"), "x").unwrap();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::End]);
+        press(&mut f.app, &[KeyCode::Char(' ')]);
+        f.app.tick();
+        buffer(&mut f.app, 120, 30);
+        settle(&mut f.app);
+        let drawn = buffer(&mut f.app, 120, 30);
+        assert!(find(&drawn, "report.pdf", 10..110).is_some());
+        let painted: Vec<(u16, u16)> = (0..120)
+            .flat_map(|x| (0..30).map(move |y| (x, y)))
+            .filter(|at| painted(&drawn[*at]))
+            .collect();
+        assert!(!painted.is_empty(), "the page");
         assert!(
             painted
                 .iter()

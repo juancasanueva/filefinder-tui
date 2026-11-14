@@ -117,7 +117,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
             .and_then(|highlighter| highlighter.get(&entry.path, entry.modified, &facts.opening));
         let rows = text_rows(&facts.opening, width, coloured);
         scrolled(frame, rows, body, preview_scroll);
-    } else if matches!(entry.category(), Category::Image | Category::App) {
+    } else if matches!(
+        entry.category(),
+        Category::Image | Category::App | Category::Pdf
+    ) {
         *preview_scroll = 0;
         let drawn = thumbs
             .as_mut()
@@ -481,6 +484,27 @@ mod tests {
         assert_eq!(row(&drawn, last + 1).trim(), "");
         assert_eq!(row(&drawn, last + 2).trim(), "Kind · Application");
         assert_eq!(row(&drawn, last + 3).trim(), "");
+    }
+
+    #[test]
+    fn a_pdf_shows_its_first_page_with_its_size_and_kind_under_it() {
+        let (mut f, _thumbnailer) = pictures();
+        // The fake draws any file; Quick Look draws a PDF's first page.
+        fs::write(f.home.join("Pictures").join("report.pdf"), "x").unwrap();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::End]);
+        f.app.tick();
+        assert_eq!(f.app.pane().selected().unwrap().name, "report.pdf");
+        buffer(&mut f.app, 120, 30);
+        settle(&mut f.app);
+        let drawn = buffer(&mut f.app, 120, 30);
+        let painted_rows: Vec<u16> = (5..28)
+            .filter(|y| (75..119).any(|x| painted(&drawn[(x, *y)])))
+            .collect();
+        let last = *painted_rows.last().expect("the page");
+        assert_eq!(painted_rows[0], 5, "right under the head");
+        assert_eq!(row(&drawn, last + 1).trim(), "");
+        assert!(row(&drawn, last + 2).starts_with("Size · "));
+        assert_eq!(row(&drawn, last + 3).trim(), "Kind · PDF document");
     }
 
     #[test]
