@@ -3876,22 +3876,28 @@ impl App {
         self.preview_scroll = self.preview_scroll.saturating_add_signed(rows);
     }
 
-    /// Tab and Shift+Tab: the places panel when it shows, each pane in
-    /// turn, then the preview when it shows.
+    /// Tab and Shift+Tab: the places panel when it shows, then each pane in
+    /// turn; never the preview.
     fn move_focus(&mut self, delta: isize) {
+        // The preview is not a stop: all it does is scroll, which the wheel
+        // does over it. A click still gives it the keyboard.
         let mut stops: Vec<(Focus, Option<usize>)> = Vec::new();
         if self.places_visible {
             stops.push((Focus::Places, None));
         }
         stops.extend((0..self.panes().len()).map(|pane| (Focus::List, Some(pane))));
-        if self.shows_preview() {
-            stops.push((Focus::Preview, None));
-        }
         let here = |(focus, pane): &(Focus, Option<usize>)| {
             *focus == self.focus && pane.is_none_or(|pane| pane == self.active())
         };
-        let index = stops.iter().position(here).unwrap_or(0) as isize;
-        let (focus, pane) = stops[(index + delta).rem_euclid(stops.len() as isize) as usize];
+        let count = stops.len() as isize;
+        // From the preview, which stands after the lists, the way round goes
+        // on to the first stop or back to the last.
+        let index = match stops.iter().position(here) {
+            Some(index) => index as isize + delta,
+            None if delta > 0 => 0,
+            None => count - 1,
+        };
+        let (focus, pane) = stops[index.rem_euclid(count) as usize];
         if focus == Focus::Places {
             return self.enter_places();
         }
@@ -4856,6 +4862,21 @@ pub mod testing {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
+    /// Gives the preview the keyboard the way the user does, Tab passing it
+    /// by: a click in it, on a frame drawn 120 by 30.
+    pub fn click_preview(app: &mut App) {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        crate::ui::testing::buffer(app, 120, 30);
+        let rect = app.hits.rect_of(&Spot::Preview).expect("the preview");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + rect.width / 2,
+            row: rect.y + rect.height / 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Preview);
+    }
+
     /// Control and Option (sent as Alt) held together.
     pub fn ctrl_alt(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -5037,18 +5058,38 @@ mod tests {
     }
 
     #[test]
-    fn tab_moves_the_keyboard_between_the_list_and_the_preview() {
+    fn tab_moves_the_keyboard_between_the_panel_and_the_list_and_passes_the_preview_by() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut f = fixture();
-        press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Preview);
-        // Round past the places panel, back to the list.
+        // The preview shows, but there is nothing to do in it but scroll,
+        // which the wheel does: Tab passes it by.
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::Places);
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::List);
-        press(&mut f.app, &[KeyCode::BackTab, KeyCode::BackTab]);
-        assert_eq!(f.app.focus, Focus::Preview);
-        // Escape gives it back to the list.
+        press(&mut f.app, &[KeyCode::BackTab]);
+        assert_eq!(f.app.focus, Focus::Places);
+        press(&mut f.app, &[KeyCode::BackTab]);
+        assert_eq!(f.app.focus, Focus::List);
+        // A click still gives it the keyboard; Tab goes on round to the
+        // panel, Shift+Tab back to the list, Escape to the list.
+        let click_preview = |app: &mut App| {
+            crate::ui::testing::buffer(app, 120, 30);
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 110,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.focus, Focus::Preview);
+        };
+        click_preview(&mut f.app);
+        press(&mut f.app, &[KeyCode::Tab]);
+        assert_eq!(f.app.focus, Focus::Places);
+        click_preview(&mut f.app);
+        press(&mut f.app, &[KeyCode::BackTab]);
+        assert_eq!(f.app.focus, Focus::List);
+        click_preview(&mut f.app);
         press(&mut f.app, &[KeyCode::Esc]);
         assert_eq!(f.app.focus, Focus::List);
         // Without the preview Tab goes between the panel and the list.
@@ -5057,11 +5098,11 @@ mod tests {
         assert_eq!(f.app.focus, Focus::Places);
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::List);
-        // The columns and the grid show the preview too.
+        // The columns and the grid show the preview too, and pass it by.
         f.app.handle_key(alt(KeyCode::Char('p')));
         for view in ['2', '3'] {
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            for focus in [Focus::Preview, Focus::Places, Focus::List] {
+            for focus in [Focus::Places, Focus::List] {
                 press(&mut f.app, &[KeyCode::Tab]);
                 assert_eq!(f.app.focus, focus, "view {view}");
             }
@@ -5160,8 +5201,7 @@ mod tests {
         let state = dir.path().join("state");
         let mut app = launch_one_pane(&home, Some(&state));
         assert!(app.preview_visible, "shown at first");
-        press(&mut app, &[KeyCode::Tab]);
-        assert_eq!(app.focus, Focus::Preview);
+        click_preview(&mut app);
         // Hidden, it gives the keyboard back to the list.
         app.handle_key(alt(KeyCode::Char('p')));
         assert!(!app.preview_visible);
@@ -5182,10 +5222,8 @@ mod tests {
         f.app.tick();
         crate::ui::testing::buffer(&mut f.app, 120, 30);
         let at = f.app.pane().cursor;
-        press(
-            &mut f.app,
-            &[KeyCode::Tab, KeyCode::Down, KeyCode::Char('j')],
-        );
+        click_preview(&mut f.app);
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Char('j')]);
         assert_eq!(f.app.preview_scroll, 2);
         press(&mut f.app, &[KeyCode::Char('k')]);
         assert_eq!(f.app.preview_scroll, 1);
@@ -7206,8 +7244,10 @@ mod tests {
         press(&mut f.app, &[KeyCode::Backspace]);
         assert_eq!(f.app.pane().cwd, f.home);
         assert_eq!(selected_name(&f.app), Some("Pictures"));
-        // Tab moves to the preview again, and a key flea leaves free is nothing.
-        press(&mut f.app, &[KeyCode::Tab, KeyCode::Char('e')]);
+        // In the preview (a click, Tab passing it by), a key flea leaves
+        // free is nothing.
+        click_preview(&mut f.app);
+        press(&mut f.app, &[KeyCode::Char('e')]);
         assert_eq!(f.app.focus, Focus::Preview);
         assert!(f.app.field.is_none());
         press(&mut f.app, &[KeyCode::Char('q')]);
@@ -7958,17 +7998,14 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('c')));
         assert_eq!(said(&f.app), ("1 item ready to paste.", false));
 
-        // Tab goes to the preview, the places panel and back, and the one
-        // pane stays the active one.
+        // Tab goes to the places panel and back, passing the preview by,
+        // and the one pane stays the active one.
         let mut stops = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             press(&mut f.app, &[KeyCode::Tab]);
             stops.push(keyboard(&f.app));
         }
-        assert_eq!(
-            stops,
-            [(Focus::Preview, 0), (Focus::Places, 0), (Focus::List, 0)]
-        );
+        assert_eq!(stops, [(Focus::Places, 0), (Focus::List, 0)]);
         press(&mut f.app, &[KeyCode::F(2)]);
         assert!(matches!(asking(&f.app), Some(Asking::Rename(_))));
     }
@@ -8149,8 +8186,8 @@ mod tests {
         assert!(!menu(&f.app).contains(&"Show Hidden Files"));
 
         // From the preview pane it is the same item's menu.
-        press(&mut f.app, &[KeyCode::Esc, KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Preview);
+        press(&mut f.app, &[KeyCode::Esc]);
+        click_preview(&mut f.app);
         f.app.handle_key(key(KeyCode::Char('m')));
         assert!(f.app.menu.is_some());
     }
@@ -11087,22 +11124,19 @@ mod places_tests {
     }
 
     #[test]
-    fn tab_goes_round_the_places_the_list_and_the_preview_and_shift_tab_back() {
+    fn tab_goes_round_the_places_and_the_list_and_shift_tab_back() {
         let mut f = fixture();
         assert_eq!(keyboard(&f.app), (Focus::List, 0));
         f.app.handle_key(key(KeyCode::Tab));
-        assert_eq!(keyboard(&f.app), (Focus::Preview, 0));
-        f.app.handle_key(key(KeyCode::Tab));
         assert_eq!(keyboard(&f.app), (Focus::Places, 0));
         f.app.handle_key(key(KeyCode::Tab));
         assert_eq!(keyboard(&f.app), (Focus::List, 0));
         f.app.handle_key(key(KeyCode::BackTab));
         assert_eq!(keyboard(&f.app), (Focus::Places, 0));
         f.app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(keyboard(&f.app), (Focus::Preview, 0));
+        assert_eq!(keyboard(&f.app), (Focus::List, 0));
 
         // Two panes: the panel, the left list, the right one.
-        f.app.handle_key(key(KeyCode::Esc));
         split(&mut f.app);
         assert_eq!(keyboard(&f.app), (Focus::List, 1));
         f.app.handle_key(key(KeyCode::Tab));

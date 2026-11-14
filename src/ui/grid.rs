@@ -529,7 +529,8 @@ mod tests {
         // With the keyboard in the preview, the cursor's tile is on the
         // selected fill without the edge.
         f.app.handle_key(alt(KeyCode::Char('p')));
-        press(&mut f.app, &[KeyCode::Esc, KeyCode::Tab]);
+        press(&mut f.app, &[KeyCode::Esc]);
+        crate::app::testing::click_preview(&mut f.app);
         let away = buffer(&mut f.app, 120, 30);
         let (x, y) = find(&away, "Pictures", 0..73).unwrap();
         assert_eq!(away[(x, y)].bg, theme::SELECTED);

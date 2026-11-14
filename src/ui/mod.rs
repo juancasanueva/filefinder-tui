@@ -684,8 +684,8 @@ mod tests {
         // Tab moves the keyboard, and the light with it.
         f.app.focus = Focus::List;
         press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::Preview);
-        assert_lit(&buffer(&mut f.app, 120, 30), end, 119, "after Tab");
+        assert_eq!(f.app.focus, Focus::Places);
+        assert_lit(&buffer(&mut f.app, 120, 30), 0, line, "after Tab");
 
         // Two panes: the active one's stretch, up to the line between them.
         f.app.focus = Focus::List;

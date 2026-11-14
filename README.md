@@ -74,7 +74,7 @@ flea's own terminal keys. Digits are never counts.
 | `l`, → | Browse into the folder, or open the file |
 | ⏎ | Open |
 | `H` / `L` | Back, forward |
-| Tab, Shift+Tab | The places panel, the list and the preview, or the places panel and the two panes |
+| Tab, Shift+Tab | The places panel and the list, or the places panel and the two panes. The preview is passed by: the wheel scrolls it, and a click in it gives it the keyboard (`j`/`k`, the page keys and Ctrl+D/U scroll it, Esc goes back) |
 | Escape | Close or go back: an error, the filter, Find (its walk first), the file work under way, the marks |
 | `:`, Ctrl+L | Go to a place (Tab completes) |
 | `/` | Filter this folder; in the field Tab adds its subfolders, ⏎ or ↓ keeps the filter, Escape clears it, Ctrl+A marks what it shows |
