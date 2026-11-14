@@ -6802,7 +6802,8 @@ mod tests {
         press(&mut f.app, &[KeyCode::Char('/')]);
         type_text(&mut f.app, "tes");
         let drawn = crate::ui::testing::buffer(&mut f.app, 100, 20);
-        let (x, y) = crate::ui::testing::find(&drawn, "notes.txt", 22..60).unwrap();
+        let files = crate::ui::testing::panes(&f.app, 100).files;
+        let (x, y) = crate::ui::testing::find(&drawn, "notes.txt", files).unwrap();
         let bold = |at: u16| {
             drawn[(at, y)]
                 .modifier
@@ -7651,7 +7652,8 @@ mod tests {
         // Drawn marked, and the footer counts them.
         press(&mut f.app, &[KeyCode::Char('v'), KeyCode::Char('G')]);
         let drawn = crate::ui::testing::buffer(&mut f.app, 120, 30);
-        let marked = crate::ui::testing::find(&drawn, "a.txt", 26..73).unwrap();
+        let files = crate::ui::testing::panes(&f.app, 120).files;
+        let marked = crate::ui::testing::find(&drawn, "a.txt", files).unwrap();
         assert_eq!(drawn[marked].bg, theme::MARKED);
         assert!(crate::ui::testing::find(&drawn, "1 of 8 selected", 0..120).is_some());
     }
@@ -9981,7 +9983,7 @@ mod tests {
 mod mouse_tests {
     use super::testing::*;
     use super::*;
-    use crate::ui::testing::{buffer, find};
+    use crate::ui::testing::{buffer, find, panes, tracks};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
     use std::cell::Cell;
@@ -10077,8 +10079,14 @@ mod mouse_tests {
 
     /// The columns a view draws a single pane's items in, at 120 across:
     /// between the places panel and the preview, in every view.
-    fn files(_view: char) -> Range<u16> {
-        26..73
+    fn files(app: &App) -> Range<u16> {
+        panes(app, 120).files
+    }
+
+    /// Draws the window and says where a piece of text starts in the files.
+    fn spot_file(app: &mut App, text: &str) -> (u16, u16) {
+        let files = files(app);
+        spot(app, text, files)
     }
 
     #[test]
@@ -10089,7 +10097,7 @@ mod mouse_tests {
             f.app.handle_key(shift(KeyCode::Down));
             // The keyboard elsewhere: in the preview.
             f.app.focus = Focus::Preview;
-            let (x, y) = spot(&mut f.app, "c.txt", files(view));
+            let (x, y) = spot_file(&mut f.app, "c.txt");
             // A tile is its picture as much as its name.
             let at = if view == '3' { (x, y - 3) } else { (x, y) };
             click(&mut f.app, at);
@@ -10154,8 +10162,11 @@ mod mouse_tests {
         f.app.handle_key(ctrl(KeyCode::Char('2')));
         press(&mut f.app, &[KeyCode::Down, KeyCode::Right]);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
-        let trip = spot(&mut f.app, "Trip", 42..73);
-        let jpg = spot(&mut f.app, "a.jpg", 42..73);
+        // The way down is home, then Pictures: a track each.
+        let tracks = tracks(&f.app, 120);
+        assert_eq!(tracks.len(), 2);
+        let trip = spot(&mut f.app, "Trip", tracks[1].clone());
+        let jpg = spot(&mut f.app, "a.jpg", tracks[1].clone());
         click(&mut f.app, jpg);
         assert_eq!(f.app.pane().cwd, f.home.join("Pictures"));
         assert_eq!(cursor_name(&f.app), "a.jpg");
@@ -10163,7 +10174,7 @@ mod mouse_tests {
         assert_eq!(cursor_name(&f.app), "Trip");
 
         // The home column, left of it: there, with the row clicked selected.
-        let notes = spot(&mut f.app, "notes.txt", 26..42);
+        let notes = spot(&mut f.app, "notes.txt", tracks[0].clone());
         click(&mut f.app, notes);
         assert_eq!(f.app.pane().cwd, f.home);
         assert_eq!(cursor_name(&f.app), "notes.txt");
@@ -10179,7 +10190,7 @@ mod mouse_tests {
             let mut f = fixture();
             let now = clock(&mut f.app);
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            let pictures = spot(&mut f.app, "Pictures", files(view));
+            let pictures = spot_file(&mut f.app, "Pictures");
             click(&mut f.app, pictures);
             wait(&now, 400);
             draw(&mut f.app);
@@ -10188,7 +10199,7 @@ mod mouse_tests {
             assert_eq!(f.app.pane().back.len(), 1, "in the history");
 
             // A file opens with its app.
-            let jpg = spot(&mut f.app, "a.jpg", files(view));
+            let jpg = spot_file(&mut f.app, "a.jpg");
             click(&mut f.app, jpg);
             wait(&now, 150);
             draw(&mut f.app);
@@ -10205,7 +10216,7 @@ mod mouse_tests {
             assert_eq!(*f.system.opened.borrow(), opened, "view {view}");
 
             // Quick, on two different items: two clicks.
-            let trip = spot(&mut f.app, "Trip", files(view));
+            let trip = spot_file(&mut f.app, "Trip");
             wait(&now, 1000);
             click(&mut f.app, trip);
             wait(&now, 100);
@@ -10222,11 +10233,11 @@ mod mouse_tests {
         for view in VIEWS {
             let mut f = several();
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            let a = spot(&mut f.app, "a.txt", files(view));
-            let b = spot(&mut f.app, "b.txt", files(view));
-            let c = spot(&mut f.app, "c.txt", files(view));
-            let d = spot(&mut f.app, "d.txt", files(view));
-            let e = spot(&mut f.app, "e.txt", files(view));
+            let a = spot_file(&mut f.app, "a.txt");
+            let b = spot_file(&mut f.app, "b.txt");
+            let c = spot_file(&mut f.app, "c.txt");
+            let d = spot_file(&mut f.app, "d.txt");
+            let e = spot_file(&mut f.app, "e.txt");
             click(&mut f.app, a);
             click_with(&mut f.app, d, KeyModifiers::SHIFT);
             assert_eq!(selection(&f.app), ["a.txt", "b.txt", "c.txt", "d.txt"]);
@@ -10267,7 +10278,7 @@ mod mouse_tests {
         for view in VIEWS {
             let mut f = several();
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            let at = |f: &mut Fixture, name| spot(&mut f.app, name, files(view));
+            let at = |f: &mut Fixture, name| spot_file(&mut f.app, name);
             let (a, c, e) = (
                 at(&mut f, "a.txt"),
                 at(&mut f, "c.txt"),
@@ -10303,7 +10314,7 @@ mod mouse_tests {
         for view in VIEWS {
             let mut f = several();
             f.app.handle_key(ctrl(KeyCode::Char(view)));
-            let at = |f: &mut Fixture, name| spot(&mut f.app, name, files(view));
+            let at = |f: &mut Fixture, name| spot_file(&mut f.app, name);
             let (a, b, c, e) = (
                 at(&mut f, "a.txt"),
                 at(&mut f, "b.txt"),
@@ -10351,7 +10362,7 @@ mod mouse_tests {
 
         // `m` after it opens at the same row, wherever the click was.
         let mut f = several();
-        let e = spot(&mut f.app, "e.txt", 26..73);
+        let e = spot_file(&mut f.app, "e.txt");
         right_click(&mut f.app, (e.0 + 10, e.1));
         let clicked = draw(&mut f.app);
         press(&mut f.app, &[KeyCode::Esc]);
@@ -10374,7 +10385,7 @@ mod mouse_tests {
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(key(KeyCode::Char('m')));
         assert!(f.app.wants_motion(), "every move is heard over the menu");
-        let compress = spot(&mut f.app, "Compress", 26..73);
+        let compress = spot_file(&mut f.app, "Compress");
         mouse(
             &mut f.app,
             MouseEventKind::Moved,
@@ -10391,7 +10402,7 @@ mod mouse_tests {
             f.app.menu.as_ref().map(|menu| menu.sub),
             Some(Sub::Compress)
         );
-        let zip = spot(&mut f.app, ".zip", 26..73);
+        let zip = spot_file(&mut f.app, ".zip");
         click(&mut f.app, zip);
         assert!(f.app.menu.is_none());
         assert_eq!(f.app.working(), Some("Compressing notes.txt to .zip"));
@@ -10402,7 +10413,7 @@ mod mouse_tests {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(key(KeyCode::Char('m')));
-        let documents = spot(&mut f.app, "Documents", 26..73);
+        let documents = spot_file(&mut f.app, "Documents");
         click(&mut f.app, documents);
         assert!(f.app.menu.is_none());
         assert_eq!(
@@ -10412,7 +10423,7 @@ mod mouse_tests {
         );
 
         f.app.handle_key(key(KeyCode::Char('m')));
-        let copy_path = spot(&mut f.app, "Copy Path", 26..73);
+        let copy_path = spot_file(&mut f.app, "Copy Path");
         click(&mut f.app, copy_path);
         assert!(f.app.menu.is_none());
         let path = f.home.join("notes.txt").display().to_string();
@@ -10458,7 +10469,7 @@ mod mouse_tests {
     #[test]
     fn the_wheel_moves_the_cursor_one_row_like_j_and_k() {
         let mut f = several();
-        let top = spot(&mut f.app, "Documents", 26..73);
+        let top = spot_file(&mut f.app, "Documents");
         f.app.focus = Focus::Preview;
         wheel(&mut f.app, top, true);
         assert_eq!(cursor_name(&f.app), "Pictures");
@@ -10545,7 +10556,7 @@ mod mouse_tests {
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(shift(KeyCode::Delete));
         assert!(f.app.wants_motion(), "the buttons follow the pointer");
-        let documents = spot(&mut f.app, "Documents", 26..73);
+        let documents = spot_file(&mut f.app, "Documents");
         // A right click outside does nothing; moving onto Delete puts the
         // keyboard on it, back on Cancel puts it back.
         right_click(&mut f.app, documents);
@@ -10599,7 +10610,7 @@ mod mouse_tests {
             f.app.handle_key(key(KeyCode::Char(c)));
         }
         finish_search(&mut f.app);
-        let found = spot(&mut f.app, "a.jpg", 26..73);
+        let found = spot_file(&mut f.app, "a.jpg");
         click(&mut f.app, found);
         wait(&now, 200);
         draw(&mut f.app);
@@ -10644,7 +10655,7 @@ mod mouse_tests {
     fn a_click_while_a_prompt_asks_does_nothing_and_one_in_the_files_hands_the_search_over() {
         let mut f = fixture();
         f.app.handle_key(ctrl(KeyCode::Char('l')));
-        let notes = spot(&mut f.app, "notes.txt", 26..73);
+        let notes = spot_file(&mut f.app, "notes.txt");
         click(&mut f.app, notes);
         right_click(&mut f.app, notes);
         assert!(f.app.prompt.is_some(), "the prompt waits for keys");
@@ -10657,7 +10668,7 @@ mod mouse_tests {
         press(&mut f.app, &[KeyCode::Char('f')]);
         type_text(&mut f.app, "jpg");
         finish_search(&mut f.app);
-        let found = spot(&mut f.app, "a.jpg", 26..73);
+        let found = spot_file(&mut f.app, "a.jpg");
         click(&mut f.app, found);
         assert!(f.app.field.is_none(), "the keyboard is with what was found");
         assert!(f.app.pane().results().is_some(), "still showing it");
@@ -10667,7 +10678,7 @@ mod mouse_tests {
     #[test]
     fn drags_moves_releases_and_the_middle_button_do_nothing() {
         let mut f = fixture();
-        let notes = spot(&mut f.app, "notes.txt", 26..73);
+        let notes = spot_file(&mut f.app, "notes.txt");
         for kind in [
             MouseEventKind::Up(MouseButton::Left),
             MouseEventKind::Drag(MouseButton::Left),
@@ -11184,7 +11195,8 @@ mod places_tests {
     fn a_click_on_a_place_opens_it_and_the_wheel_over_the_panel_scrolls_it() {
         let mut f = fixture();
         let drawn = buffer(&mut f.app, 120, 30);
-        let (x, y) = find(&drawn, "Pictures", 0..25).expect("the place");
+        let panel = crate::ui::testing::panes(&f.app, 120).panel;
+        let (x, y) = find(&drawn, "Pictures", panel).expect("the place");
         f.app.focus = Focus::Preview;
         f.app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -11201,7 +11213,11 @@ mod places_tests {
         }
         f.app.handle_key(key(KeyCode::F(5)));
         let top = |app: &mut App| {
-            let row: String = screen(app, 120, 14)[2].chars().take(25).collect();
+            let panel = crate::ui::testing::panes(app, 120).panel;
+            let row: String = screen(app, 120, 14)[2]
+                .chars()
+                .take(panel.end as usize)
+                .collect();
             row.trim().to_string()
         };
         assert_eq!(top(&mut f.app), "PLACES");

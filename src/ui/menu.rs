@@ -205,7 +205,7 @@ mod tests {
     use super::*;
     use crate::app::Sub;
     use crate::app::testing::{ctrl, fixture, grid_fixture, key, press};
-    use crate::ui::testing::{buffer, find, screen};
+    use crate::ui::testing::{buffer, find, panes, screen};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
     use ratatui::style::Color;
@@ -222,7 +222,8 @@ mod tests {
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(key(KeyCode::Char('m')));
         let drawn = buffer(&mut f.app, 120, 30);
-        let (x, y) = find(&drawn, "notes.txt", 26..73).expect("the item");
+        let files = panes(&f.app, 120).files;
+        let (x, y) = find(&drawn, "notes.txt", files).expect("the item");
         // The frame in the frame colour, on the terminal's own background,
         // from the name's column, right under the row.
         let corner = (x, y + 1);
@@ -296,10 +297,11 @@ mod tests {
         press(&mut f.app, &[KeyCode::Char('J')]);
         f.app.handle_key(key(KeyCode::Char('m')));
         let drawn = buffer(&mut f.app, 120, 30);
-        let with = find(&drawn, "Open With", 26..73).expect("the row");
+        let files = panes(&f.app, 120).files;
+        let with = find(&drawn, "Open With", files.clone()).expect("the row");
         assert_eq!(drawn[with].fg, theme::MUTED);
         assert_eq!(drawn[(with.0 - 2, with.1)].fg, theme::MUTED);
-        let rename = find(&drawn, "Rename", 26..73).expect("the row");
+        let rename = find(&drawn, "Rename", files).expect("the row");
         assert_eq!(
             drawn[rename].fg,
             theme::FOREGROUND,
@@ -317,7 +319,8 @@ mod tests {
         press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(key(KeyCode::Char('m')));
         let root = buffer(&mut f.app, 120, 30);
-        let (x, y) = find(&root, "┌", 26..73).expect("the menu");
+        let files = panes(&f.app, 120).files;
+        let (x, y) = find(&root, "┌", files).expect("the menu");
         press(
             &mut f.app,
             &[KeyCode::Char('j'), KeyCode::Char('j'), KeyCode::Char('l')],
@@ -362,11 +365,15 @@ mod tests {
         press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
         f.app.handle_key(key(KeyCode::Char('m')));
         let drawn = buffer(&mut f.app, 120, 40);
-        let (x, y) = find(&drawn, "notes.txt", 26..73).expect("the item");
+        let files = panes(&f.app, 120).files;
+        let (x, y) = find(&drawn, "notes.txt", files.clone()).expect("the item");
         assert!(y > 30, "near the bottom");
         assert_eq!(drawn[(x, y - 1)].symbol(), "└");
-        assert_eq!(find(&drawn, "Open Trash", 26..73), Some((x + 4, y - 2)));
-        assert_eq!(find(&drawn, "Open ", 26..73), Some((x + 4, y - 17)));
+        assert_eq!(
+            find(&drawn, "Open Trash", files.clone()),
+            Some((x + 4, y - 2))
+        );
+        assert_eq!(find(&drawn, "Open ", files.clone()), Some((x + 4, y - 17)));
         assert_eq!(drawn[(x, y - 18)].symbol(), "┌");
         press(&mut f.app, &[KeyCode::Esc]);
 
@@ -378,13 +385,13 @@ mod tests {
         let top = lines.iter().position(|line| line.contains('┌')).unwrap();
         let bottom = lines.iter().position(|line| line.contains('└')).unwrap();
         assert_eq!((top, bottom), (2, 11), "the whole body, no more");
-        assert!(find(&short, "Open ", 26..73).is_some());
-        assert_eq!(find(&short, "Open Trash", 26..73), None);
+        assert!(find(&short, "Open ", files.clone()).is_some());
+        assert_eq!(find(&short, "Open Trash", files.clone()), None);
         press(&mut f.app, &[KeyCode::Down; 30]);
         let short = buffer(&mut f.app, 120, 14);
-        let last = find(&short, "Open Trash", 26..73).expect("the last row");
+        let last = find(&short, "Open Trash", files.clone()).expect("the last row");
         assert_eq!(short[last].bg, theme::TAB);
-        assert_eq!(find(&short, "Open With", 26..73), None);
+        assert_eq!(find(&short, "Open With", files.clone()), None);
 
         // And one too small for anything is still drawn.
         for (width, height) in [(3, 2), (20, 5), (40, 6), (12, 5)] {
@@ -424,13 +431,15 @@ mod tests {
         let mut f = fixture();
         press(&mut f.app, &[KeyCode::End, KeyCode::Char('T')]);
         let drawn = buffer(&mut f.app, 120, 30);
-        assert!(find(&drawn, "TAGS", 26..120).is_some());
+        // Over the files, from their first column to the window's edge.
+        let right = panes(&f.app, 120).files.start..120;
+        assert!(find(&drawn, "TAGS", right.clone()).is_some());
         for (index, name) in crate::tags::NAMES.iter().enumerate() {
-            let (x, y) = find(&drawn, name, 26..120).expect("the tag's line");
+            let (x, y) = find(&drawn, name, right.clone()).expect("the tag's line");
             assert_eq!(drawn[(x - 2, y)].symbol(), "■", "{name}");
             assert_eq!(drawn[(x - 2, y)].fg, theme::TAGS[index], "{name}");
         }
-        assert_eq!(find(&drawn, "Remove All Tags", 26..120), None);
+        assert_eq!(find(&drawn, "Remove All Tags", right), None);
     }
 
     #[test]

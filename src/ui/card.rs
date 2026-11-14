@@ -284,7 +284,7 @@ fn asked(dialog: &Dialog) -> (String, String, &'static str) {
 mod tests {
     use super::*;
     use crate::app::testing::{fixture, press, several, shift};
-    use crate::ui::testing::{buffer, find};
+    use crate::ui::testing::{buffer, find, panes};
     use ratatui::crossterm::event::KeyCode;
     use ratatui::style::Color;
 
@@ -333,7 +333,8 @@ mod tests {
         assert_eq!(drawn[(delete.0 + 2, y + 4)].bg, Color::Reset);
         // Everything behind it is dimmed: the path, the item's row.
         assert_eq!(drawn[(1, 0)].fg, theme::DIMMED);
-        let notes = find(&drawn, "notes.txt", 26..73).expect("the item");
+        let files = panes(&f.app, 120).files;
+        let notes = find(&drawn, "notes.txt", files).expect("the item");
         assert_eq!(drawn[notes].fg, theme::DIMMED);
         assert_eq!(
             drawn[notes].bg,

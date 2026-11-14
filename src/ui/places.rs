@@ -91,6 +91,23 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
     frame.render_widget(Paragraph::new(drawn), area);
 }
 
+/// Cells left free after the widest name, so the panel doesn't feel crowded.
+const AIR: usize = 5;
+
+/// The panel's width for what it lists: its widest row (the edge, the
+/// glyph and its space, the name, then `AIR`) or heading.
+pub fn needed(sections: &[places::Section]) -> u16 {
+    let rows = sections
+        .iter()
+        .flat_map(|section| &section.places)
+        .map(|place| {
+            let glyph = icons::place(place.kind).width() + 1;
+            1 + glyph + place.name.width() + AIR
+        });
+    let headings = sections.iter().map(|section| section.heading.width() + 2);
+    rows.chain(headings).max().unwrap_or(0) as u16
+}
+
 /// A place's row: the edge, the glyph, a space and the name, filled to the
 /// width. `cursor` is the panel's cursor while it has the keyboard; `here`
 /// is the place holding the active pane's folder.
@@ -124,7 +141,7 @@ mod tests {
     use crate::app::testing::{Fixture, alt, ctrl, fixture, key, launch, launch_one_pane};
     use crate::icons;
     use crate::theme;
-    use crate::ui::testing::{buffer, find, screen};
+    use crate::ui::testing::{buffer, find, panes, screen};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
     use ratatui::style::Color;
@@ -137,8 +154,9 @@ mod tests {
 
     /// The panel's rows at 120 by 30, each trimmed.
     fn panel(f: &mut Fixture) -> Vec<String> {
+        let width = panes(&f.app, 120).panel.end as usize;
         let lines = screen(&mut f.app, 120, 30);
-        let row = |line: &String| line.chars().take(25).collect::<String>();
+        let row = |line: &String| line.chars().take(width).collect::<String>();
         lines[2..28]
             .iter()
             .map(|line| row(line).trim().to_string())
@@ -155,12 +173,15 @@ mod tests {
             let (x, y) = find(drawn, name, columns).unwrap_or_else(|| panic!("{name}"));
             drawn[(x - 2, y)].fg
         };
-        assert_eq!(glyph_at(&drawn, "Home", 0..25), theme::ICON_FOLDER);
-        assert_eq!(glyph_at(&drawn, "Pictures", 0..25), theme::ICON_IMAGE);
-        assert_eq!(glyph_at(&drawn, "Trash", 0..25), theme::MUTED);
+        let panes = panes(&f.app, 120);
+        let panel = || panes.panel.clone();
+        assert_eq!(glyph_at(&drawn, "Home", panel()), theme::ICON_FOLDER);
+        assert_eq!(glyph_at(&drawn, "Pictures", panel()), theme::ICON_IMAGE);
+        assert_eq!(glyph_at(&drawn, "Trash", panel()), theme::MUTED);
         // The list: a folder blue, a text file muted, away from the cursor.
-        assert_eq!(glyph_at(&drawn, "Pictures", 26..73), theme::ICON_FOLDER);
-        assert_eq!(glyph_at(&drawn, "notes.txt", 26..73), theme::MUTED);
+        let files = || panes.files.clone();
+        assert_eq!(glyph_at(&drawn, "Pictures", files()), theme::ICON_FOLDER);
+        assert_eq!(glyph_at(&drawn, "notes.txt", files()), theme::MUTED);
     }
 
     /// The fixture with Movies, a file called Music, and two volumes: a
@@ -173,6 +194,33 @@ mod tests {
         std::os::unix::fs::symlink("/", f.volumes.join("Macintosh HD")).unwrap();
         f.app.handle_key(key(KeyCode::F(5)));
         f
+    }
+
+    #[test]
+    fn the_panel_needs_room_for_its_widest_row_and_heading() {
+        use crate::places::{Kind, Place, Section};
+        let place = |name: &str| Place {
+            name: name.to_string(),
+            path: std::path::PathBuf::from("/"),
+            kind: Kind::Drive,
+        };
+        let sections = |names: &[&str], heading| {
+            vec![Section {
+                heading,
+                places: names.iter().map(|name| place(name)).collect(),
+            }]
+        };
+        // The edge, the glyph and its space, the name, then five cells of
+        // air before the line.
+        assert_eq!(
+            super::needed(&sections(&["Home", "Applications"], "PLACES")),
+            20
+        );
+        // A heading wider than every row (here, no rows): its cell each side.
+        assert_eq!(super::needed(&sections(&[], "DEVICES")), 9);
+        // A short name still gets its air: wider than the heading.
+        assert_eq!(super::needed(&sections(&["T7"], "DEVICES")), 10);
+        assert_eq!(super::needed(&[]), 0);
     }
 
     #[test]
@@ -203,9 +251,10 @@ mod tests {
             assert_eq!(rows[..10], wanted, "{view:?}");
             assert!(rows[10..].iter().all(String::is_empty), "{view:?}");
             let drawn = buffer(&mut f.app, 120, 30);
+            let line = panes(&f.app, 120).panel.end;
             // Headings start where the glyphs do, in the muted ink.
-            assert_eq!(find(&drawn, "PLACES", 0..25), Some((1, 2)));
-            assert_eq!(find(&drawn, "DEVICES", 0..25), Some((1, 9)));
+            assert_eq!(find(&drawn, "PLACES", 0..line), Some((1, 2)));
+            assert_eq!(find(&drawn, "DEVICES", 0..line), Some((1, 9)));
             for x in 1..7 {
                 assert_eq!(drawn[(x, 2)].fg, theme::MUTED, "{x}");
             }
@@ -214,10 +263,10 @@ mod tests {
             assert_eq!(drawn[(1, 4)].fg, theme::ICON_FOLDER);
             // The line right of it, all the way down and into the rules.
             for y in 2..28 {
-                assert_eq!(drawn[(25, y)].symbol(), "│", "{view:?} {y}");
+                assert_eq!(drawn[(line, y)].symbol(), "│", "{view:?} {y}");
             }
-            assert_eq!(drawn[(25, 1)].symbol(), "┬");
-            assert_eq!(drawn[(25, 28)].symbol(), "┴");
+            assert_eq!(drawn[(line, 1)].symbol(), "┬");
+            assert_eq!(drawn[(line, 28)].symbol(), "┴");
             f.app.handle_key(ctrl(KeyCode::Char('1')));
         }
     }
@@ -228,7 +277,7 @@ mod tests {
         f.app.navigate(&f.home.join("Pictures/Trip"));
         let drawn = buffer(&mut f.app, 120, 30);
         assert_eq!(cells(&drawn, 5, 3..11), "Pictures");
-        for x in 0..25 {
+        for x in panes(&f.app, 120).panel {
             assert_eq!(drawn[(x, 5)].bg, theme::SELECTED, "{x}");
         }
         assert_eq!(drawn[(0, 5)].symbol(), " ", "no edge without the keyboard");
@@ -258,23 +307,25 @@ mod tests {
         assert_eq!(f.app.focus, Focus::Places);
         f.app.handle_key(key(KeyCode::Char('j')));
         let drawn = buffer(&mut f.app, 120, 30);
+        let panes = panes(&f.app, 120);
         // Documents, under the panel's cursor.
         assert_eq!(cells(&drawn, 4, 3..12), "Documents");
         assert_eq!(drawn[(0, 4)].symbol(), "▎");
         assert_eq!(drawn[(0, 4)].fg, theme::ACCENT);
-        for x in 0..25 {
+        for x in panes.panel {
             assert_eq!(drawn[(x, 4)].bg, theme::CURSOR, "{x}");
         }
         // Home, holding the folder, keeps the selected fill without the edge.
         assert_eq!(drawn[(0, 3)].symbol(), " ");
         assert_eq!(drawn[(10, 3)].bg, theme::SELECTED);
         // The list has no accent edge while the panel has the keyboard.
-        assert_eq!(drawn[(26, 2)].symbol(), " ");
+        let edge = (panes.files.start, 2);
+        assert_eq!(drawn[edge].symbol(), " ");
         f.app.handle_key(key(KeyCode::Esc));
         let drawn = buffer(&mut f.app, 120, 30);
         assert_eq!(drawn[(0, 4)].symbol(), " ");
         assert_eq!(drawn[(10, 4)].bg, Color::Reset);
-        assert_eq!(drawn[(26, 2)].symbol(), "▎");
+        assert_eq!(drawn[edge].symbol(), "▎");
     }
 
     #[test]

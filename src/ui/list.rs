@@ -284,7 +284,7 @@ pub fn notice(frame: &mut Frame, area: Rect, glyph: &str, text: &str, style: Sty
 mod tests {
     use super::*;
     use crate::app::testing::{ctrl, key, pictures_through, settle};
-    use crate::ui::testing::{buffer, find};
+    use crate::ui::testing::{buffer, find, panes};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
     use ratatui_image::picker::ProtocolType;
@@ -304,11 +304,12 @@ mod tests {
 
     #[test]
     fn an_app_shows_its_icon_where_its_glyph_was_in_the_list_and_the_columns() {
-        for (view, columns) in [('1', 26..73), ('2', 26..73)] {
+        for view in ['1', '2'] {
             let (mut f, _thumbnailer) = pictures_through(ProtocolType::Kitty);
             fs::write(f.home.join("Safari.app"), "x").unwrap();
             f.app.handle_key(key(KeyCode::F(5)));
             f.app.handle_key(ctrl(KeyCode::Char(view)));
+            let columns = panes(&f.app, 120).files;
             // Until the icon is ready, the glyph shows.
             let first = buffer(&mut f.app, 120, 30);
             let [glyph, space] = glyph_slot(&first, "Safari.app", columns.clone());
@@ -335,7 +336,8 @@ mod tests {
         buffer(&mut f.app, 120, 30);
         settle(&mut f.app);
         let drawn = buffer(&mut f.app, 120, 30);
-        let [glyph, _] = glyph_slot(&drawn, "Safari.app", 26..73);
+        let files = panes(&f.app, 120).files;
+        let [glyph, _] = glyph_slot(&drawn, "Safari.app", files);
         assert_eq!(
             drawn[glyph].symbol(),
             icons::of(&entry(&f.home, "Safari.app"))
@@ -445,9 +447,10 @@ mod tests {
         let square = ("■".to_string(), green);
         // The list, and the preview's head on the right.
         let drawn = buffer(&mut f.app, 120, 30);
-        let listed = find(&drawn, "notes.txt", 26..73).expect("the row");
+        let panes = crate::ui::testing::panes(&f.app, 120);
+        let listed = find(&drawn, "notes.txt", panes.files).expect("the row");
         assert_eq!(after(&drawn, listed), square);
-        let head = find(&drawn, "notes.txt", 73..120).expect("the preview's head");
+        let head = find(&drawn, "notes.txt", panes.preview).expect("the preview's head");
         assert_eq!(after(&drawn, head), square);
         // The columns.
         f.app.handle_key(ctrl(KeyCode::Char('2')));

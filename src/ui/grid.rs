@@ -650,7 +650,8 @@ mod tests {
         for x in 0..62 {
             assert!(!painted(&cut[(x, 25)]), "the rule at {x} is drawn over");
             assert_eq!(cut[(x, 25)].symbol(), "─");
-            assert_eq!(cut[(x, 25)].fg, theme::BORDER);
+            // The grid, the whole window wide, has the keyboard: lit.
+            assert_eq!(cut[(x, 25)].fg, theme::ACCENT);
         }
         assert!(find(&cut, "Detail column · Modified", 0..62).is_some_and(|(_, y)| y == 26));
     }
