@@ -186,6 +186,8 @@ pub enum Action {
     Open,
     /// Open With ›: the apps, in a submenu.
     OpenWith,
+    /// Open in Terminal: a terminal in the folder, or the item's folder.
+    OpenTerminal,
     /// Open With › Default app.
     DefaultApp,
     /// Open With › Quick Look: macOS's own Quick Look window.
@@ -2515,7 +2517,8 @@ impl App {
         }
         view.push(item("Open Trash", Action::OpenTrash));
         let Some(entry) = self.selected() else {
-            return vec![view];
+            // An empty folder: a terminal in it.
+            return vec![vec![item("Open in Terminal", Action::OpenTerminal)], view];
         };
         let one = selection.len() == 1;
         // An archive goes beside its items: they have to be in one folder.
@@ -2531,6 +2534,7 @@ impl App {
             vec![
                 item("Open", Action::Open),
                 item_if(one, "Open With", Action::OpenWith),
+                item("Open in Terminal", Action::OpenTerminal),
             ],
             archives.into_iter().flatten().collect(),
             [
@@ -2668,6 +2672,7 @@ impl App {
             Action::Trash => self.trash(),
             Action::Delete => self.ask_delete(),
             Action::ToggleHidden => self.toggle_hidden(),
+            Action::OpenTerminal => self.open_terminal(),
             Action::OpenTrash => {
                 let trash = self.trash_dir.clone();
                 self.navigate(&trash);
@@ -8769,9 +8774,10 @@ mod tests {
     }
 
     /// The menu for one file or folder that is not an archive.
-    const FILE_MENU: [&str; 16] = [
+    const FILE_MENU: [&str; 17] = [
         "Open",
         "Open With",
+        "Open in Terminal",
         "-",
         "Compress",
         "-",
@@ -8815,8 +8821,16 @@ mod tests {
         f.app.handle_key(ctrl(KeyCode::Char('r')));
         select(&mut f.app, "pack.zip");
         f.app.handle_key(shift(KeyCode::F(10)));
-        let archive = ["Open", "Open With", "-", "Compress", "Extract", "-"];
-        assert_eq!(&menu(&f.app)[..6], archive);
+        let archive = [
+            "Open",
+            "Open With",
+            "Open in Terminal",
+            "-",
+            "Compress",
+            "Extract",
+            "-",
+        ];
+        assert_eq!(&menu(&f.app)[..7], archive);
         assert_eq!(menu(&f.app).len(), FILE_MENU.len() + 1);
         press(&mut f.app, &[KeyCode::Esc]);
 
@@ -8868,7 +8882,10 @@ mod tests {
         assert_eq!(chosen(&f.app).len(), 2);
         f.app.handle_key(key(KeyCode::Char('m')));
         assert_eq!(dim(&f.app), ["Open With", "Compress"]);
-        press(&mut f.app, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]);
+        press(
+            &mut f.app,
+            &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter],
+        );
         assert_eq!(sub(&f.app), Sub::Root, "a dim Compress opens nothing");
     }
 
@@ -8878,7 +8895,10 @@ mod tests {
         press(&mut f.app, &[KeyCode::Enter]);
         assert!(names(&f.app).is_empty());
         f.app.handle_key(key(KeyCode::Char('m')));
-        assert_eq!(menu(&f.app), ["Show Hidden Files", "Open Trash"]);
+        assert_eq!(
+            menu(&f.app),
+            ["Open in Terminal", "-", "Show Hidden Files", "Open Trash"]
+        );
         press(&mut f.app, &[KeyCode::Esc, KeyCode::Char('h')]);
 
         select(&mut f.app, "notes.txt");
@@ -8918,13 +8938,16 @@ mod tests {
         press(&mut f.app, &[KeyCode::Char('h')]);
         assert_eq!((sub(&f.app), menu_cursor(&f.app)), (Sub::Root, 1));
 
-        press(&mut f.app, &[KeyCode::Char('j'), KeyCode::Right]);
+        press(
+            &mut f.app,
+            &[KeyCode::Char('j'), KeyCode::Char('j'), KeyCode::Right],
+        );
         assert_eq!(sub(&f.app), Sub::Compress);
         assert_eq!(Sub::Compress.title(), Some("COMPRESS"));
         let formats = [".zip", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz"];
         assert_eq!(menu(&f.app), formats);
         press(&mut f.app, &[KeyCode::Left]);
-        assert_eq!((sub(&f.app), menu_cursor(&f.app)), (Sub::Root, 3));
+        assert_eq!((sub(&f.app), menu_cursor(&f.app)), (Sub::Root, 4));
 
         press(&mut f.app, &[KeyCode::Char('j'), KeyCode::Enter]);
         assert_eq!(sub(&f.app), Sub::Tags);
@@ -8964,14 +8987,20 @@ mod tests {
         for code in [
             KeyCode::Down,
             KeyCode::Char('j'),
+            KeyCode::Char('j'),
             KeyCode::Up,
+            KeyCode::Char('k'),
             KeyCode::Char('k'),
             KeyCode::Up,
         ] {
             press(&mut f.app, &[code]);
             stops.push(menu_cursor(&f.app));
         }
-        assert_eq!(stops, [1, 3, 1, 0, 0], "over the rule, and no further");
+        assert_eq!(
+            stops,
+            [1, 2, 4, 2, 1, 0, 0],
+            "over the rule, and no further"
+        );
         press(&mut f.app, &[KeyCode::Down; 30]);
         assert_eq!(menu_cursor(&f.app), FILE_MENU.len() - 1);
 
@@ -9107,6 +9136,33 @@ mod tests {
         // And Alt+1 is still the bar of a Spanish keyboard.
         f.app.handle_key(alt(KeyCode::Char('1')));
         assert_eq!(f.app.panes().len(), 2);
+    }
+
+    #[test]
+    fn the_menu_s_open_in_terminal_starts_one_where_alt_t_does() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        // On a folder, in it; on a file, in its folder.
+        select(&mut f.app, "Pictures");
+        pick(&mut f.app, "Open in Terminal");
+        assert!(f.app.menu.is_none(), "the menu closes");
+        select(&mut f.app, "notes.txt");
+        pick(&mut f.app, "Open in Terminal");
+        assert_eq!(
+            *f.system.terminals.borrow(),
+            [pictures.clone(), f.home.clone()]
+        );
+        // In an empty folder, in the folder itself.
+        let empty = f.home.join("Documents");
+        select(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert!(names(&f.app).is_empty());
+        pick(&mut f.app, "Open in Terminal");
+        assert_eq!(f.system.terminals.borrow().last(), Some(&empty));
+        // No terminal: it says so, as Alt+T does.
+        f.system.no_terminal.set(true);
+        pick(&mut f.app, "Open in Terminal");
+        assert_eq!(said(&f.app), ("Couldn't start a terminal.", true));
     }
 
     #[test]
@@ -11093,7 +11149,10 @@ mod mouse_tests {
             right_click(&mut f.app, (e.0 + 2, e.1));
             assert_eq!(selection(&f.app), ["e.txt"], "view {view}");
             assert_eq!(f.app.focus, Focus::List);
-            assert_eq!(&labels(&f.app)[..3], ["Open", "Open With", "-"]);
+            assert_eq!(
+                &labels(&f.app)[..4],
+                ["Open", "Open With", "Open in Terminal", "-"]
+            );
             // Under the row clicked, at its name, or above it without room.
             let drawn = draw(&mut f.app);
             if view == '1' {
@@ -11157,11 +11216,11 @@ mod mouse_tests {
             compress,
             KeyModifiers::NONE,
         );
-        assert_eq!(f.app.menu.as_ref().map(|menu| menu.cursor), Some(3));
+        assert_eq!(f.app.menu.as_ref().map(|menu| menu.cursor), Some(4));
         // Over a rule nothing moves.
         let rule = (compress.0, compress.1 + 1);
         mouse(&mut f.app, MouseEventKind::Moved, rule, KeyModifiers::NONE);
-        assert_eq!(f.app.menu.as_ref().map(|menu| menu.cursor), Some(3));
+        assert_eq!(f.app.menu.as_ref().map(|menu| menu.cursor), Some(4));
         click(&mut f.app, compress);
         assert_eq!(
             f.app.menu.as_ref().map(|menu| menu.sub),

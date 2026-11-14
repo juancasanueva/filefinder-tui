@@ -30,6 +30,7 @@ const FILES: &str = "\u{f0222}";
 const TRASH: &str = "\u{f0a79}";
 const RESTORE: &str = "\u{f099b}";
 const CHEVRON: &str = "\u{f0142}";
+const TERMINAL: &str = "\u{f018d}";
 
 /// The `›` at the end of a row that opens a submenu.
 pub fn chevron() -> &'static str {
@@ -43,6 +44,7 @@ fn glyph(action: Action, label: &str) -> &'static str {
         Action::Open => OPEN,
         Action::OpenWith | Action::DefaultApp => WINDOW,
         Action::QuickLook => EYE,
+        Action::OpenTerminal => TERMINAL,
         Action::ToggleHidden if label.starts_with("Hide") => EYE_CLOSED,
         Action::ToggleHidden => EYE,
         Action::Compress | Action::Extract => ARCHIVE,
@@ -262,28 +264,35 @@ mod tests {
         );
         assert_eq!(drawn[(x + 22, y + 3)].symbol(), CHEVRON);
         assert_eq!(drawn[(x + 22, y + 3)].fg, theme::MUTED);
+        // Open in Terminal, with its glyph and no `›`.
+        assert_eq!(cells(&drawn, y + 4, x + 4..x + 20), "Open in Terminal");
+        assert_eq!(drawn[(x + 2, y + 4)].symbol(), TERMINAL);
+        assert_eq!(drawn[(x + 22, y + 4)].symbol(), " ");
         // A rule between the groups, in the card's rule colour.
         assert_eq!(
-            cells(&drawn, y + 4, x + 1..x + 24),
+            cells(&drawn, y + 5, x + 1..x + 24),
             format!(" {} ", "─".repeat(21))
         );
-        assert_eq!(drawn[(x + 2, y + 4)].fg, theme::CARD_RULE);
-        assert_eq!(cells(&drawn, y + 5, x + 4..x + 12), "Compress");
-        assert_eq!(drawn[(x + 22, y + 5)].symbol(), CHEVRON);
+        assert_eq!(drawn[(x + 2, y + 5)].fg, theme::CARD_RULE);
+        assert_eq!(cells(&drawn, y + 6, x + 4..x + 12), "Compress");
+        assert_eq!(drawn[(x + 22, y + 6)].symbol(), CHEVRON);
         // Delete Permanently… in the error colour, its glyph too.
         let delete = find(&drawn, "Delete Permanently…", x..x + 24).expect("the row");
-        assert_eq!(delete, (x + 4, y + 2 + 12));
+        assert_eq!(delete, (x + 4, y + 2 + 13));
         assert_eq!(drawn[delete].fg, theme::ERROR);
         assert_eq!(drawn[(x + 2, delete.1)].fg, theme::ERROR);
         assert_eq!(drawn[(x + 2, delete.1)].symbol(), TRASH);
         let last = find(&drawn, "Open Trash", x..x + 24).expect("the last row");
-        assert_eq!(last, (x + 4, y + 2 + 15));
+        assert_eq!(last, (x + 4, y + 2 + 16));
         assert_eq!(drawn[(x, last.1 + 1)].symbol(), "└");
 
         // `j` moves the fill along, over the rule.
-        press(&mut f.app, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+        press(
+            &mut f.app,
+            &[KeyCode::Char('j'), KeyCode::Char('j'), KeyCode::Char('j')],
+        );
         let drawn = buffer(&mut f.app, 120, 30);
-        assert_eq!(drawn[(x + 4, y + 5)].bg, theme::TAB);
+        assert_eq!(drawn[(x + 4, y + 6)].bg, theme::TAB);
         assert_eq!(drawn[open].bg, Color::Reset);
 
         // Closed, it is gone.
@@ -324,7 +333,12 @@ mod tests {
         let (x, y) = find(&root, "┌", files).expect("the menu");
         press(
             &mut f.app,
-            &[KeyCode::Char('j'), KeyCode::Char('j'), KeyCode::Char('l')],
+            &[
+                KeyCode::Char('j'),
+                KeyCode::Char('j'),
+                KeyCode::Char('j'),
+                KeyCode::Char('l'),
+            ],
         );
         assert_eq!(
             f.app.menu.as_ref().map(|menu| menu.sub),
@@ -351,7 +365,7 @@ mod tests {
             // The keyboard is on Compress now.
             for column in x + 1..x + 24 {
                 back[(column, y + 1)].bg = Color::Reset;
-                back[(column, y + 4)].bg = theme::TAB;
+                back[(column, y + 5)].bg = theme::TAB;
             }
             back
         });
@@ -375,8 +389,8 @@ mod tests {
             find(&drawn, "Open Trash", files.clone()),
             Some((x + 4, y - 2))
         );
-        assert_eq!(find(&drawn, "Open ", files.clone()), Some((x + 4, y - 17)));
-        assert_eq!(drawn[(x, y - 18)].symbol(), "┌");
+        assert_eq!(find(&drawn, "Open ", files.clone()), Some((x + 4, y - 18)));
+        assert_eq!(drawn[(x, y - 19)].symbol(), "┌");
         press(&mut f.app, &[KeyCode::Esc]);
 
         // A body with room neither above nor below: as low as it fits,

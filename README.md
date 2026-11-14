@@ -150,14 +150,14 @@ trash_now = []              # Delete runs nothing
 
 `m` (or Menu, Shift+F10, a right click on an item) opens the menu under the item, at its name, or above it when there is no room below:
 
-- Open, Open With › (Default app, and Quick Look in macOS's own window)
+- Open, Open With › (Default app, and Quick Look in macOS's own window), Open in Terminal (in the folder, or the item's folder; as Alt+T)
 - Compress › (`.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, and `.7z` with 7-Zip installed), Extract (for an archive)
 - Tags › (the seven Finder tags, Remove All Tags), Copy Path
 - Rename (with several selected, all of them in `$EDITOR`), Duplicate
 - Move to Trash, Delete Permanently…
 - Show/Hide Hidden Files, Open Trash
 
-In the Trash it offers Restore, Delete Permanently… and Empty Trash…. `j` / `k` and the arrows move, `l`, → or ⏎ choose or open a submenu, `h` or ← go back out of one, Escape closes. Each row does exactly what its key does. What can't apply is left out or dimmed.
+In an empty folder it offers Open in Terminal over the last group. In the Trash it offers Restore, Delete Permanently… and Empty Trash…. `j` / `k` and the arrows move, `l`, → or ⏎ choose or open a submenu, `h` or ← go back out of one, Escape closes. Each row does exactly what its key does. What can't apply is left out or dimmed.
 
 ### Quick Look
 
