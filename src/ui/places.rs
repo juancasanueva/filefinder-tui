@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(drawn[(0, 3)].symbol(), " ");
         assert_eq!(drawn[(10, 3)].bg, theme::SELECTED);
         // The list has no accent edge while the panel has the keyboard.
-        let edge = (panes.files.start, 2);
+        let edge = (panes.files.start, 3);
         assert_eq!(drawn[edge].symbol(), " ");
         f.app.handle_key(key(KeyCode::Esc));
         let drawn = buffer(&mut f.app, 120, 30);
@@ -361,17 +361,19 @@ mod tests {
         assert!(!app.places_visible);
         assert_eq!(app.focus, Focus::List);
         let drawn = buffer(&mut app, 120, 30);
-        assert_eq!(cells(&drawn, 2, 0..12), "▎\u{f0219} notes.txt");
+        assert_eq!(cells(&drawn, 3, 0..12), "▎\u{f0219} notes.txt");
         assert_eq!(find(&drawn, "PLACES", 0..120), None);
         // The list runs to the preview's line; the panel's line is gone.
         assert_eq!(drawn[(25, 1)].symbol(), "─");
         assert_eq!(drawn[(25, 10)].symbol(), " ");
         assert_eq!(drawn[(73, 1)].symbol(), "┬");
-        assert_eq!(find(&drawn, "5 B", 0..73), Some((68, 2)));
+        // Its cursor row, under the header, fills it up to that line.
+        assert_eq!(find(&drawn, "Name ▴", 0..73), Some((3, 2)));
+        assert_eq!(drawn[(72, 3)].bg, theme::CURSOR);
         // Without the preview either, the list has the whole width.
         app.handle_key(alt(KeyCode::Char('p')));
         let drawn = buffer(&mut app, 120, 30);
-        assert_eq!(find(&drawn, "5 B", 0..120), Some((115, 2)));
+        assert_eq!(drawn[(119, 3)].bg, theme::CURSOR);
         app.handle_key(alt(KeyCode::Char('p')));
         let saved = fs::read_to_string(state.join("state")).unwrap();
         assert!(saved.contains("places=off\n"), "{saved}");

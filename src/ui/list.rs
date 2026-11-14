@@ -15,6 +15,7 @@ use crate::format::DateStyle;
 use crate::icons;
 use crate::matcher::Query;
 use crate::model::{self, Entry};
+use crate::model::{SortKey, SortMode};
 use crate::theme;
 
 /// What a row is, which decides its colours.
@@ -89,6 +90,177 @@ pub fn row(
             spans.push(Span::styled(format!("{size}  "), text(meta)));
         }
         None => spans.push(Span::styled(" ", text(ink))),
+    }
+    Line::from(spans)
+}
+
+/// A column after the names in the list and the two panes, in the order
+/// they stand; the last ones give way first when a pane is narrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Column {
+    Size,
+    User,
+    Permissions,
+    Kind,
+    Modified,
+}
+
+pub const COLUMNS: [Column; 5] = [
+    Column::Size,
+    Column::User,
+    Column::Permissions,
+    Column::Kind,
+    Column::Modified,
+];
+
+/// The fewest cells a name keeps before a column gives way to it.
+const NAME_ROOM: usize = 20;
+/// The cells between two columns.
+const GAP: usize = 2;
+/// The cells of a row around its name and columns: the edge, the glyph and
+/// its space, a space before the columns and two after them.
+const ROW_CHROME: usize = 6;
+
+impl Column {
+    /// What the header says over it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Column::Size => "Size",
+            Column::User => "User",
+            Column::Permissions => "Permissions",
+            Column::Kind => "Kind",
+            Column::Modified => "Modified",
+        }
+    }
+
+    /// The sort key it shows, when there is one.
+    fn key(self) -> Option<SortKey> {
+        match self {
+            Column::Size => Some(SortKey::Size),
+            Column::Kind => Some(SortKey::Kind),
+            Column::Modified => Some(SortKey::Modified),
+            Column::User | Column::Permissions => None,
+        }
+    }
+
+    /// The widest it grows; longer values are cut with `…`.
+    fn widest(self) -> usize {
+        match self {
+            Column::Size => 11,
+            Column::User => 16,
+            Column::Permissions => 10,
+            Column::Kind => 20,
+            Column::Modified => 16,
+        }
+    }
+
+    /// Sizes line up on their right, everything else on its left.
+    fn right(self) -> bool {
+        self == Column::Size
+    }
+
+    /// What it says about an item.
+    pub fn value(self, entry: &Entry, now: std::time::SystemTime, style: DateStyle) -> String {
+        match self {
+            Column::Size => size_text(entry),
+            Column::User => model::owner(entry.uid),
+            Column::Permissions => format::permissions(entry.mode),
+            Column::Kind => entry.kind(),
+            Column::Modified => detail_text(entry, Detail::Modified, now, style),
+        }
+    }
+
+    /// The cells its title needs, with room for the sort arrow when it sorts.
+    fn title_width(self) -> usize {
+        self.title().width() + if self.key().is_some() { 2 } else { 0 }
+    }
+}
+
+/// The columns a list `width` cells wide shows for `entries`, each with its
+/// width: its widest value or its title, up to [`Column::widest`]. Columns
+/// stand while the name keeps [`NAME_ROOM`] cells.
+pub fn table(
+    entries: &[Entry],
+    width: usize,
+    now: std::time::SystemTime,
+    style: DateStyle,
+) -> Vec<(Column, usize)> {
+    let mut shown = Vec::new();
+    let mut used = ROW_CHROME + NAME_ROOM;
+    for column in COLUMNS {
+        let widest = (entries.iter())
+            .map(|entry| column.value(entry, now, style).width())
+            .max()
+            .unwrap_or(0);
+        let cells = widest.min(column.widest()).max(column.title_width());
+        let needs = cells + if shown.is_empty() { 0 } else { GAP };
+        if used + needs > width {
+            break;
+        }
+        used += needs;
+        shown.push((column, cells));
+    }
+    shown
+}
+
+/// Texts set in a table's columns, a gap apart: each cut to its column and
+/// lined up on its side.
+fn set(table: &[(Column, usize)], texts: impl Iterator<Item = String>) -> String {
+    let cells: Vec<String> = (table.iter().zip(texts))
+        .map(|(&(column, width), text)| {
+            let text = fit(&text, width);
+            let pad = " ".repeat(width - text.width());
+            match column.right() {
+                true => format!("{pad}{text}"),
+                false => format!("{text}{pad}"),
+            }
+        })
+        .collect();
+    cells.join(&" ".repeat(GAP))
+}
+
+/// A title, with `▴` or `▾` after it when the items are sorted by it.
+fn titled(title: &str, key: Option<SortKey>, sort: SortMode) -> String {
+    match key == Some(sort.key) {
+        true => format!("{title} {}", if sort.reversed { "▾" } else { "▴" }),
+        false => title.to_string(),
+    }
+}
+
+/// The header over a list `width` cells wide: "Name" over the names, then
+/// each column's title over it, in the muted colour; the sorted one in the
+/// foreground with its arrow.
+pub fn header(table: &[(Column, usize)], width: usize, sort: SortMode) -> Line<'static> {
+    let muted = Style::default().fg(theme::ink(theme::MUTED));
+    let lit = Style::default().fg(theme::ink(theme::FOREGROUND));
+    let style = |key: Option<SortKey>| if key == Some(sort.key) { lit } else { muted };
+    // The same cells a row gives its name and its columns.
+    let columns: usize = table.iter().map(|(_, cells)| cells + GAP).sum();
+    let around = if table.is_empty() {
+        1
+    } else {
+        columns - GAP + 3
+    };
+    if width < 3 + around {
+        return Line::default();
+    }
+    let name_width = width - 3 - around;
+    let name = fit(&titled("Name", Some(SortKey::Name), sort), name_width);
+    let mut spans = vec![
+        Span::raw("   "),
+        Span::styled(name.clone(), style(Some(SortKey::Name))),
+        Span::raw(" ".repeat(name_width - name.width() + 1)),
+    ];
+    for (at, &(column, _)) in table.iter().enumerate() {
+        if at > 0 {
+            spans.push(Span::raw(" ".repeat(GAP)));
+        }
+        let title = titled(column.title(), column.key(), sort);
+        let text = set(&table[at..=at], std::iter::once(title));
+        spans.push(Span::styled(text, style(column.key())));
+    }
+    if !table.is_empty() {
+        spans.push(Span::raw("  "));
     }
     Line::from(spans)
 }
@@ -173,19 +345,38 @@ pub fn draw(
     hits: &mut HitMap,
 ) {
     let caption = app.caption;
-    let (detail, style) = (app.detail, app.date_style);
+    let (sort, style) = (app.sort, app.date_style);
     let now = std::time::SystemTime::now();
     let pane = &mut app.tab_mut().panes[index];
+    // The header takes the top row once there is a row for items under it.
+    let header = area.height >= 2;
+    let (head, area) = match header {
+        true => (
+            Rect { height: 1, ..area },
+            Rect {
+                y: area.y + 1,
+                height: area.height - 1,
+                ..area
+            },
+        ),
+        false => (Rect { height: 0, ..area }, area),
+    };
     let rows = area.height as usize;
+    let width = area.width as usize;
     pane.page_rows = rows.max(1);
+    pane.offset = scroll(pane.offset, pane.cursor, rows);
+    // The columns fit what shows, so they don't grow for what is out of sight.
+    let end = (pane.offset + rows).min(pane.entries.len());
+    let table = table(&pane.entries[pane.offset.min(end)..end], width, now, style);
+    if header {
+        frame.render_widget(Paragraph::new(self::header(&table, width, sort)), head);
+    }
     if pane.entries.is_empty() {
         empty(frame, area, pane, caption);
         return;
     }
-    pane.offset = scroll(pane.offset, pane.cursor, rows);
 
     let query = pane.matching();
-    let width = area.width as usize;
     let mut lines = Vec::new();
     let mut apps = AppRows::new();
     for (item, entry) in pane.entries.iter().enumerate().skip(pane.offset).take(rows) {
@@ -205,7 +396,8 @@ pub fn draw(
         };
         // What was found below says which folder it is in.
         let folder = pane.place_of(entry);
-        let value = detail_text(entry, detail, now, style);
+        let values = (table.iter()).map(|(column, _)| column.value(entry, now, style));
+        let value = set(&table, values);
         lines.push(row(
             entry,
             width,
@@ -353,6 +545,69 @@ mod tests {
 
     fn entry(dir: &Path, name: &str) -> Entry {
         Entry::from_path(dir.join(name)).unwrap()
+    }
+
+    /// Where a piece of text starts in one row, within a range of columns.
+    fn x_in(drawn: &Buffer, y: u16, text: &str, columns: std::ops::Range<u16>) -> Option<u16> {
+        let cells: Vec<&str> = text.split_inclusive(|_| true).collect();
+        columns.clone().find(|x| {
+            let end = x + cells.len() as u16;
+            end <= columns.end
+                && (cells.iter().zip(*x..end)).all(|(cell, x)| drawn[(x, y)].symbol() == *cell)
+        })
+    }
+
+    #[test]
+    fn the_list_shows_size_user_permissions_kind_and_modified_under_a_header() {
+        use crate::app::testing::{fixture, press};
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = fixture();
+        let path = f.home.join("report.pdf");
+        fs::write(&path, vec![0u8; 2048]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        f.app.handle_key(key(KeyCode::F(5)));
+        let user = model::owner(entry(&f.home, "report.pdf").uid);
+        let drawn = buffer(&mut f.app, 200, 30);
+        let files = panes(&f.app, 200).files;
+        let (_, top) = find(&drawn, "Permissions", files.clone()).expect("the header");
+        let title = |text: &str| x_in(&drawn, top, text, files.clone()).expect(text);
+        let titles = ["Size", "User", "Permissions", "Kind", "Modified"].map(title);
+        assert!(titles.is_sorted(), "{titles:?}");
+        let (name, y) = find(&drawn, "report.pdf", files.clone()).expect("the row");
+        assert!(y > top);
+        let value = |text: &str| x_in(&drawn, y, text, files.clone()).expect(text);
+        // Each value starts under its title; the size ends under its own.
+        assert_eq!(title("Name ▴"), name);
+        assert_eq!(value("2.0 KB") + 6, title("Size") + 4);
+        assert_eq!(value(&user), title("User"));
+        assert_eq!(value("-rw-r-----"), title("Permissions"));
+        assert_eq!(value("PDF document"), title("Kind"));
+        // The sorted column carries the arrow.
+        press(&mut f.app, &[KeyCode::Char('s')]);
+        let drawn = buffer(&mut f.app, 200, 30);
+        assert!(x_in(&drawn, top, "Size ▴", files.clone()).is_some());
+        assert!(x_in(&drawn, top, "Name ▴", files).is_none());
+    }
+
+    #[test]
+    fn a_narrow_list_drops_its_last_columns_first() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        let entries = [entry(dir.path(), "notes.txt")];
+        let now = std::time::SystemTime::now();
+        let shown = |width| -> Vec<Column> {
+            let table = table(&entries, width, now, DateStyle::MonthFirst);
+            table.iter().map(|(column, _)| *column).collect()
+        };
+        assert_eq!(shown(20), []);
+        assert_eq!(shown(400), COLUMNS);
+        let mut last = 0;
+        for width in 0..400 {
+            let columns = shown(width);
+            assert_eq!(columns, COLUMNS[..columns.len()], "{width}");
+            assert!(columns.len() >= last, "{width}");
+            last = columns.len();
+        }
     }
 
     #[test]

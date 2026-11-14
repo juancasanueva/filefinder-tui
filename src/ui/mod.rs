@@ -751,7 +751,11 @@ mod tests {
         assert_eq!(drawn[(line, 1)].symbol(), "┬");
         assert_eq!(drawn[(end, 1)].symbol(), "─");
         assert_eq!(drawn[(end, 10)].symbol(), " ");
-        assert_eq!(find(&drawn, "3 B", 0..120), Some((115, 3)));
+        assert_eq!(
+            drawn[(119, 3)].bg,
+            theme::CURSOR,
+            "the cursor row to the edge"
+        );
     }
 
     #[test]
@@ -785,41 +789,50 @@ mod tests {
     fn list_rows_are_an_edge_a_glyph_the_name_and_the_size() {
         let mut f = in_pictures();
         let drawn = buffer(&mut f.app, 120, 30);
-        // The list's columns: the edge, the glyph, a space, the name; the
-        // size two cells in from the preview's line.
+        // The list's columns: the edge, the glyph, a space, the name; then the
+        // columns, each under its title in the header on the list's first row.
         let files = panes(&f.app, 120).files;
-        let (edge, glyph, name, end) = (files.start, files.start + 1, files.start + 3, files.end);
+        let (edge, glyph, name) = (files.start, files.start + 1, files.start + 3);
+        assert_eq!(find(&drawn, "Name ▴", files.clone()), Some((name, 2)));
+        assert_eq!(drawn[(name, 2)].fg, theme::FOREGROUND, "the sorted title");
+        let (size, _) = find(&drawn, "Size", files.clone()).expect("the size's title");
+        assert_eq!(drawn[(size, 2)].fg, theme::MUTED);
+        // Sizes end where their title does.
+        let size_end = size + 4;
         // Trip, under the cursor in the list that has the keyboard.
-        assert_eq!(drawn[(edge, 2)].symbol(), "▎");
-        assert_eq!(drawn[(edge, 2)].fg, theme::ACCENT);
-        assert_eq!(drawn[(glyph, 2)].symbol(), icons::FOLDER);
+        assert_eq!(drawn[(edge, 3)].symbol(), "▎");
+        assert_eq!(drawn[(edge, 3)].fg, theme::ACCENT);
+        assert_eq!(drawn[(glyph, 3)].symbol(), icons::FOLDER);
         assert_eq!(
-            drawn[(glyph, 2)].fg,
+            drawn[(glyph, 3)].fg,
             theme::ICON_FOLDER,
             "a folder's colour"
         );
-        assert_eq!(find(&drawn, "Trip", files.clone()), Some((name, 2)));
-        assert_eq!(find(&drawn, "No items", files.clone()), Some((end - 10, 2)));
+        assert_eq!(find(&drawn, "Trip", files.clone()), Some((name, 3)));
+        assert_eq!(
+            find(&drawn, "No items", files.clone()),
+            Some((size_end - 8, 3))
+        );
         for x in files.clone() {
-            assert_eq!(drawn[(x, 2)].bg, theme::CURSOR, "{x}");
+            assert_eq!(drawn[(x, 3)].bg, theme::CURSOR, "{x}");
         }
         // a.jpg: no fill, the glyph in a picture's colour, the size in the
         // metadata ink.
-        assert_eq!(drawn[(edge, 3)].symbol(), " ");
-        assert_eq!(drawn[(glyph, 3)].fg, theme::ICON_IMAGE);
-        assert_eq!(find(&drawn, "a.jpg", files.clone()), Some((name, 3)));
-        assert_eq!(drawn[(name, 3)].fg, theme::FOREGROUND);
-        assert_eq!(find(&drawn, "3 B", files.clone()), Some((end - 5, 3)));
-        assert_eq!(drawn[(end - 5, 3)].fg, theme::MUTED);
-        assert_eq!(drawn[(name + 11, 3)].bg, Color::Reset);
+        assert_eq!(drawn[(edge, 4)].symbol(), " ");
+        assert_eq!(drawn[(glyph, 4)].fg, theme::ICON_IMAGE);
+        assert_eq!(find(&drawn, "a.jpg", files.clone()), Some((name, 4)));
+        assert_eq!(drawn[(name, 4)].fg, theme::FOREGROUND);
+        assert_eq!(find(&drawn, "3 B", files.clone()), Some((size_end - 3, 4)));
+        assert_eq!(drawn[(size_end - 3, 4)].fg, theme::MUTED);
+        assert_eq!(drawn[(name + 11, 4)].bg, Color::Reset);
 
         // With the keyboard in the preview the cursor row loses its edge.
         press(&mut f.app, &[KeyCode::Tab]);
         let away = buffer(&mut f.app, 120, 30);
-        assert_eq!(away[(edge, 2)].symbol(), " ");
-        assert_eq!(away[(edge, 2)].bg, theme::SELECTED);
+        assert_eq!(away[(edge, 3)].symbol(), " ");
+        assert_eq!(away[(edge, 3)].bg, theme::SELECTED);
 
-        // A long name is cut with an ellipsis before the size.
+        // A long name is cut with an ellipsis, a cell before the columns.
         fs::write(
             f.home
                 .join("Pictures")
@@ -829,11 +842,14 @@ mod tests {
         .unwrap();
         press(&mut f.app, &[KeyCode::Esc, KeyCode::F(5)]);
         let cut = buffer(&mut f.app, 120, 30);
-        let row = cells(&cut, 4, files.clone());
-        // All the row but the edge, glyph, space, ellipsis, space, size and
-        // the two cells after it.
-        let kept = files.len() - 10;
-        assert_eq!(row, format!(" {} {}… 0 B  ", icons::TEXT, "x".repeat(kept)));
+        let (ellipsis, y) = find(&cut, "… ", files.clone()).expect("the cut name");
+        assert_eq!(y, 5);
+        assert_eq!(
+            cells(&cut, 5, name..ellipsis),
+            "x".repeat((ellipsis - name) as usize)
+        );
+        assert_eq!(find(&cut, "0 B", files.clone()), Some((size_end - 3, 5)));
+        assert!(ellipsis + 1 < size_end - 3);
     }
 
     #[test]
@@ -924,13 +940,14 @@ mod tests {
         let mut f = in_pictures();
         f.app.depth = Depth::Indexed;
         let drawn = buffer(&mut f.app, 120, 30);
-        // The list's edge, its names three cells in, a size five from its end.
+        // The list's edge, its names three cells in, a.jpg's size.
         let files = panes(&f.app, 120).files;
-        let (edge, name, size) = (files.start, files.start + 3, files.end - 5);
-        assert_eq!(drawn[(name, 3)].fg, Color::Indexed(252), "a.jpg");
-        assert_eq!(drawn[(size, 3)].fg, Color::Indexed(246), "its size");
+        let (edge, name) = (files.start, files.start + 3);
+        let (size, _) = find(&drawn, "3 B", files.clone()).expect("a.jpg's size");
+        assert_eq!(drawn[(name, 4)].fg, Color::Indexed(252), "a.jpg");
+        assert_eq!(drawn[(size, 4)].fg, Color::Indexed(246), "its size");
         assert_eq!(
-            drawn[(name, 2)].bg,
+            drawn[(name, 3)].bg,
             Color::Indexed(236),
             "the cursor's fill"
         );
@@ -944,7 +961,7 @@ mod tests {
             Color::Indexed(252),
             "the line by the list, which has the keyboard"
         );
-        assert_eq!(drawn[(edge, 2)].symbol(), "▎");
+        assert_eq!(drawn[(edge, 3)].symbol(), "▎");
     }
 
     #[test]
@@ -1092,12 +1109,12 @@ mod tests {
         f.app.tick();
         let caption = |app: &mut crate::app::App| {
             let drawn = buffer(app, 120, 30);
-            // The list's 47 cells and 26 rows: the glyph on row 11 of them,
-            // the caption under it.
-            let glyph = cells(&drawn, 13, 26..73);
+            // The list's 47 cells and the 25 rows under its header: the
+            // glyph on row 11 of them, the caption under it.
+            let glyph = cells(&drawn, 14, 26..73);
             assert_eq!(glyph.trim(), icons::FOLDER);
-            assert_eq!(drawn[(49, 13)].fg, theme::MUTED);
-            cells(&drawn, 14, 26..73).trim().to_string()
+            assert_eq!(drawn[(49, 14)].fg, theme::MUTED);
+            cells(&drawn, 15, 26..73).trim().to_string()
         };
         assert_eq!(caption(&mut f.app), "NOTHING HERE YET");
         for (millis, said) in [
@@ -1200,9 +1217,9 @@ mod tests {
         let list = buffer(&mut f.app, 120, 30);
         assert_eq!(
             find(&list, "notes.txt", files()),
-            Some((panes.files.start + 3, 4))
+            Some((panes.files.start + 3, 5))
         );
-        assert_eq!(find(&list, "5 B", files()).map(|(_, y)| y), Some(4));
+        assert_eq!(find(&list, "5 B", files()).map(|(_, y)| y), Some(5));
         assert_eq!(list[(line, 10)].symbol(), "│");
 
         f.app.handle_key(ctrl(KeyCode::Char('2')));
@@ -1419,8 +1436,8 @@ mod tests {
 
         f.app.handle_key(ctrl(KeyCode::Char('1')));
         let list = buffer(&mut f.app, 130, 30);
-        let (x, y) = find(&list, "a.jpg", 0..130).unwrap();
-        assert_eq!(find(&list, "day.jpg", 0..130), Some((x, y + 1)));
+        let (x, y) = find(&list, "a.jpg", files.clone()).unwrap();
+        assert_eq!(find(&list, "day.jpg", files.clone()), Some((x, y + 1)));
         assert!(find(&list, "3 B", 0..130).is_some(), "with its size");
 
         f.app.handle_key(ctrl(KeyCode::Char('3')));
@@ -1489,18 +1506,18 @@ mod tests {
         );
         assert_eq!(right[(right_edge + 1, 2)].fg, theme::MUTED);
         assert_eq!(right[(right_edge + 3, 2)].fg, theme::FOREGROUND);
-        // Under it the files, each pane's own, with its own cursor: only the
-        // pane with the keyboard draws the edge.
-        assert_eq!(cells(&right, 3, start + 3..start + 12), "Documents");
-        assert_eq!(cells(&right, 4, start + 3..start + 11), "Pictures");
-        assert_eq!(cells(&right, 3, right_edge + 3..right_edge + 7), "Trip");
-        assert_eq!(cells(&right, 4, right_edge + 3..right_edge + 8), "a.jpg");
+        // Under them a header, then the files, each pane's own, with its own
+        // cursor: only the pane with the keyboard draws the edge.
+        assert_eq!(cells(&right, 4, start + 3..start + 12), "Documents");
+        assert_eq!(cells(&right, 5, start + 3..start + 11), "Pictures");
+        assert_eq!(cells(&right, 4, right_edge + 3..right_edge + 7), "Trip");
+        assert_eq!(cells(&right, 5, right_edge + 3..right_edge + 8), "a.jpg");
         assert_eq!(
-            (right[(left_edge, 4)].symbol(), right[(left_edge, 4)].bg),
+            (right[(left_edge, 5)].symbol(), right[(left_edge, 5)].bg),
             (" ", theme::SELECTED)
         );
         assert_eq!(
-            (right[(right_edge, 4)].symbol(), right[(right_edge, 4)].bg),
+            (right[(right_edge, 5)].symbol(), right[(right_edge, 5)].bg),
             ("▎", theme::CURSOR)
         );
         // The header is the right pane's.
@@ -1512,8 +1529,8 @@ mod tests {
         let left = buffer(&mut f.app, 120, 30);
         assert_eq!(left[(start + 1, 2)].fg, theme::FOREGROUND);
         assert_eq!(left[(right_edge + 3, 2)].fg, theme::MUTED);
-        assert_eq!(left[(left_edge, 4)].symbol(), "▎");
-        assert_eq!(left[(right_edge, 4)].symbol(), " ");
+        assert_eq!(left[(left_edge, 5)].symbol(), "▎");
+        assert_eq!(left[(right_edge, 5)].symbol(), " ");
         assert_eq!(cells(&left, 0, 0..60).trim(), "~");
 
         // Closed, the window is what it was before.
@@ -1529,13 +1546,22 @@ mod tests {
         let colors = |drawn: &Buffer, x, y| (drawn[(x, y)].fg, drawn[(x, y)].bg);
 
         // Documents and Pictures, not notes.txt: rows in the list and the columns.
-        for (view, x) in [('1', 29), ('2', 29)] {
+        // The list's rows start under its header.
+        for (view, x, top) in [('1', 29, 3), ('2', 29, 2)] {
             f.app.handle_key(ctrl(KeyCode::Char(view)));
             let drawn = buffer(&mut f.app, 120, 30);
             let at = |y| colors(&drawn, x, y);
-            assert_eq!(at(2), (theme::FOREGROUND, theme::MARKED), "view {view}");
-            assert_eq!(at(3), (theme::FOREGROUND, theme::CURSOR), "view {view}");
-            assert_eq!(at(4), (theme::FOREGROUND, Color::Reset), "view {view}");
+            assert_eq!(at(top), (theme::FOREGROUND, theme::MARKED), "view {view}");
+            assert_eq!(
+                at(top + 1),
+                (theme::FOREGROUND, theme::CURSOR),
+                "view {view}"
+            );
+            assert_eq!(
+                at(top + 2),
+                (theme::FOREGROUND, Color::Reset),
+                "view {view}"
+            );
         }
         // Tiles in the grid: the marked fill and the cursor's.
         f.app.handle_key(ctrl(KeyCode::Char('3')));

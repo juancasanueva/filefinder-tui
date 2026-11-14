@@ -1174,7 +1174,8 @@ pub struct App {
     pub focus: Focus,
     pub tile: TileSize,
     pub sort: SortMode,
-    /// What the list's right-hand column shows: `I`.
+    /// What the columns view's right-hand column shows: `I`. The list and
+    /// the two panes show every column under a header.
     pub detail: Detail,
     pub show_hidden: bool,
     /// Whether the preview pane shows beside the list: Alt+P.
@@ -9173,7 +9174,7 @@ mod tests {
         let click = |button| MouseEvent {
             kind: MouseEventKind::Down(button),
             column: 30,
-            row: 2,
+            row: 3,
             modifiers: KeyModifiers::NONE,
         };
         f.app.handle_mouse(click(MouseButton::Left));
@@ -9237,9 +9238,12 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut app = launch_one_pane(&f.home, Some(state.path()));
         fs::set_permissions(f.home.join("Documents"), fs::Permissions::from_mode(0o700)).unwrap();
+        // The list and the two panes show every column under a header; the
+        // columns view keeps one, which `I` changes.
         app.handle_key(KeyEvent::from(KeyCode::F(5)));
-        // The list's own cells on the first row, between the parent's
-        // column and the preview.
+        app.handle_key(ctrl(KeyCode::Char('2')));
+        // The column's own cells on the first row, between the places panel
+        // and the preview.
         let row = |app: &mut App| -> String {
             screen(app, 120, 30)[2].chars().skip(26).take(47).collect()
         };
@@ -9333,7 +9337,7 @@ mod tests {
     #[test]
     fn g_and_capital_g_and_the_page_keys_move_far() {
         let mut f = several();
-        crate::ui::testing::screen(&mut f.app, 120, 7);
+        crate::ui::testing::screen(&mut f.app, 120, 8);
         press(&mut f.app, &[KeyCode::Char('G')]);
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
         press(&mut f.app, &[KeyCode::Char('g')]);
