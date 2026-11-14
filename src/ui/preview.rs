@@ -112,7 +112,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
     } else if !facts.opening.is_empty() {
         let rows = text_rows(&facts.opening, width);
         scrolled(frame, rows, body, preview_scroll);
-    } else if entry.category() == Category::Image {
+    } else if matches!(entry.category(), Category::Image | Category::App) {
         *preview_scroll = 0;
         let drawn = thumbs
             .as_mut()
@@ -293,11 +293,9 @@ fn picture_facts(entry: &Entry, facts: &Facts, width: usize) -> Vec<Line<'static
     let pixels = facts
         .dimensions
         .map(|(across, down)| ("Pixels", format!("{across} × {down}")));
-    let all = [
-        pixels,
-        Some(("Size", format::size(entry.size))),
-        Some(("Kind", entry.kind())),
-    ];
+    // An app bundle's own size is its folder's, nothing like the app's.
+    let size = (entry.category() != Category::App).then(|| ("Size", format::size(entry.size)));
+    let all = [pixels, size, Some(("Kind", entry.kind()))];
     all.into_iter()
         .flatten()
         .take(FACTS)
@@ -441,6 +439,28 @@ mod tests {
         assert!(row(&drawn, last + 3).starts_with("Size · "));
         assert_eq!(row(&drawn, last + 4).trim(), "Kind · PNG image");
         assert_eq!(drawn[(75, last + 2)].fg, theme::MUTED);
+    }
+
+    #[test]
+    fn an_app_shows_its_icon_with_its_kind_under_it() {
+        let (mut f, _thumbnailer) = pictures();
+        // The fake draws any file; a file named like an app is one.
+        fs::write(f.home.join("Pictures").join("Safari.app"), "x").unwrap();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::End]);
+        f.app.tick();
+        buffer(&mut f.app, 120, 30);
+        settle(&mut f.app);
+        let drawn = buffer(&mut f.app, 120, 30);
+        assert_eq!(find(&drawn, "Safari.app", 74..120).map(|at| at.1), Some(2));
+        let painted_rows: Vec<u16> = (5..28)
+            .filter(|y| (75..119).any(|x| painted(&drawn[(x, *y)])))
+            .collect();
+        let last = *painted_rows.last().expect("the icon");
+        assert_eq!(painted_rows[0], 5, "right under the head");
+        // A bundle's own size says nothing about the app: only its kind.
+        assert_eq!(row(&drawn, last + 1).trim(), "");
+        assert_eq!(row(&drawn, last + 2).trim(), "Kind · Application");
+        assert_eq!(row(&drawn, last + 3).trim(), "");
     }
 
     #[test]

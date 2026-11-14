@@ -143,7 +143,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
     } else if !facts.opening.is_empty() {
         let rows = text_rows(&facts.opening, width as usize);
         scrolled(frame, rows, body, &mut look.scroll);
-    } else if entry.category() == Category::Image
+    } else if matches!(entry.category(), Category::Image | Category::App)
         && let Some(thumbs) = thumbs.as_mut()
     {
         // The card is in front of everything: its picture may show.
@@ -295,6 +295,31 @@ mod tests {
         let trip = find(&drawn, "Trip", 10..110).expect("its items");
         assert_eq!(trip.1, 6);
         assert!(find(&drawn, "a.jpg", 10..110).is_some_and(|(_, y)| y == 7));
+    }
+
+    #[test]
+    fn an_app_shows_its_icon_in_the_card() {
+        let (mut f, _thumbnailer) = pictures();
+        // The fake draws any file; a file named like an app is one.
+        fs::write(f.home.join("Pictures").join("Safari.app"), "x").unwrap();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::End]);
+        press(&mut f.app, &[KeyCode::Char(' ')]);
+        f.app.tick();
+        buffer(&mut f.app, 120, 30);
+        settle(&mut f.app);
+        let drawn = buffer(&mut f.app, 120, 30);
+        assert!(find(&drawn, "Safari.app", 10..110).is_some());
+        let painted: Vec<(u16, u16)> = (0..120)
+            .flat_map(|x| (0..30).map(move |y| (x, y)))
+            .filter(|at| painted(&drawn[*at]))
+            .collect();
+        assert!(!painted.is_empty(), "the icon");
+        assert!(
+            painted
+                .iter()
+                .all(|(x, y)| (12..108).contains(x) && (6..27).contains(y)),
+            "inside the card's body"
+        );
     }
 
     #[test]
