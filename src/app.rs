@@ -419,8 +419,8 @@ pub const PASTE_KEYS: &str = "enter or b keeps both · r replaces · s skips · 
 /// What the rename prompt says on the right.
 pub const RENAME_HINT: &str = "enter saves · esc cancels · ctrl-a selects the whole name";
 
-/// The commands of the function key bar under the footer while two panes
-/// show, in the bar's order.
+/// The commands of the function key bar along the bottom of the panes
+/// while two show, in the bar's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FnKey {
     /// F2: the rename prompt, as everywhere.
@@ -1531,8 +1531,8 @@ impl App {
         self.preview_visible && self.view() != ViewMode::Dual
     }
 
-    /// Whether the function key bar shows under the footer: while two
-    /// panes do.
+    /// Whether the function key bar shows along the bottom of the panes:
+    /// while two panes do.
     pub fn shows_fn_bar(&self) -> bool {
         self.view() == ViewMode::Dual
     }
@@ -12329,10 +12329,12 @@ mod fn_key_tests {
         left_click(app, (rect.x + rect.width / 2, rect.y));
     }
 
-    /// The colours the bar's row is drawn in, from a 120 by 30 frame.
+    /// The colours the bar is drawn in, from a 120 by 30 frame: the last
+    /// row of the panes' area, across the panes' columns.
     fn bar_colours(app: &mut App) -> Vec<ratatui::style::Color> {
         let drawn = crate::ui::testing::buffer(app, 120, 30);
-        (0..120).map(|x| drawn[(x, 29)].fg).collect()
+        let files = crate::ui::testing::panes(app, 120).files;
+        files.map(|x| drawn[(x, 27)].fg).collect()
     }
 
     fn message(app: &App) -> Option<String> {
@@ -12353,7 +12355,7 @@ mod fn_key_tests {
         // F8 Delete all muted; the other items as before.
         let drawn = crate::ui::testing::buffer(&mut f.app, 120, 30);
         let (x, y) = crate::ui::testing::find(&drawn, "F8 Delete", 0..120).expect("F8");
-        assert_eq!(y, 29);
+        assert_eq!(y, 27);
         for dx in 0.."F8 Delete".len() as u16 {
             assert_eq!(drawn[(x + dx, y)].fg, crate::theme::MUTED, "cell {dx}");
         }
@@ -12671,13 +12673,21 @@ mod fn_key_tests {
         assert!(f.app.settings.is_none() && f.app.prompt.is_none());
         assert!(!f.home.join("new.md").exists());
 
-        // The key sheet.
+        // The key sheet. It covers the panes' area, the bar's row with it,
+        // all but the end of F10's share.
         press(&mut f.app, &[KeyCode::Char('?')]);
         assert!(f.app.help_visible);
         assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
         assert!(!bar_colours(&mut f.app).contains(&accent));
+        // A click on F8, under the sheet, runs nothing and leaves it open.
         click_bar(&mut f.app, FnKey::Trash);
-        assert!(!f.app.help_visible);
+        assert!(f.app.help_visible);
+        assert_eq!(read(f.home.join("notes.txt")), "hello");
+        // One on F10, right of the sheet, only closes it, as one outside
+        // it does.
+        click_bar(&mut f.app, FnKey::NewText);
+        assert!(!f.app.help_visible && f.app.prompt.is_none());
+        assert!(!f.home.join("new.txt").exists());
         assert_eq!(read(f.home.join("notes.txt")), "hello");
 
         // Nothing open: lit again.

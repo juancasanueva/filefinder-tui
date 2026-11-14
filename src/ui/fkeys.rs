@@ -1,10 +1,12 @@
-//! The function key bar: one row under the footer while two panes show,
-//! F2 and F5 to F10 spread evenly across it, each the key lit and what it
-//! does muted. One that can't run now is all muted. A click on one does
-//! what its key does.
+//! The function key bar: while two panes show, the last row of their
+//! area, under both and over the bottom rule and the footer, on the tab
+//! fill. F2 and F5 to F10 spread evenly across it, each the key lit and
+//! what it does muted. One that can't run now is all muted. A click on one
+//! does what its key does.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
@@ -16,6 +18,9 @@ use crate::theme;
 /// Draws the bar on its row: the row cut in seven, each command in the
 /// middle of its part, and the whole part a spot for the mouse.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    // On the tab fill, as the list's header is, so it reads as a panel.
+    let fill = Style::default().bg(theme::ink(theme::TAB));
+    frame.render_widget(Paragraph::new("").style(fill), area);
     let count = FnKey::ALL.len() as u16;
     for (index, command) in (0..count).zip(FnKey::ALL) {
         let slot = slot(area, index, count);
@@ -56,7 +61,8 @@ mod tests {
     use crate::app::testing::{ctrl, finish_work, fixture, key, press, split};
     use crate::app::{Asking, FnKey, Spot};
     use crate::theme;
-    use crate::ui::testing::{buffer, find, screen};
+    use crate::ui::testing::{buffer, find, panes, screen};
+    use crate::ui::{dual, look};
     use ratatui::crossterm::event::{
         KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -71,14 +77,14 @@ mod tests {
         "F10 New TXT",
     ];
 
-    /// Where each label starts on the bottom row of a 120 by 30 frame.
+    /// Where each label starts on the bar's row of a 120 by 30 frame.
     fn starts(app: &mut crate::app::App) -> Vec<Option<u16>> {
         let drawn = buffer(app, 120, 30);
         LABELS
             .iter()
             .map(|label| {
                 find(&drawn, label, 0..120)
-                    .filter(|(_, y)| *y == 29)
+                    .filter(|(_, y)| *y == BAR)
                     .map(|(x, _)| x)
             })
             .collect()
@@ -91,6 +97,101 @@ mod tests {
             row: at.1,
             modifiers: KeyModifiers::NONE,
         });
+    }
+
+    /// The bar's row in a 120 by 30 frame in two panes: the last row of
+    /// the panes' area, over the bottom rule (28) and the footer (29).
+    const BAR: u16 = 27;
+
+    #[test]
+    fn the_bar_is_the_last_row_of_the_two_panes_over_the_bottom_rule_and_the_footer() {
+        let mut f = fixture();
+        split(&mut f.app);
+        for panel in [true, false] {
+            if !panel {
+                // Ctrl+B hides the places panel.
+                f.app.handle_key(ctrl(KeyCode::Char('b')));
+            }
+            assert_eq!(f.app.places_visible, panel);
+            let files = panes(&f.app, 120).files;
+            let drawn = buffer(&mut f.app, 120, 30);
+            let rows = screen(&mut f.app, 120, 30);
+            // The footer on the window's last row, the bottom rule over it.
+            assert!(rows[29].contains("? keys"), "{panel}: {}", rows[29]);
+            assert!(rows[28].starts_with('─'), "{panel}: {}", rows[28]);
+            assert!(rows[28].chars().all(|c| c == '─' || c == '┴'));
+            // Every item on the bar's row, within the panes' columns.
+            for label in LABELS {
+                let (x, y) = find(&drawn, label, 0..120)
+                    .unwrap_or_else(|| panic!("{panel}: {label} on {}", rows[BAR as usize]));
+                assert_eq!(y, BAR, "{panel}: {label}");
+                assert!(
+                    files.contains(&x),
+                    "{panel}: {label} at {x}, not in {files:?}"
+                );
+            }
+            // On the tab fill across exactly the panes' columns.
+            for x in 0..120 {
+                let fill = drawn[(x, BAR)].bg == theme::TAB;
+                assert_eq!(fill, files.contains(&x), "{panel}: the fill at {x}");
+            }
+            if panel {
+                // The panel keeps its rows down to the bottom rule, its
+                // line with them.
+                let line = files.start - 1;
+                for y in 2..28 {
+                    assert_eq!(drawn[(line, y)].symbol(), "│", "the panel's line at {y}");
+                }
+                assert_eq!(drawn[(line, 28)].symbol(), "┴");
+            }
+            // The line between the panes stops above the bar, so the bottom
+            // rule has no junction under it.
+            let div = files.start + dual::divider(files.end - files.start);
+            for y in 2..BAR {
+                assert_eq!(drawn[(div, y)].symbol(), "│", "{panel}: the divider at {y}");
+            }
+            assert_ne!(drawn[(div, BAR)].symbol(), "│", "{panel}: over the bar");
+            assert_eq!(drawn[(div, BAR)].bg, theme::TAB, "{panel}");
+            assert_eq!(drawn[(div, 28)].symbol(), "─", "{panel}: under the bar");
+            assert_eq!(drawn[(div, 1)].symbol(), "┬", "{panel}: over the panes");
+        }
+    }
+
+    #[test]
+    fn a_click_on_an_item_at_the_bottom_of_the_panes_does_what_its_key_does() {
+        for panel in [true, false] {
+            let mut f = fixture();
+            split(&mut f.app);
+            if !panel {
+                f.app.handle_key(ctrl(KeyCode::Char('b')));
+            }
+            let files = panes(&f.app, 120).files;
+            let width = files.end - files.start;
+            // The middle of item `index`'s seventh of the panes' columns.
+            let middle = |index: u16| files.start + width * index / 7 + width / 14;
+            // F7: the folder name prompt.
+            buffer(&mut f.app, 120, 30);
+            left_click(&mut f.app, (middle(3), BAR));
+            let asking = f.app.prompt.as_ref().map(|prompt| prompt.asking.clone());
+            assert_eq!(asking, Some(Asking::NewFolder(f.home.clone())), "{panel}");
+            press(&mut f.app, &[KeyCode::Esc]);
+            // F9: an empty new.md and its rename prompt.
+            buffer(&mut f.app, 120, 30);
+            left_click(&mut f.app, (middle(5), BAR));
+            assert!(f.home.join("new.md").is_file(), "{panel}");
+            let asking = f.app.prompt.as_ref().map(|prompt| prompt.asking.clone());
+            assert_eq!(asking, Some(Asking::Rename(f.home.join("new.md"))));
+            press(&mut f.app, &[KeyCode::Esc]);
+            // Each item's spot is its seventh of the bar's row.
+            let rect = f.app.hits.rect_of(&Spot::FnKey(FnKey::Rename)).expect("F2");
+            assert_eq!((rect.x, rect.y), (files.start, BAR), "{panel}");
+            let rect = f
+                .app
+                .hits
+                .rect_of(&Spot::FnKey(FnKey::NewText))
+                .expect("F10");
+            assert_eq!((rect.right(), rect.y), (files.end, BAR), "{panel}");
+        }
     }
 
     #[test]
@@ -113,10 +214,13 @@ mod tests {
         let mut f = fixture();
         split(&mut f.app);
         let drawn = buffer(&mut f.app, 60, 30);
-        let y = 29;
+        let y = BAR;
+        // The bar spans the panes' columns.
+        let files = panes(&f.app, 60).files;
+        let width = files.end - files.start;
         // The last cell of every item's share stays blank, cut or not.
         for index in 1..7u16 {
-            let x = 60 * index / 7;
+            let x = files.start + width * index / 7;
             assert_eq!(drawn[(x - 1, y)].symbol(), " ", "before item {index}");
         }
         assert_eq!(drawn[(59, y)].symbol(), " ", "after the last");
@@ -133,20 +237,23 @@ mod tests {
         split(&mut f.app);
         let drawn = buffer(&mut f.app, 120, 30);
         let rows = screen(&mut f.app, 120, 30);
-        // The footer one row up, over the bar; the rule over the footer.
-        assert!(rows[28].contains("? keys"), "{}", rows[28]);
-        assert!(rows[27].starts_with('─'), "{}", rows[27]);
+        // The footer on the last row, the rule over it, the bar over that.
+        assert!(rows[29].contains("? keys"), "{}", rows[29]);
+        assert!(rows[28].starts_with('─'), "{}", rows[28]);
+        let files = panes(&f.app, 120).files;
+        let (start, width) = (files.start, files.end - files.start);
         let xs = starts(&mut f.app);
         for (index, (label, x)) in LABELS.iter().zip(&xs).enumerate() {
-            let x = x.unwrap_or_else(|| panic!("{label} on the bottom row: {}", rows[29]));
-            // Each in its seventh of the width.
-            let slot = (120 * index as u16 / 7)..(120 * (index as u16 + 1) / 7);
+            let x = x.unwrap_or_else(|| panic!("{label} on the bar: {}", rows[BAR as usize]));
+            // Each in its seventh of the panes' width.
+            let index = index as u16;
+            let slot = (start + width * index / 7)..(start + width * (index + 1) / 7);
             assert!(slot.contains(&x), "{label} at {x}, not in {slot:?}");
             // The key lit, the label muted.
             let keys = label.split(' ').next().unwrap().len() as u16;
-            assert_eq!(drawn[(x, 29)].fg, theme::ink(theme::ACCENT), "{label}");
-            assert_eq!(drawn[(x + keys - 1, 29)].fg, theme::ink(theme::ACCENT));
-            assert_eq!(drawn[(x + keys + 1, 29)].fg, theme::MUTED, "{label}");
+            assert_eq!(drawn[(x, BAR)].fg, theme::ink(theme::ACCENT), "{label}");
+            assert_eq!(drawn[(x + keys - 1, BAR)].fg, theme::ink(theme::ACCENT));
+            assert_eq!(drawn[(x + keys + 1, BAR)].fg, theme::MUTED, "{label}");
         }
         assert!(xs.windows(2).all(|pair| pair[0] < pair[1]), "in order");
         assert_eq!(FnKey::ALL.map(FnKey::label)[6], "New TXT");
@@ -174,8 +281,8 @@ mod tests {
         assert!(f.app.pane().entries.is_empty());
         let drawn = buffer(&mut f.app, 120, 30);
         let xs = starts(&mut f.app);
-        let lit = |x: Option<u16>| drawn[(x.unwrap(), 29)].fg == theme::ink(theme::ACCENT);
-        let muted = |x: Option<u16>| drawn[(x.unwrap(), 29)].fg == theme::MUTED;
+        let lit = |x: Option<u16>| drawn[(x.unwrap(), BAR)].fg == theme::ink(theme::ACCENT);
+        let muted = |x: Option<u16>| drawn[(x.unwrap(), BAR)].fg == theme::MUTED;
         for (index, label) in LABELS.iter().enumerate() {
             let can = matches!(index, 3 | 5 | 6);
             assert_eq!(lit(xs[index]), can, "{label}");
@@ -189,32 +296,40 @@ mod tests {
         );
         let drawn = buffer(&mut f.app, 120, 30);
         let xs = starts(&mut f.app);
-        assert_eq!(drawn[(xs[0].unwrap(), 29)].fg, theme::MUTED, "F2");
-        assert_eq!(drawn[(xs[1].unwrap(), 29)].fg, theme::ink(theme::ACCENT));
+        assert_eq!(drawn[(xs[0].unwrap(), BAR)].fg, theme::MUTED, "F2");
+        assert_eq!(drawn[(xs[1].unwrap(), BAR)].fg, theme::ink(theme::ACCENT));
         // While a prompt is open nothing runs: every item muted.
         press(&mut f.app, &[KeyCode::F(7)]);
         assert!(f.app.prompt.is_some());
         let drawn = buffer(&mut f.app, 120, 30);
-        let bar: Vec<_> = (0..120).map(|x| drawn[(x, 29)].fg).collect();
+        let files = panes(&f.app, 120).files;
+        let bar: Vec<_> = files.map(|x| drawn[(x, BAR)].fg).collect();
         assert!(bar.iter().all(|fg| *fg != theme::ink(theme::ACCENT)));
         assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
     }
 
-    /// Every item on the bottom row of a 120 by 30 frame drawn all muted:
-    /// its key in the colour of its label (both dimmed under a card), and
-    /// nothing on the row in the accent colour.
+    /// Every item on the bar of a 120 by 30 frame drawn all muted: its key
+    /// in the colour of its label (both dimmed under a card), and nothing
+    /// on the bar in the accent colour.
     fn assert_every_item_muted(app: &mut crate::app::App, open: &str) {
         let drawn = buffer(app, 120, 30);
-        let row: String = (0..120).map(|x| drawn[(x, 29)].symbol()).collect();
+        let files = panes(app, 120).files;
+        let start = files.start;
+        let row: String = files.clone().map(|x| drawn[(x, BAR)].symbol()).collect();
         let accent = theme::ink(theme::ACCENT);
-        assert!((0..120).all(|x| drawn[(x, 29)].fg != accent), "{open}");
+        assert!(
+            files.clone().all(|x| drawn[(x, BAR)].fg != accent),
+            "{open}"
+        );
         for label in LABELS {
-            let x = row
-                .find(label)
-                .unwrap_or_else(|| panic!("{open}: {label} on the bottom row: {row}"));
-            let muted = drawn[(x as u16 + label.len() as u16 - 1, 29)].fg;
+            let x = start
+                + row
+                    .find(label)
+                    .unwrap_or_else(|| panic!("{open}: {label} on the bar: {row}"))
+                    as u16;
+            let muted = drawn[(x + label.len() as u16 - 1, BAR)].fg;
             for dx in 0..label.len() {
-                let fg = drawn[(x as u16 + dx as u16, 29)].fg;
+                let fg = drawn[(x + dx as u16, BAR)].fg;
                 assert_eq!(fg, muted, "{open}: {label}, cell {dx}");
             }
         }
@@ -254,7 +369,7 @@ mod tests {
         assert!(FnKey::ALL.iter().all(|command| f.app.can_run(*command)));
         let drawn = buffer(&mut f.app, 120, 30);
         for x in starts(&mut f.app) {
-            assert_eq!(drawn[(x.unwrap(), 29)].fg, theme::ink(theme::ACCENT));
+            assert_eq!(drawn[(x.unwrap(), BAR)].fg, theme::ink(theme::ACCENT));
         }
 
         // Shift+Delete's card, asking to delete notes.txt for good.
@@ -282,21 +397,39 @@ mod tests {
         assert_eq!(f.app.working(), None);
         assert_eq!(on_disk(), before);
 
-        // Quick Look, in the terminal (the setting's default).
+        // Quick Look, in the terminal (the setting's default). Its card
+        // covers the panes' area, the bar's row with it, all but the end
+        // of F10's share.
         press(&mut f.app, &[KeyCode::Char(' ')]);
         assert!(f.app.look.is_some());
         assert!(FnKey::ALL.iter().all(|command| !f.app.can_run(*command)));
-        assert_every_item_muted(&mut f.app, "Quick Look");
-        // A click on F9 only closes it, as one outside it does.
+        let card = look::outer(ratatui::layout::Rect::new(0, 0, 120, 30));
+        assert!((card.y..card.bottom()).contains(&BAR));
+        let drawn = buffer(&mut f.app, 120, 30);
+        let files = panes(&f.app, 120).files;
+        let accent = theme::ink(theme::ACCENT);
+        assert!(files.clone().all(|x| drawn[(x, BAR)].fg != accent));
+        assert!(find(&drawn, "F5 Copy", 0..120).is_none(), "under the card");
+        // A click on F9, under the card, runs nothing and leaves it open.
         click_item(&mut f.app, FnKey::NewMarkdown);
+        assert!(f.app.look.is_some());
+        assert!(f.app.prompt.is_none());
+        assert_eq!(on_disk(), before);
+        // One on F10, right of the card, only closes it, as one outside it
+        // does.
+        let f10 = f.app.hits.rect_of(&Spot::FnKey(FnKey::NewText)).unwrap();
+        assert!(f10.x + f10.width / 2 >= card.right());
+        click_item(&mut f.app, FnKey::NewText);
         assert!(f.app.look.is_none());
         assert!(f.app.prompt.is_none());
         assert_eq!(on_disk(), before);
         press(&mut f.app, &[KeyCode::Char(' ')]);
         click_item(&mut f.app, FnKey::Move);
-        assert!(f.app.look.is_none());
+        assert!(f.app.look.is_some(), "under the card");
         assert_eq!(f.app.working(), None);
         assert_eq!(on_disk(), before);
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.look.is_none());
         // The cursor stayed on notes.txt, and the bar is lit again.
         assert_eq!(
             f.app.pane().selected().map(|entry| entry.name.as_str()),
@@ -304,7 +437,7 @@ mod tests {
         );
         let drawn = buffer(&mut f.app, 120, 30);
         for x in starts(&mut f.app) {
-            assert_eq!(drawn[(x.unwrap(), 29)].fg, theme::ink(theme::ACCENT));
+            assert_eq!(drawn[(x.unwrap(), BAR)].fg, theme::ink(theme::ACCENT));
         }
     }
 
@@ -314,18 +447,18 @@ mod tests {
         split(&mut f.app);
         let xs = starts(&mut f.app);
         // F7: the folder name prompt.
-        left_click(&mut f.app, (xs[3].unwrap(), 29));
+        left_click(&mut f.app, (xs[3].unwrap(), BAR));
         let asking = f.app.prompt.as_ref().map(|prompt| prompt.asking.clone());
         assert_eq!(asking, Some(Asking::NewFolder(f.home.clone())));
         // A click while the prompt is open does nothing.
         buffer(&mut f.app, 120, 30);
-        left_click(&mut f.app, (xs[5].unwrap(), 29));
+        left_click(&mut f.app, (xs[5].unwrap(), BAR));
         assert!(!f.home.join("new.md").exists());
         press(&mut f.app, &[KeyCode::Esc]);
 
         // F9: an empty new.md and its rename prompt.
         buffer(&mut f.app, 120, 30);
-        left_click(&mut f.app, (xs[5].unwrap() + 4, 29));
+        left_click(&mut f.app, (xs[5].unwrap() + 4, BAR));
         assert!(f.home.join("new.md").is_file());
         let asking = f.app.prompt.as_ref().map(|prompt| prompt.asking.clone());
         assert_eq!(asking, Some(Asking::Rename(f.home.join("new.md"))));

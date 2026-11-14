@@ -157,10 +157,9 @@ mod tests {
         let width = panes(&f.app, 120).panel.end as usize;
         let lines = screen(&mut f.app, 120, 30);
         let row = |line: &String| line.chars().take(width).collect::<String>();
-        // The body ends over the bottom rule, a row higher in two panes,
-        // where the function key bar takes the last row.
-        let end = if f.app.shows_fn_bar() { 27 } else { 28 };
-        lines[2..end]
+        // The body ends over the bottom rule, in every view: in two panes
+        // the function key bar is under the panes, not the panel.
+        lines[2..28]
             .iter()
             .map(|line| row(line).trim().to_string())
             .collect()
@@ -264,9 +263,9 @@ mod tests {
             // The names in the foreground, the glyphs in their kind's colour.
             assert_eq!(drawn[(3, 4)].fg, theme::FOREGROUND);
             assert_eq!(drawn[(1, 4)].fg, theme::ICON_FOLDER);
-            // The line right of it, all the way down and into the rules; in
-            // two panes the bottom rule is a row higher, over the bar.
-            let rule = if f.app.shows_fn_bar() { 27 } else { 28 };
+            // The line right of it, all the way down and into the rules, in
+            // two panes too: the function key bar is under the panes.
+            let rule = 28;
             for y in 2..rule {
                 assert_eq!(drawn[(line, y)].symbol(), "│", "{view:?} {y}");
             }

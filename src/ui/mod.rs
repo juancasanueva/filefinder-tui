@@ -1,6 +1,6 @@
 //! Drawing: the frame of a header, a rule, the body, a rule and the
-//! footer, and in two panes the function key bar under it, with one
-//! function per region.
+//! footer, and in two panes the function key bar along the bottom of the
+//! panes, with one function per region.
 
 mod card;
 mod columns;
@@ -80,22 +80,15 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
         too_small(frame, area);
         return;
     }
-    // The function key bar under the footer while two panes show, when
-    // the body keeps a row.
-    let bar = u16::from(app.shows_fn_bar() && area.height > CHROME_ROWS + 1);
-    let [header, top_rule, body, bottom_rule, footer, keys] = Layout::vertical([
+    let [header, top_rule, body, bottom_rule, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(area.height - CHROME_ROWS - bar),
+        Constraint::Length(area.height - CHROME_ROWS),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(bar),
     ])
     .areas(area);
     topbar::draw(frame, app, header, hits);
-    if bar > 0 {
-        fkeys::draw(frame, app, keys, hits);
-    }
 
     let preview = app.shows_preview();
     let needed = places::needed(&app.places);
@@ -112,7 +105,18 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
     } else {
         body.width
     };
-    let files = column(start, end.saturating_sub(start));
+    let mut files = column(start, end.saturating_sub(start));
+    // The function key bar while two panes show, when the body keeps a
+    // row for them: the last row of their area, under both and over the
+    // bottom rule, as wide as they are.
+    let keys = (app.shows_fn_bar() && body.height > 1).then(|| {
+        files.height -= 1;
+        Rect {
+            y: files.bottom(),
+            height: 1,
+            ..files
+        }
+    });
     if panel {
         junctions.push(left);
     }
@@ -129,7 +133,14 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
         junctions.push(start + dual::divider(files.width));
     }
     rule(frame, top_rule, &junctions, '┬');
-    rule(frame, bottom_rule, &junctions, '┴');
+    // Under the function key bar the line between the two panes has
+    // stopped, so the bottom rule has no junction for it.
+    let mut under = junctions.clone();
+    if keys.is_some() && app.view() == ViewMode::Dual {
+        let divider = start + dual::divider(files.width);
+        under.retain(|x| *x != divider);
+    }
+    rule(frame, bottom_rule, &under, '┴');
 
     if panel {
         places::draw(frame, app, column(0, left), hits);
@@ -144,34 +155,41 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
         separator(frame, column(left + middle + 1, 1));
         preview::draw(frame, app, column(left + middle + 2, right), hits);
     }
+    if let Some(keys) = keys {
+        fkeys::draw(frame, app, keys, hits);
+    }
     // The area with the keyboard: its stretch of both rules and the lines
     // on its sides lit, from the line (or edge) left of it to the one right.
     let list = (
         if panel { left } else { 0 },
         if preview { end } else { body.width - 1 },
     );
+    // The line between two panes is as tall as they are: over the bar.
+    let divider = (app.view() == ViewMode::Dual).then(|| start + dual::divider(files.width));
     let span = match app.focus {
         Focus::Places if panel => Some((0, left)),
         Focus::Preview if preview => Some((left + middle + 1, body.width - 1)),
-        Focus::List if app.view() == ViewMode::Dual => {
-            let line = start + dual::divider(files.width);
-            Some(if app.active() == 0 {
-                (list.0, line)
-            } else {
-                (line, list.1)
-            })
-        }
-        Focus::List => Some(list),
+        Focus::List => Some(match divider {
+            Some(line) if app.active() == 0 => (list.0, line),
+            Some(line) => (line, list.1),
+            None => list,
+        }),
         _ => None,
     };
     if let Some((from, to)) = span {
-        light(
-            frame,
-            [top_rule.y, bottom_rule.y],
-            body,
-            (from, to),
-            &junctions,
-        );
+        // Each line down the body, but the one between two panes only down
+        // to the bar: the bar is neither pane's.
+        let lines: Vec<(u16, u16)> = (junctions.iter())
+            .map(|x| {
+                let rows = if Some(*x) == divider {
+                    files.height
+                } else {
+                    body.height
+                };
+                (*x, rows)
+            })
+            .collect();
+        light(frame, [top_rule.y, bottom_rule.y], body, (from, to), &lines);
     }
     // The bottom row asks while a paste waits or a prompt is open.
     if let Some(question) = &app.question {
@@ -274,8 +292,15 @@ fn rule(frame: &mut Frame, area: Rect, junctions: &[u16], junction: char) {
 }
 
 /// Lights the cells of the rules on rows `rules` from column `from` to
-/// `to`, and the lines between panes at either end, all the body down.
-fn light(frame: &mut Frame, rules: [u16; 2], body: Rect, (from, to): (u16, u16), lines: &[u16]) {
+/// `to`, and the lines between panes at either end, each `(column, rows)`
+/// lit from the body's top down its rows.
+fn light(
+    frame: &mut Frame,
+    rules: [u16; 2],
+    body: Rect,
+    (from, to): (u16, u16),
+    lines: &[(u16, u16)],
+) {
     let ink = theme::ink(theme::ACCENT);
     let buffer = frame.buffer_mut();
     for y in rules {
@@ -283,8 +308,9 @@ fn light(frame: &mut Frame, rules: [u16; 2], body: Rect, (from, to): (u16, u16),
             buffer[(body.x + x, y)].set_fg(ink);
         }
     }
-    for x in [from, to].into_iter().filter(|x| lines.contains(x)) {
-        for y in body.y..body.y + body.height {
+    // Each line as many rows down from the body's top as it is tall.
+    for (x, rows) in lines.iter().filter(|(x, _)| *x == from || *x == to) {
+        for y in body.y..body.y + rows {
             buffer[(body.x + x, y)].set_fg(ink);
         }
     }
@@ -653,13 +679,14 @@ mod tests {
 
     /// Which cells of the two rules and the lines between the panes are
     /// lit, as (first, last) column of the lit stretch; checks each cell.
-    fn assert_lit(drawn: &Buffer, from: u16, to: u16, label: &str) {
+    /// In two panes the line between them, `short`, stops a row above the
+    /// bottom rule, over the function key bar, and is lit only that far.
+    fn assert_lit(drawn: &Buffer, from: u16, to: u16, short: Option<u16>, label: &str) {
         let width = drawn.area.width;
         let lines: Vec<u16> = (0..width)
             .filter(|x| drawn[(*x, 1)].symbol() == "┬")
             .collect();
-        // The bottom rule: over the footer, or in two panes over the footer
-        // and the function key bar.
+        // The bottom rule, over the footer.
         let bottom = (2..drawn.area.height)
             .rev()
             .find(|y| (0..width).any(|x| drawn[(x, *y)].symbol() == "┴"))
@@ -680,7 +707,14 @@ mod tests {
             } else {
                 theme::BORDER
             };
-            for y in 2..bottom {
+            let end = if Some(x) == short {
+                // The bar's cell, not the line's.
+                assert_ne!(drawn[(x, bottom - 1)].symbol(), "│", "{label}: {x}");
+                bottom - 1
+            } else {
+                bottom
+            };
+            for y in 2..end {
                 assert_eq!(drawn[(x, y)].fg, wanted, "{label}: line {x}, {y}");
             }
         }
@@ -699,13 +733,13 @@ mod tests {
         ] {
             f.app.focus = focus;
             let drawn = buffer(&mut f.app, 120, 30);
-            assert_lit(&drawn, from, to, &format!("{focus:?}"));
+            assert_lit(&drawn, from, to, None, &format!("{focus:?}"));
         }
         // Tab moves the keyboard, and the light with it.
         f.app.focus = Focus::List;
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::Places);
-        assert_lit(&buffer(&mut f.app, 120, 30), 0, line, "after Tab");
+        assert_lit(&buffer(&mut f.app, 120, 30), 0, line, None, "after Tab");
 
         // Two panes: the active one's stretch, up to the line between them.
         f.app.focus = Focus::List;
@@ -721,7 +755,7 @@ mod tests {
         } else {
             (divider, 119)
         };
-        assert_lit(&drawn, from, to, "the active pane");
+        assert_lit(&drawn, from, to, Some(divider), "the active pane");
         f.app.tab_mut().active = 1 - active;
         let drawn = buffer(&mut f.app, 120, 30);
         let (from, to) = if active == 0 {
@@ -729,7 +763,7 @@ mod tests {
         } else {
             (line, divider)
         };
-        assert_lit(&drawn, from, to, "the other pane");
+        assert_lit(&drawn, from, to, Some(divider), "the other pane");
     }
 
     #[test]
@@ -1515,20 +1549,22 @@ mod tests {
         let div = start + dual::divider(files.end - start);
         // Each pane's columns: its edge, its glyph and its names three in.
         let (left_edge, right_edge) = (start, div + 1);
-        // The body ends a row higher than in one pane: the function key
-        // bar takes the bottom row, under the footer.
-        for y in 2..27 {
+        // The line between them stops a row over the bottom rule: the
+        // function key bar takes the panes' last row.
+        for y in 2..26 {
             assert_eq!(right[(div, y)].symbol(), "│", "row {y}");
             // The right pane has the keyboard: the line left of it is lit.
             assert_eq!(right[(div, y)].fg, theme::ACCENT);
         }
+        assert_ne!(right[(div, 27)].symbol(), "│");
+        // It starts at the top rule; under the bar the bottom rule runs on.
         assert_eq!(
-            (right[(div, 1)].symbol(), right[(div, 27)].symbol()),
-            ("┬", "┴")
+            (right[(div, 1)].symbol(), right[(div, 28)].symbol()),
+            ("┬", "─")
         );
         for x in (0..120).filter(|x| *x != line && *x != div) {
             assert_eq!(
-                (right[(x, 1)].symbol(), right[(x, 27)].symbol()),
+                (right[(x, 1)].symbol(), right[(x, 28)].symbol()),
                 ("─", "─")
             );
         }
