@@ -4,6 +4,7 @@ mod app;
 mod format;
 mod icons;
 mod input;
+mod keys;
 mod matcher;
 mod model;
 mod ops;

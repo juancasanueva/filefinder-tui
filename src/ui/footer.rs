@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{fit, prompt};
 use crate::app::App;
 use crate::format;
+use crate::keys::Command;
 use crate::theme;
 
 /// A run of text with the cells before it.
@@ -36,12 +37,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .volume()
         .map(|volume| format!("{} · {} free", volume.kind, format::size(volume.free)))
         .unwrap_or_default();
+    // The key sheet's key, as the keys file has it; none when it has none.
+    let keys = match app.keymap.first(Command::Help, "?") {
+        key if key.is_empty() => String::new(),
+        key => format!("{key} keys"),
+    };
     let mut right: Vec<Span> = Vec::new();
     let mut right_width = 0;
-    for (text, style) in [
-        (disk, theme::base()),
-        ("? keys".to_string(), theme::muted()),
-    ] {
+    for (text, style) in [(disk, theme::base()), (keys, theme::muted())] {
         let gap = if right_width == 0 { 0 } else { 3 };
         if text.is_empty()
             || text.width() + right_width + gap + left_width.min(columns) + 2 > columns

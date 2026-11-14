@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{fit, pad};
 use crate::app::{App, HitMap, Spot, ViewMode};
 use crate::icons;
+use crate::keys::Command;
 use crate::model::SortMode;
 use crate::theme;
 
@@ -173,16 +174,18 @@ fn draw_buttons(frame: &mut Frame, app: &App, x: u16, y: u16, hits: &mut HitMap)
     hits.add(rect, Spot::Gear);
 }
 
-/// What a header button's tooltip says: what it does, and its keys.
-fn tip_text(spot: &Spot) -> Option<(&'static str, &'static str)> {
-    Some(match spot {
-        Spot::View(ViewMode::List) => ("List view", "ctrl-opt-1"),
-        Spot::View(ViewMode::Columns) => ("Columns view", "ctrl-opt-2"),
-        Spot::View(ViewMode::Grid) => ("Grid view", "ctrl-opt-3"),
-        Spot::View(ViewMode::Dual) => ("Dual pane", "ctrl-opt-4"),
-        Spot::Gear => ("Settings", ","),
+/// What a header button's tooltip says: what it does, and its keys, as
+/// the keys file has them.
+fn tip_text(app: &App, spot: &Spot) -> Option<(&'static str, String)> {
+    let (label, command, keys) = match spot {
+        Spot::View(ViewMode::List) => ("List view", Command::ListView, "ctrl-opt-1"),
+        Spot::View(ViewMode::Columns) => ("Columns view", Command::ColumnsView, "ctrl-opt-2"),
+        Spot::View(ViewMode::Grid) => ("Grid view", Command::GridView, "ctrl-opt-3"),
+        Spot::View(ViewMode::Dual) => ("Dual pane", Command::DualPane, "ctrl-opt-4"),
+        Spot::Gear => return Some(("Settings", ",".to_string())),
         _ => return None,
-    })
+    };
+    Some((label, app.keymap.show(&[command], keys)))
 }
 
 /// The tooltip of the view button the pointer rests on: a framed line just
@@ -191,7 +194,7 @@ fn tip_text(spot: &Spot) -> Option<(&'static str, &'static str)> {
 /// button isn't showing.
 pub fn tip(frame: &mut Frame, app: &App, hits: &HitMap) {
     let Some(spot) = &app.tip else { return };
-    let (Some(button), Some((label, keys))) = (hits.rect_of(spot), tip_text(spot)) else {
+    let (Some(button), Some((label, keys))) = (hits.rect_of(spot), tip_text(app, spot)) else {
         return;
     };
     let screen = frame.area();

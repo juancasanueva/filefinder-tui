@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use super::card::{self, ESC};
 use super::{fit, pad, pad_left, words};
 use crate::app::{App, HitMap, Spot};
+use crate::keys::{Command, Keymap};
 use crate::theme;
 
 pub const TITLE: &str = "Keyboard Shortcuts";
@@ -95,6 +96,95 @@ pub const ROWS: &[(usize, &str, &str)] = &[
     (3, "alt-t", "Open terminal"),
 ];
 
+/// The browsing commands a row of the sheet stands for, by its keys as the
+/// sheet spells them by default; none for a key the keys file can't change.
+fn commands(keys: &str) -> &'static [Command] {
+    use Command as C;
+    match keys {
+        "j / down" => &[C::Down],
+        "k / up" => &[C::Up],
+        "g / home" => &[C::First],
+        "G / end" => &[C::Last],
+        "ctrl-d / pagedown" => &[C::PageDown],
+        "ctrl-u / pageup" => &[C::PageUp],
+        "enter" => &[C::Open],
+        "h / left / backspace" => &[C::Parent],
+        "l / right" => &[C::BrowseIn],
+        "H" => &[C::Back],
+        "L" => &[C::Forward],
+        "tab / shift-tab" => &[C::FocusNext, C::FocusPrevious],
+        "t" => &[C::NewTab],
+        "O" => &[C::OpenInNewTab],
+        "w / ctrl-w" => &[C::CloseTab],
+        "]" => &[C::NextTab],
+        "[" => &[C::PreviousTab],
+        "{" => &[C::MoveTabLeft],
+        "}" => &[C::MoveTabRight],
+        "escape" => &[C::Escape],
+        "1–9" => &[
+            C::Tab1,
+            C::Tab2,
+            C::Tab3,
+            C::Tab4,
+            C::Tab5,
+            C::Tab6,
+            C::Tab7,
+            C::Tab8,
+            C::Tab9,
+        ],
+        "q" => &[C::Quit],
+        "?" => &[C::Help],
+        "space" => &[C::QuickLook],
+        "." => &[C::Hidden],
+        "I" => &[C::Detail],
+        "alt-p" => &[C::Preview],
+        "ctrl-b" => &[C::Places],
+        "ctrl-p" => &[C::Pin],
+        "ctrl-opt-1" => &[C::ListView],
+        "ctrl-opt-2" => &[C::ColumnsView],
+        "ctrl-opt-3" => &[C::GridView],
+        "ctrl-opt-4 / | / alt-1" => &[C::DualPane],
+        "+" => &[C::ZoomIn],
+        "-" => &[C::ZoomOut],
+        "/" => &[C::Filter],
+        "f / ctrl-f" => &[C::Find],
+        "o" => &[C::Reveal],
+        "s" => &[C::Sort],
+        "S" => &[C::ReverseSort],
+        ": / ctrl-l" => &[C::GoTo],
+        "ctrl-r" => &[C::Refresh],
+        "y / ctrl-c" => &[C::Copy],
+        "x / ctrl-x" => &[C::Cut],
+        "p / ctrl-v" => &[C::Paste],
+        "M" => &[C::MoveHere],
+        "U" => &[C::Duplicate],
+        "r / f2" => &[C::Rename],
+        "dd / delete" => &[C::Trash, C::TrashNow],
+        "shift-delete" => &[C::DeleteForever],
+        "z / ctrl-z" => &[C::Undo],
+        "ctrl-shift-z / ctrl-y" => &[C::Redo],
+        "ctrl-shift-n / N" => &[C::NewFolder],
+        "f5 (two panes)" => &[C::PaneCopy],
+        "f6 (two panes)" => &[C::PaneMove],
+        "f7 (two panes)" => &[C::PaneNewFolder],
+        "f8 (two panes)" => &[C::PaneTrash],
+        "f9 (two panes)" => &[C::PaneNewMarkdown],
+        "f10 (two panes)" => &[C::PaneNewText],
+        "E" => &[C::Edit],
+        "v" => &[C::Select],
+        "J / shift-down" => &[C::ExtendNext, C::ExtendDown],
+        "K / shift-up" => &[C::ExtendPrevious, C::ExtendUp],
+        "V" => &[C::InvertSelection],
+        "ctrl-a" => &[C::SelectAll],
+        "T" => &[C::Tags],
+        "ctrl-shift-c" => &[C::CopyPath],
+        "Y" => &[C::CopyFolderPath],
+        "m / menu" => &[C::Menu],
+        "alt-t" => &[C::Terminal],
+        _ => &[],
+    }
+}
+
 /// At most three columns, four cells apart.
 const COLUMNS: usize = 3;
 const GAP: usize = 4;
@@ -104,16 +194,19 @@ const GAP: usize = 4;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Sheet {
     Heading(&'static str),
-    Binding(&'static str, &'static str),
+    Binding(String, &'static str),
     Key(String),
     Words(String),
 }
 
-fn groups() -> Vec<Vec<Sheet>> {
+/// The groups, each row with the keys the keys file gives its commands.
+fn groups(keymap: &Keymap) -> Vec<Vec<Sheet>> {
     let group = |index: usize| {
         let mut lines = vec![Sheet::Heading(GROUPS[index])];
         let rows = ROWS.iter().filter(|(group, _, _)| *group == index);
-        lines.extend(rows.map(|(_, keys, does)| Sheet::Binding(keys, does)));
+        lines.extend(
+            rows.map(|(_, keys, does)| Sheet::Binding(keymap.show(commands(keys), keys), does)),
+        );
         lines
     };
     (0..GROUPS.len()).map(group).collect()
@@ -169,8 +262,8 @@ fn total(columns: &[Vec<Sheet>]) -> usize {
 /// The most columns, up to three, that fit `room` cells with the fewest
 /// rows, `rows` being what the card shows; a screen too narrow for one
 /// column of keys beside their words has each on lines of their own.
-fn sheet(rows: usize, room: usize) -> Vec<Vec<Sheet>> {
-    let groups = groups();
+fn sheet(keymap: &Keymap, rows: usize, room: usize) -> Vec<Vec<Sheet>> {
+    let groups = groups(keymap);
     for count in (1..=COLUMNS).rev() {
         let mut capacity = rows.max(1);
         while pack(&groups, capacity).len() > count {
@@ -206,7 +299,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
         inside.saturating_sub(2)
     };
     let room = card::room(area.width) as usize;
-    let columns = sheet(rows, room);
+    let columns = sheet(&app.keymap, rows, room);
     let heading = TITLE.width() + 2 + ESC.width();
     let need = total(&columns).max(heading).min(room) as u16;
     let air = card::air(area.width);
@@ -334,6 +427,31 @@ mod tests {
         );
         // Behind it, everything dimmed.
         assert_eq!(drawn[(1, 0)].fg, theme::DIMMED);
+    }
+
+    #[test]
+    fn every_browsing_command_is_on_the_sheet_once() {
+        use crate::keys::COMMANDS;
+        let mut seen = Vec::new();
+        for (_, keys, _) in ROWS {
+            let commands = commands(keys);
+            assert!(
+                !commands.is_empty() || [",", "ctrl-g"].contains(keys),
+                "{keys} stands for no command"
+            );
+            seen.extend_from_slice(commands);
+        }
+        // The grid's own left and right were never on the sheet.
+        let grid = [
+            Command::ExtendRight,
+            Command::ExtendLeft,
+            Command::GridLeft,
+            Command::GridRight,
+        ];
+        for (command, _, name, _, _) in COMMANDS.iter().filter(|entry| !grid.contains(&entry.0)) {
+            let times = seen.iter().filter(|seen| *seen == command).count();
+            assert_eq!(times, 1, "{name}");
+        }
     }
 
     #[test]

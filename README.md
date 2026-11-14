@@ -65,7 +65,7 @@ From a clone, without installing: `cargo run --release -- ~/Pictures`.
 
 ## Keys
 
-Digits are never counts.
+Digits are never counts. These are the default keys; the browsing commands' keys can be changed in a file (see [Changing the keys](#changing-the-keys)).
 
 | Key | Does |
 | --- | --- |
@@ -127,6 +127,24 @@ Digits are never counts.
 
 Rename, Folder name and Go to ask on the bottom row. A paste that meets names already taken asks there too: Enter or `b` keeps both (`name copy.ext`), `r` replaces (the one there goes to the Trash, and undo brings it back), `s` skips, Escape cancels.
 
+### Changing the keys
+
+The browsing commands' keys live in `~/.config/filefinder-tui/keys`. The first launch writes it with every command and its default keys; edit it and restart the app. Each line is one command and its keys:
+
+```
+copy = y, ctrl-c            # Copy
+quit = ctrl-q               # q no longer quits
+trash_now =                 # Delete runs nothing
+```
+
+- A key is one character (`M` is Shift+m) or a name: `up down left right home end pageup pagedown enter esc tab backspace delete insert space comma hash menu f1`–`f24`. Put `ctrl-`, `alt-` (or `opt-`) and `shift-` before it: `ctrl-shift-z`.
+- A command left out of the file keeps its default keys; `name =` with nothing after it leaves it without keys. A `#` after a space starts a comment.
+- A key with Shift that runs nothing runs what the key without Shift does (Shift+Enter opens), except a plain letter: `M` is not `m`.
+- When commands share a key, the first one that can run here does, in the order the app writes the file (rearranging the lines changes nothing): Left moves in the grid and goes to the parent folder elsewhere; `pane_copy` and the other `pane_` commands run only while two panes show.
+- A line the app can't read (an unknown command or key, no `=`) is named in red at launch and that command keeps its defaults; two commands that always run sharing a key are named too, and the first one wins.
+- The `?` sheet, the footer's `? keys`, the function key bar and the view buttons' tooltips show your keys for any command you changed.
+- The places panel, the preview, Quick Look, menus, prompts, the find and filter fields and `,` (settings) keep their own keys. From the places panel, the window's commands (views, tabs, focus, `?`, quit, sort and the like) still run on their keys.
+
 ### The menu
 
 `m` (or Menu, Shift+F10, a right click on an item) opens the menu under the item, at its name, or above it when there is no room below:
@@ -159,7 +177,7 @@ The mouse is tracked for presses and drags, and every move only while a menu or 
 
 ## Where it keeps things
 
-- `~/.config/filefinder-tui/`: the chosen view, tile size, sort, detail column and whether the preview, the places panel and hidden files show (`state`), and where trashed items came from (`trashed`).
+- `~/.config/filefinder-tui/`: the chosen view, tile size, sort, detail column and whether the preview, the places panel and hidden files show (`state`), where trashed items came from (`trashed`), and the browsing commands' keys (`keys`).
 - `~/Library/Caches/filefinder-tui/`: Quick Look thumbnails.
 - The Trash is `~/.Trash`. Restore works for items this app moved there.
 

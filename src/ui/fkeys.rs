@@ -13,7 +13,21 @@ use unicode_width::UnicodeWidthStr;
 
 use super::fit;
 use crate::app::{App, FnKey, HitMap, Spot};
+use crate::keys::Command;
 use crate::theme;
+
+/// The browsing command whose keys an item of the bar runs.
+fn runs(command: FnKey) -> Command {
+    match command {
+        FnKey::Rename => Command::Rename,
+        FnKey::Copy => Command::PaneCopy,
+        FnKey::Move => Command::PaneMove,
+        FnKey::NewFolder => Command::PaneNewFolder,
+        FnKey::Trash => Command::PaneTrash,
+        FnKey::NewMarkdown => Command::PaneNewMarkdown,
+        FnKey::NewText => Command::PaneNewText,
+    }
+}
 
 /// Draws the bar on its row: the row cut in seven, each command in the
 /// middle of its part, and the whole part a spot for the mouse.
@@ -24,10 +38,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let count = FnKey::ALL.len() as u16;
     for (index, command) in (0..count).zip(FnKey::ALL) {
         let slot = slot(area, index, count);
-        let key = format!("F{}", command.number());
+        let key = app
+            .keymap
+            .first(runs(command), &format!("F{}", command.number()));
         // A cell of air at the end, so a cut label never runs into the next.
         let room = (slot.width as usize).saturating_sub(1);
-        let text = fit(&format!("{key} {}", command.label()), room);
+        let text = match key.is_empty() {
+            true => fit(command.label(), room),
+            false => fit(&format!("{key} {}", command.label()), room),
+        };
         let before = room.saturating_sub(text.width()).div_ceil(2);
         let lit = if app.can_run(command) {
             theme::fg(theme::ACCENT)

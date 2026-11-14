@@ -16,6 +16,7 @@ use ratatui::layout::{Position as Point, Rect};
 
 use crate::format::DateStyle;
 use crate::input::Input;
+use crate::keys::{self, Chord, Command, Keymap};
 use crate::matcher::{self, Query, Tier};
 use crate::model::{self, Entry, SortKey, SortMode};
 use crate::ops::{self, Change, History, Kind, Report, Step};
@@ -1345,6 +1346,8 @@ pub struct App {
     pub question: Option<PasteQuestion>,
     /// When the first `d` was pressed, while the second may still follow.
     trash_armed: Option<Instant>,
+    /// The browsing commands' keys, from the keys file.
+    pub keymap: Keymap,
     /// Whether the terminal was handed to another program, so that the
     /// next frame has to be drawn whole.
     redraw: bool,
@@ -1393,6 +1396,11 @@ impl App {
             .as_deref()
             .map(state::load_trashed)
             .unwrap_or_default();
+        let (keymap, key_problems) = config
+            .state_dir
+            .as_deref()
+            .map(keys::load)
+            .unwrap_or_default();
         let mut app = Self {
             tabs: vec![Tab::new(config.home.clone(), saved.view)],
             current: 0,
@@ -1431,6 +1439,7 @@ impl App {
             prompt: None,
             question: None,
             trash_armed: None,
+            keymap,
             redraw: false,
             message: None,
             caption: 0,
@@ -1480,6 +1489,13 @@ impl App {
         // the keyboard; the view remembered is the one Ctrl+4 goes back to.
         app.split();
         app.tab_mut().active = 0;
+        if let Some(first) = key_problems.first() {
+            let more = key_problems.len() - 1;
+            app.fail(match more {
+                0 => first.clone(),
+                _ => format!("{first} (and {more} more)"),
+            });
+        }
         app
     }
 
@@ -1753,145 +1769,145 @@ impl App {
         self.command_key(key, armed);
     }
 
-    /// The command keys, over the files of the active pane.
+    /// The command keys, over the files of the active pane: the commands
+    /// the keys file gives the key, tried in the file's order until one can
+    /// run here; a key with Shift that runs none runs those of the key
+    /// without it, unless it is a plain letter's capital.
     fn command_key(&mut self, key: KeyEvent, armed: Option<Instant>) {
-        let held = key.modifiers;
-        let alt = held.contains(KeyModifiers::ALT) && !held.contains(KeyModifiers::CONTROL);
-        let ctrl = held.contains(KeyModifiers::CONTROL) && !held.contains(KeyModifiers::ALT);
-        // Control and Option together: the views' keys where a window
-        // manager takes Ctrl+1–4 for itself (Terrazzo's workspaces).
-        let ctrl_alt = held.contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        // Shift is what it takes to type a capital, `?`, `:` or `|`, so it
-        // may come along with a plain key.
-        let plain =
-            !held.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
-        let shift = held.contains(KeyModifiers::SHIFT);
-        // A shifted chord arrives as the capital, or as the small letter with
-        // Shift held, depending on the terminal.
-        let (letter, capital) = match key.code {
-            KeyCode::Char(c) => (Some(c.to_ascii_lowercase()), c.is_ascii_uppercase()),
-            _ => (None, false),
+        let Some(chord) = Chord::of(key) else {
+            return;
         };
-        let ctrl_shift = ctrl && (capital || shift);
+        if !self.run_chord(chord, armed)
+            && let Some(unshifted) = chord.unshifted()
+        {
+            self.run_chord(unshifted, armed);
+        }
+    }
+
+    /// Runs the first command on a chord that can run here; false if none.
+    fn run_chord(&mut self, chord: Chord, armed: Option<Instant>) -> bool {
+        let commands: Vec<Command> = self.keymap.commands(chord).collect();
+        commands
+            .into_iter()
+            .any(|command| self.run_command(command, armed))
+    }
+
+    /// Runs a browsing command, or says it can't run here with false: the
+    /// function key bar's only while it shows, the grid's only in the grid.
+    fn run_command(&mut self, command: Command, armed: Option<Instant>) -> bool {
         let grid = self.view() == ViewMode::Grid;
-        // F5 to F10 run the function key bar's commands while it shows.
-        let bar = self.shows_fn_bar() && plain && !shift;
-        match key.code {
+        let bar = self.shows_fn_bar();
+        match command {
             // Changing files.
-            KeyCode::F(5) if bar => self.run_fn_key(FnKey::Copy),
-            KeyCode::F(6) if bar => self.run_fn_key(FnKey::Move),
-            KeyCode::F(7) if bar => self.run_fn_key(FnKey::NewFolder),
-            KeyCode::F(8) if bar => self.run_fn_key(FnKey::Trash),
-            KeyCode::F(9) if bar => self.run_fn_key(FnKey::NewMarkdown),
-            KeyCode::F(10) if bar => self.run_fn_key(FnKey::NewText),
-            KeyCode::Char('d') if plain => self.trash_key(armed),
-            KeyCode::Delete if plain && shift => self.ask_delete(),
-            KeyCode::Delete if plain => self.delete_key(),
-            KeyCode::Char('y') if plain => self.take(false),
-            KeyCode::Char('x') if plain => self.take(true),
-            KeyCode::Char('p') if plain => self.paste(false),
-            KeyCode::Char('M') if plain => self.paste(true),
-            KeyCode::Char('U') if plain => self.duplicate(),
-            KeyCode::Char('Y') if plain => self.copy_folder_path(),
-            KeyCode::Char('r') if plain => self.ask_rename(),
-            KeyCode::F(2) => self.ask_rename(),
-            KeyCode::Char('N') if plain => self.ask_new_folder(),
-            KeyCode::Char('z') if plain => self.undo(),
-            KeyCode::Char('E') if plain => self.edit_file(),
-            KeyCode::Char('I') if plain => self.next_detail(),
-            KeyCode::Char('T') if plain => self.open_tags(),
-            _ if ctrl_shift && letter == Some('c') => self.copy_path(),
-            _ if ctrl_shift && letter == Some('n') => self.ask_new_folder(),
-            _ if ctrl_shift && letter == Some('z') => self.redo(),
-            KeyCode::Char('c') if ctrl => self.take(false),
-            KeyCode::Char('x') if ctrl => self.take(true),
-            KeyCode::Char('v') if ctrl => self.paste(false),
-            KeyCode::Char('z') if ctrl => self.undo(),
-            KeyCode::Char('y') if ctrl => self.redo(),
-            KeyCode::Char('p') if ctrl => self.toggle_pin(),
-            // Alt+T where a window manager takes Ctrl+T (Terrazzo's float).
-            KeyCode::Char('t') if ctrl || alt => self.open_terminal(),
+            Command::PaneCopy if bar => self.run_fn_key(FnKey::Copy),
+            Command::PaneMove if bar => self.run_fn_key(FnKey::Move),
+            Command::PaneNewFolder if bar => self.run_fn_key(FnKey::NewFolder),
+            Command::PaneTrash if bar => self.run_fn_key(FnKey::Trash),
+            Command::PaneNewMarkdown if bar => self.run_fn_key(FnKey::NewMarkdown),
+            Command::PaneNewText if bar => self.run_fn_key(FnKey::NewText),
+            Command::PaneCopy
+            | Command::PaneMove
+            | Command::PaneNewFolder
+            | Command::PaneTrash
+            | Command::PaneNewMarkdown
+            | Command::PaneNewText => return false,
+            Command::Trash => self.trash_key(armed),
+            Command::TrashNow => self.delete_key(),
+            Command::DeleteForever => self.ask_delete(),
+            Command::Copy => self.take(false),
+            Command::Cut => self.take(true),
+            Command::Paste => self.paste(false),
+            Command::MoveHere => self.paste(true),
+            Command::Duplicate => self.duplicate(),
+            Command::CopyFolderPath => self.copy_folder_path(),
+            Command::CopyPath => self.copy_path(),
+            Command::Rename => self.ask_rename(),
+            Command::NewFolder => self.ask_new_folder(),
+            Command::Undo => self.undo(),
+            Command::Redo => self.redo(),
+            Command::Edit => self.edit_file(),
+            Command::Tags => self.open_tags(),
+            Command::Pin => self.toggle_pin(),
+            Command::Terminal => self.open_terminal(),
             // Selecting.
-            KeyCode::Char('v') if plain => self.pane_mut().toggle_mark(),
-            KeyCode::Char('V') if plain => self.pane_mut().invert(),
-            KeyCode::Char('a') if ctrl => self.pane_mut().select_all(),
-            KeyCode::Char('J') if plain => self.extend(1),
-            KeyCode::Char('K') if plain => self.extend(-1),
-            KeyCode::Down if shift && plain => self.extend_row(true),
-            KeyCode::Up if shift && plain => self.extend_row(false),
-            KeyCode::Right if shift && plain && grid => self.extend(1),
-            KeyCode::Left if shift && plain && grid => self.extend(-1),
+            Command::Select => self.pane_mut().toggle_mark(),
+            Command::InvertSelection => self.pane_mut().invert(),
+            Command::SelectAll => self.pane_mut().select_all(),
+            Command::ExtendNext => self.extend(1),
+            Command::ExtendPrevious => self.extend(-1),
+            Command::ExtendDown => self.extend_row(true),
+            Command::ExtendUp => self.extend_row(false),
+            Command::ExtendRight if grid => self.extend(1),
+            Command::ExtendLeft if grid => self.extend(-1),
             // Moving.
-            KeyCode::Char('j') if plain => self.step(1),
-            KeyCode::Char('k') if plain => self.step(-1),
-            KeyCode::Down if plain => self.step(1),
-            KeyCode::Up if plain => self.step(-1),
-            KeyCode::Left if plain && grid => self.move_by(-1),
-            KeyCode::Right if plain && grid => self.move_by(1),
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace if plain => self.go_up(),
-            KeyCode::Char('l') | KeyCode::Right if plain => self.browse_in(),
-            KeyCode::Enter if plain => self.open_selected(),
-            KeyCode::Char('H') if plain => self.go_back(),
-            KeyCode::Char('L') if plain => self.go_forward(),
-            KeyCode::Char('g') | KeyCode::Home if plain => self.move_by(isize::MIN / 2),
-            KeyCode::Char('G') | KeyCode::End if plain => self.move_by(isize::MAX / 2),
-            KeyCode::Char('d') if ctrl => self.page(1),
-            KeyCode::Char('u') if ctrl => self.page(-1),
-            KeyCode::PageDown if plain => self.page(1),
-            KeyCode::PageUp if plain => self.page(-1),
-            KeyCode::Tab => self.move_focus(1),
-            KeyCode::BackTab => self.move_focus(-1),
-            KeyCode::Esc => self.escape(),
+            Command::GridLeft if grid => self.move_by(-1),
+            Command::GridRight if grid => self.move_by(1),
+            Command::ExtendRight | Command::ExtendLeft | Command::GridLeft | Command::GridRight => {
+                return false;
+            }
+            Command::Down => self.step(1),
+            Command::Up => self.step(-1),
+            Command::Parent => self.go_up(),
+            Command::BrowseIn => self.browse_in(),
+            Command::Open => self.open_selected(),
+            Command::Back => self.go_back(),
+            Command::Forward => self.go_forward(),
+            Command::First => self.move_by(isize::MIN / 2),
+            Command::Last => self.move_by(isize::MAX / 2),
+            Command::PageDown => self.page(1),
+            Command::PageUp => self.page(-1),
+            Command::FocusNext => self.move_focus(1),
+            Command::FocusPrevious => self.move_focus(-1),
+            Command::Escape => self.escape(),
             // Looking.
-            KeyCode::Char('?') if plain => {
+            Command::Help => {
                 self.help_visible = true;
                 self.help_scroll = 0;
             }
             // The card in the terminal, or macOS's window: a setting.
-            KeyCode::Char(' ') if plain => match self.space_look {
+            Command::QuickLook => match self.space_look {
                 SpaceLook::Terminal => self.open_look(),
                 SpaceLook::QuickLook => self.preview_selected(),
             },
-            KeyCode::Char('.') if plain => self.toggle_hidden(),
-            KeyCode::Char('/') if plain => self.open_filter(),
-            KeyCode::Char('f') if plain => self.search(),
-            KeyCode::Char('f') if ctrl => self.search(),
-            KeyCode::Char('o') if plain => self.reveal(),
-            KeyCode::Char('s') if plain => self.set_sort(self.sort.next()),
-            KeyCode::Char('S') if plain => self.set_sort(self.sort.reverse()),
-            KeyCode::Char(':') if plain => self.ask_go_to(),
-            KeyCode::Char('l') if ctrl => self.ask_go_to(),
-            KeyCode::Char('r') if ctrl => self.refresh(),
-            KeyCode::Char('p' | 'P') if alt => self.toggle_preview(),
-            KeyCode::Char('b') if ctrl => self.toggle_places(),
-            KeyCode::Char('m') if plain => self.open_menu(),
-            KeyCode::Menu => self.open_menu(),
-            KeyCode::F(10) if shift => self.open_menu(),
+            Command::Hidden => self.toggle_hidden(),
+            Command::Detail => self.next_detail(),
+            Command::Filter => self.open_filter(),
+            Command::Find => self.search(),
+            Command::Reveal => self.reveal(),
+            Command::Sort => self.set_sort(self.sort.next()),
+            Command::ReverseSort => self.set_sort(self.sort.reverse()),
+            Command::GoTo => self.ask_go_to(),
+            Command::Refresh => self.refresh(),
+            Command::Preview => self.toggle_preview(),
+            Command::Places => self.toggle_places(),
+            Command::Menu => self.open_menu(),
             // Views, panes and the window.
-            KeyCode::Char('1') if ctrl || ctrl_alt => self.set_view(ViewMode::List),
-            KeyCode::Char('2') if ctrl || ctrl_alt => self.set_view(ViewMode::Columns),
-            KeyCode::Char('3') if ctrl || ctrl_alt => self.set_view(ViewMode::Grid),
-            KeyCode::Char('4') if ctrl || ctrl_alt => self.toggle_split(),
-            KeyCode::Char('|') if plain => self.toggle_split(),
-            // Option+1 is the bar on a Spanish Mac keyboard; with Option sent
-            // as Alt, it arrives as Alt+1.
-            KeyCode::Char('1') if alt => self.toggle_split(),
-            KeyCode::Char('+') if plain => self.set_tile(self.tile.bigger()),
-            KeyCode::Char('-') if plain => self.set_tile(self.tile.smaller()),
-            // Tabs. Digits are never counts.
-            KeyCode::Char('t') if plain => self.new_tab(),
-            KeyCode::Char('O') if plain => self.open_in_new_tab(),
-            KeyCode::Char('w') if plain || ctrl => self.close_tab(),
-            KeyCode::Char(']') if plain => self.step_tab(1),
-            KeyCode::Char('[') if plain => self.step_tab(-1),
-            KeyCode::Char('}') if plain => self.move_tab(1),
-            KeyCode::Char('{') if plain => self.move_tab(-1),
-            KeyCode::Char(digit @ '1'..='9') if plain => {
-                self.go_to_tab(digit as usize - '1' as usize)
-            }
-            KeyCode::Char('q' | 'Q') if plain => self.quit(),
-            _ => {}
+            Command::ListView => self.set_view(ViewMode::List),
+            Command::ColumnsView => self.set_view(ViewMode::Columns),
+            Command::GridView => self.set_view(ViewMode::Grid),
+            Command::DualPane => self.toggle_split(),
+            Command::ZoomIn => self.set_tile(self.tile.bigger()),
+            Command::ZoomOut => self.set_tile(self.tile.smaller()),
+            // Tabs.
+            Command::NewTab => self.new_tab(),
+            Command::OpenInNewTab => self.open_in_new_tab(),
+            Command::CloseTab => self.close_tab(),
+            Command::NextTab => self.step_tab(1),
+            Command::PreviousTab => self.step_tab(-1),
+            Command::MoveTabRight => self.move_tab(1),
+            Command::MoveTabLeft => self.move_tab(-1),
+            Command::Tab1 => self.go_to_tab(0),
+            Command::Tab2 => self.go_to_tab(1),
+            Command::Tab3 => self.go_to_tab(2),
+            Command::Tab4 => self.go_to_tab(3),
+            Command::Tab5 => self.go_to_tab(4),
+            Command::Tab6 => self.go_to_tab(5),
+            Command::Tab7 => self.go_to_tab(6),
+            Command::Tab8 => self.go_to_tab(7),
+            Command::Tab9 => self.go_to_tab(8),
+            Command::Quit => self.quit(),
         }
+        true
     }
 
     /// The mouse twin of `handle_key`: a click, a double
@@ -2297,7 +2313,7 @@ impl App {
             KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
                 self.unpin_place(cursor)
             }
-            _ if window_key(key) => self.command_key(key, None),
+            _ if self.window_key(key) => self.command_key(key, None),
             _ => {}
         }
     }
@@ -2450,10 +2466,16 @@ impl App {
         } else {
             "it"
         };
+        // The keys file's keys, where it changes them.
+        let again = self.keymap.first(Command::Trash, "d");
+        let alone = match self.keymap.first(Command::TrashNow, "Delete") {
+            key if key.is_empty() => String::new(),
+            key => format!(", or press {key} on its own"),
+        };
         let said = if self.in_trash() {
-            "Press d again to review permanent deletion, or press Delete on its own.".to_string()
+            format!("Press {again} again to review permanent deletion{alone}.")
         } else {
-            format!("Press d again to move {what} to Trash, or press Delete on its own.")
+            format!("Press {again} again to move {what} to Trash{alone}.")
         };
         self.note(&said);
     }
@@ -4827,25 +4849,15 @@ impl App {
     fn fail(&mut self, text: String) {
         self.say(text, true, false, RECEIPT_LASTS);
     }
-}
 
-/// Whether a key is the window's own rather than the files': it does what
-/// it does even while the places panel has the keyboard.
-fn window_key(key: KeyEvent) -> bool {
-    let held = key.modifiers;
-    let ctrl = held.contains(KeyModifiers::CONTROL) && !held.contains(KeyModifiers::ALT);
-    let alt = held.contains(KeyModifiers::ALT) && !held.contains(KeyModifiers::CONTROL);
-    let plain = !held.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
-    match key.code {
-        KeyCode::Tab | KeyCode::BackTab => true,
-        KeyCode::Char('b' | 'r' | 'w' | '1'..='4') if ctrl => true,
-        KeyCode::Char('1'..='4') if held.contains(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-            true
-        }
-        KeyCode::Char('1' | 'p' | 'P') if alt => true,
-        KeyCode::Char('?' | 'q' | 'Q' | '|' | '.' | 's' | 'S' | 'I') if plain => true,
-        KeyCode::Char('t' | 'w' | '[' | ']' | '{' | '}' | '1'..='9') if plain => true,
-        _ => false,
+    /// Whether a key is the window's own rather than the files': it does
+    /// what it does even while the places panel has the keyboard.
+    fn window_key(&self, key: KeyEvent) -> bool {
+        let Some(chord) = Chord::of(key) else {
+            return false;
+        };
+        let window = |chord: Chord| self.keymap.commands(chord).any(Command::window);
+        window(chord) || chord.unshifted().is_some_and(window)
     }
 }
 
