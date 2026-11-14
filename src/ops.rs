@@ -127,12 +127,12 @@ pub enum Step {
     /// Several items renamed together, each from its first path to its
     /// second, through temporary names so that names can swap.
     Renamed { moves: Vec<(PathBuf, PathBuf)> },
-    /// Its Finder tags changed from `before` to `after`: the attribute's
-    /// bytes, `None` for none at all.
+    /// Its Finder tags changed from `before` to `after`: the bytes of both
+    /// attributes they are kept in, the tags and Finder's colour label.
     Tagged {
         at: PathBuf,
-        before: Option<Vec<u8>>,
-        after: Option<Vec<u8>>,
+        before: crate::tags::Stored,
+        after: crate::tags::Stored,
     },
     /// Moved or renamed.
     Moved { from: PathBuf, to: PathBuf },
@@ -416,20 +416,20 @@ pub fn retag(items: &[PathBuf], tagging: Tagging) -> Result<(Retagged, Change), 
     let mut read = Vec::with_capacity(items.len());
     for item in items {
         let refused = |why: String| Error(format!("Couldn't tag {}: {why}", shown(item)));
-        let raw = match tags::read(item) {
-            Ok(raw) => raw,
+        let stored = match tags::read_stored(item) {
+            Ok(stored) => stored,
             Err(error) if tags::is_unsupported(&error) => {
                 return Err(Error(tags::UNSUPPORTED.to_string()));
             }
             Err(error) => return Err(refused(why_failed(&error))),
         };
-        let labels = match &raw {
+        let labels = match &stored.tags {
             None => Vec::new(),
             Some(bytes) => {
                 tags::decode(bytes).ok_or_else(|| refused("its tags can't be read.".into()))?
             }
         };
-        read.push((item, raw, labels));
+        read.push((item, stored, labels));
     }
     let has = |labels: &[String], index: usize| tags::mask(labels) & 1 << index != 0;
     let what = match tagging {
@@ -449,12 +449,18 @@ pub fn retag(items: &[PathBuf], tagging: Tagging) -> Result<(Retagged, Change), 
         if wanted == labels {
             continue;
         }
-        let after = (!wanted.is_empty()).then(|| tags::encode(&wanted));
-        if let Err(error) = write_tags(item, after.as_deref()) {
-            // The ones already done go back to what they were.
+        // Finder's colour label follows the last colour tag, as Foundation
+        // keeps it; with none left it goes, or macOS would still show it.
+        let after = tags::Stored {
+            tags: (!wanted.is_empty()).then(|| tags::encode(&wanted)),
+            info: tags::with_colour(before.info.as_deref(), tags::colour(&wanted)),
+        };
+        if let Err(error) = write_tags(item, &after) {
+            // This one and the ones already done go back to what they were.
+            let _ = tags::store(item, &before);
             for step in steps.iter().rev() {
                 if let Step::Tagged { at, before, .. } = step {
-                    let _ = tags::write(at, before.as_deref());
+                    let _ = tags::store(at, before);
                 }
             }
             return Err(error);
@@ -475,7 +481,7 @@ pub fn retag(items: &[PathBuf], tagging: Tagging) -> Result<(Retagged, Change), 
 /// Writes an item's tags, unless the system would write a file of the
 /// user's over to keep them: on a disk without attributes of its own, they
 /// go in a `._name` file next to it.
-fn write_tags(item: &Path, value: Option<&[u8]>) -> Result<(), Error> {
+fn write_tags(item: &Path, wanted: &crate::tags::Stored) -> Result<(), Error> {
     let refused = |why: String| Error(format!("Couldn't tag {}: {why}", shown(item)));
     if let (Some(folder), Some(name)) = (item.parent(), item.file_name()) {
         let mut companion = OsString::from("._");
@@ -486,7 +492,7 @@ fn write_tags(item: &Path, value: Option<&[u8]>) -> Result<(), Error> {
             return Err(refused(why_failed(&error)));
         }
     }
-    match crate::tags::write(item, value) {
+    match crate::tags::store(item, wanted) {
         Ok(()) => Ok(()),
         Err(error) if crate::tags::is_unsupported(&error) => {
             Err(Error(crate::tags::UNSUPPORTED.to_string()))
@@ -1327,7 +1333,7 @@ impl Step {
             if !exists(at) {
                 return Some(format!("{} isn't where it was left.", shown(at)));
             }
-            return match crate::tags::read(at) {
+            return match crate::tags::read_stored(at) {
                 Ok(now) if now == *left => None,
                 _ => Some(format!("the tags of {} changed since.", shown(at))),
             };
@@ -1364,7 +1370,7 @@ impl Step {
                 *parked = Some(trash_item(at, trash_dir, &rename_new, &volume_trash)?);
                 Ok(())
             }
-            Step::Tagged { at, before, .. } => write_tags(at, before.as_deref()),
+            Step::Tagged { at, before, .. } => write_tags(at, before),
             Step::Renamed { moves } => run_batch(&reversed(moves)),
         }
     }
@@ -1383,7 +1389,7 @@ impl Step {
                 *parked = None;
                 Ok(())
             }
-            Step::Tagged { at, after, .. } => write_tags(at, after.as_deref()),
+            Step::Tagged { at, after, .. } => write_tags(at, after),
             Step::Renamed { moves } => run_batch(moves),
         }
     }
@@ -4355,6 +4361,137 @@ mod tests {
         );
         assert_eq!(w.read("USB/._x.txt"), "my own notes");
         assert_eq!(crate::tags::read(&x).unwrap(), None);
+    }
+
+    /// `com.apple.FinderInfo` as Foundation left it, read with `xattr -px`
+    /// after setting tags with `NSURLTagNamesKey`: 32 bytes, the Finder
+    /// flags' colour bits (byte 9, `0x0E`) holding the last colour tag's
+    /// number. `kind` is the file type and creator, `flags` the high byte.
+    fn finder_info(kind: &[u8; 8], flags: u8, colour_byte: u8) -> Vec<u8> {
+        let mut info = vec![0u8; 32];
+        info[..8].copy_from_slice(kind);
+        info[8] = flags;
+        info[9] = colour_byte;
+        info
+    }
+
+    fn put_info(path: &Path, info: &[u8]) {
+        let wanted = crate::tags::Stored {
+            tags: crate::tags::read(path).unwrap(),
+            info: Some(info.to_vec()),
+        };
+        crate::tags::store(path, &wanted).unwrap();
+    }
+
+    fn info_of(path: &Path) -> Option<Vec<u8>> {
+        crate::tags::read_stored(path).unwrap().info
+    }
+
+    const NOTHING: [u8; 8] = [0; 8];
+    const TEXT: &[u8; 8] = b"TEXTttxt";
+
+    #[test]
+    fn a_colour_tag_sets_finders_colour_label_as_foundation_does() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        // Red alone: what Foundation wrote for ["Red"].
+        retag(std::slice::from_ref(&a), Tagging::Toggle(0)).unwrap();
+        assert_eq!(info_of(&a), Some(finder_info(&NOTHING, 0, 0x0C)));
+        // Red then Blue: the last colour, as for ["Red", "Blue"].
+        retag(std::slice::from_ref(&a), Tagging::Toggle(4)).unwrap();
+        assert_eq!(tag_names(&a), ["Red\n6", "Blue\n4"]);
+        assert_eq!(info_of(&a), Some(finder_info(&NOTHING, 0, 0x08)));
+        // A file type, a creator and another Finder flag stay as they were,
+        // as they did for ["Green"].
+        let b = w.file("b.txt", "beta");
+        put_info(&b, &finder_info(TEXT, 0x40, 0));
+        retag(std::slice::from_ref(&b), Tagging::Toggle(3)).unwrap();
+        assert_eq!(info_of(&b), Some(finder_info(TEXT, 0x40, 0x04)));
+        // A tag of the user's own with no colour leaves no label behind.
+        let c = w.file("c.txt", "gamma");
+        put_tags(&c, &["Work\n0"]);
+        retag(std::slice::from_ref(&c), Tagging::Toggle(0)).unwrap();
+        assert_eq!(info_of(&c), Some(finder_info(&NOTHING, 0, 0x0C)));
+    }
+
+    #[test]
+    fn removing_the_last_colour_tag_takes_finders_colour_label_off_too() {
+        let w = world();
+        // Tagged Red the way Foundation tags it: both attributes.
+        let a = w.file("a.txt", "alpha");
+        put_tags(&a, &["Red\n6"]);
+        put_info(&a, &finder_info(&NOTHING, 0, 0x0C));
+        let (what, _) = retag(std::slice::from_ref(&a), Tagging::Toggle(0)).unwrap();
+        assert_eq!(what, Retagged::Removed(0));
+        assert_eq!(crate::tags::read(&a).unwrap(), None);
+        // Nothing else was in it: it goes, as Foundation's does.
+        assert_eq!(info_of(&a), None);
+
+        // Other Finder flags keep the attribute, with only the colour gone.
+        let b = w.file("b.txt", "beta");
+        put_tags(&b, &["Red\n6", "Blue\n4"]);
+        put_info(&b, &finder_info(TEXT, 0x40, 0x08));
+        retag(std::slice::from_ref(&b), Tagging::Toggle(4)).unwrap();
+        // Blue gone, Red left: Red's colour.
+        assert_eq!(info_of(&b), Some(finder_info(TEXT, 0x40, 0x0C)));
+        retag(std::slice::from_ref(&b), Tagging::Toggle(0)).unwrap();
+        assert_eq!(info_of(&b), Some(finder_info(TEXT, 0x40, 0)));
+
+        // Remove All Tags on Red and Blue, a tag of the user's own staying.
+        let c = w.file("c.txt", "gamma");
+        put_tags(&c, &["Red\n6", "Blue\n4", "Work\n0"]);
+        put_info(&c, &finder_info(&NOTHING, 0, 0x08));
+        let d = w.file("d.txt", "delta");
+        put_tags(&d, &["Red\n6", "Blue\n4"]);
+        put_info(&d, &finder_info(&NOTHING, 0, 0x08));
+        retag(&[c.clone(), d.clone()], Tagging::RemoveAll).unwrap();
+        assert_eq!(tag_names(&c), ["Work\n0"]);
+        assert_eq!(info_of(&c), None);
+        assert_eq!(crate::tags::read(&d).unwrap(), None);
+        assert_eq!(info_of(&d), None);
+    }
+
+    #[test]
+    fn undo_and_redo_put_back_both_attributes_byte_for_byte() {
+        let w = world();
+        let a = w.file("a.txt", "alpha");
+        put_tags(&a, &["Red\n6", "Work\n0"]);
+        put_info(&a, &finder_info(TEXT, 0x40, 0x0C));
+        let before = crate::tags::read_stored(&a).unwrap();
+        let mut history = History::default();
+        history.record(
+            retag(std::slice::from_ref(&a), Tagging::RemoveAll)
+                .unwrap()
+                .1,
+        );
+        let after = crate::tags::read_stored(&a).unwrap();
+        assert_eq!(after.info, Some(finder_info(TEXT, 0x40, 0)));
+        history.undo(&w.trash).unwrap().unwrap();
+        assert_eq!(crate::tags::read_stored(&a).unwrap(), before);
+        history.redo(&w.trash).unwrap().unwrap();
+        assert_eq!(crate::tags::read_stored(&a).unwrap(), after);
+
+        // A file that had neither attribute has neither after undo.
+        let b = w.file("b.txt", "beta");
+        history.record(
+            retag(std::slice::from_ref(&b), Tagging::Toggle(1))
+                .unwrap()
+                .1,
+        );
+        assert_eq!(info_of(&b), Some(finder_info(&NOTHING, 0, 0x0E)));
+        history.undo(&w.trash).unwrap().unwrap();
+        let none = crate::tags::Stored::default();
+        assert_eq!(crate::tags::read_stored(&b).unwrap(), none);
+
+        // Finder's label changed since by someone else: never undone over.
+        history.redo(&w.trash).unwrap().unwrap();
+        put_info(&b, &finder_info(TEXT, 0, 0x0E));
+        let error = history.undo(&w.trash).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Can't undo that: the tags of b.txt changed since."
+        );
+        assert_eq!(info_of(&b), Some(finder_info(TEXT, 0, 0x0E)));
     }
 
     #[test]

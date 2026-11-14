@@ -18,6 +18,14 @@ const FINDER_COLOURS: [u8; 7] = [6, 7, 5, 2, 4, 3, 1];
 /// Where macOS keeps an item's tags.
 pub const ATTRIBUTE: &str = "com.apple.metadata:_kMDItemUserTags";
 
+/// Where macOS also keeps the colour label: the Finder flags in it hold
+/// the last colour tag's number, which macOS shows when an item has no tags
+/// of its own. Foundation keeps it in step with the tags, and so does this.
+pub const FINDER_INFO: &str = "com.apple.FinderInfo";
+
+/// The Finder flags' colour bits, in byte 9 of `com.apple.FinderInfo`.
+const COLOUR_BITS: u8 = 0x0E;
+
 /// What is said when the disk can't keep tags, in flea's words.
 pub const UNSUPPORTED: &str = "This filesystem does not support file tags.";
 
@@ -238,20 +246,81 @@ fn marker(out: &mut Vec<u8>, kind: u8, count: usize) {
     out.extend_from_slice(&(count as u64).to_be_bytes()[8 - size..]);
 }
 
+/// Both attributes an item's tags live in, as their bytes; `None` for one
+/// it doesn't have.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stored {
+    /// `com.apple.metadata:_kMDItemUserTags`.
+    pub tags: Option<Vec<u8>>,
+    /// `com.apple.FinderInfo`.
+    pub info: Option<Vec<u8>>,
+}
+
+/// Finder's colour number of the last tag that has one, which Foundation
+/// keeps in the Finder flags; 0 for none.
+pub fn colour(labels: &[String]) -> u8 {
+    let number = |label: &String| {
+        let (_, number) = label.split_once('\n')?;
+        number
+            .parse::<u8>()
+            .ok()
+            .filter(|number| (1..=7).contains(number))
+    };
+    labels.iter().rev().find_map(number).unwrap_or(0)
+}
+
+/// `com.apple.FinderInfo` with its colour bits holding `colour` and every
+/// other byte as it was: none when it would hold nothing at all, as macOS
+/// keeps it, and one that isn't the 32 bytes it should be left alone.
+pub fn with_colour(info: Option<&[u8]>, colour: u8) -> Option<Vec<u8>> {
+    let mut bytes = match info {
+        Some(bytes) if bytes.len() != 32 => return Some(bytes.to_vec()),
+        Some(bytes) => bytes.to_vec(),
+        None if colour == 0 => return None,
+        None => vec![0; 32],
+    };
+    bytes[9] = bytes[9] & !COLOUR_BITS | (colour << 1) & COLOUR_BITS;
+    bytes.iter().any(|byte| *byte != 0).then_some(bytes)
+}
+
+/// Both attributes as they are on an item, link or not.
+pub fn read_stored(path: &Path) -> io::Result<Stored> {
+    Ok(Stored {
+        tags: xattr::get(path, ATTRIBUTE)?,
+        info: xattr::get(path, FINDER_INFO)?,
+    })
+}
+
+/// Gives an item exactly these attributes, writing only the ones that differ.
+pub fn store(path: &Path, wanted: &Stored) -> io::Result<()> {
+    let now = read_stored(path)?;
+    if now.tags != wanted.tags {
+        write(path, wanted.tags.as_deref())?;
+    }
+    if now.info != wanted.info {
+        write_attribute(path, FINDER_INFO, wanted.info.as_deref())?;
+    }
+    Ok(())
+}
+
 /// The attribute as it is on an item, link or not; `None` when it has none.
 pub fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    xattr::get(path)
+    xattr::get(path, ATTRIBUTE)
 }
 
 /// Puts the attribute on an item, or takes it off with `None`.
 pub fn write(path: &Path, value: Option<&[u8]>) -> io::Result<()> {
+    write_attribute(path, ATTRIBUTE, value)
+}
+
+fn write_attribute(path: &Path, name: &str, value: Option<&[u8]>) -> io::Result<()> {
     #[cfg(test)]
     if testing::is_pretend(path) {
         return Err(io::Error::from_raw_os_error(45));
     }
     match value {
-        Some(value) => xattr::set(path, value),
-        None => xattr::remove(path),
+        Some(value) => xattr::set(path, name, value),
+        None => xattr::remove(path, name),
     }
 }
 
@@ -282,12 +351,12 @@ mod xattr {
         CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)
     }
 
-    fn c_name() -> CString {
-        CString::new(super::ATTRIBUTE).expect("no NUL in the name")
+    fn c_name(name: &str) -> CString {
+        CString::new(name).expect("no NUL in the name")
     }
 
-    pub fn get(path: &Path) -> io::Result<Option<Vec<u8>>> {
-        let (path, name) = (c_path(path)?, c_name());
+    pub fn get(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
+        let (path, name) = (c_path(path)?, c_name(name));
         loop {
             // SAFETY: both strings end in a NUL; a null buffer asks for the size.
             let size = unsafe {
@@ -333,8 +402,8 @@ mod xattr {
         }
     }
 
-    pub fn set(path: &Path, value: &[u8]) -> io::Result<()> {
-        let (path, name) = (c_path(path)?, c_name());
+    pub fn set(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+        let (path, name) = (c_path(path)?, c_name(name));
         // SAFETY: both strings end in a NUL and `value` is `value.len()` bytes.
         let done = unsafe {
             libc::setxattr(
@@ -353,8 +422,8 @@ mod xattr {
         }
     }
 
-    pub fn remove(path: &Path) -> io::Result<()> {
-        let (path, name) = (c_path(path)?, c_name());
+    pub fn remove(path: &Path, name: &str) -> io::Result<()> {
+        let (path, name) = (c_path(path)?, c_name(name));
         // SAFETY: both strings end in a NUL.
         let done = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) };
         let error = io::Error::last_os_error();
@@ -372,15 +441,15 @@ mod xattr {
     use std::io;
     use std::path::Path;
 
-    pub fn get(_path: &Path) -> io::Result<Option<Vec<u8>>> {
+    pub fn get(_path: &Path, _name: &str) -> io::Result<Option<Vec<u8>>> {
         Ok(None)
     }
 
-    pub fn set(_path: &Path, _value: &[u8]) -> io::Result<()> {
+    pub fn set(_path: &Path, _name: &str, _value: &[u8]) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
 
-    pub fn remove(_path: &Path) -> io::Result<()> {
+    pub fn remove(_path: &Path, _name: &str) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
 }
