@@ -465,7 +465,7 @@ mod tests {
         let mut f = fixture();
         fs::write(f.home.join("report_2026_final_version_draft.pdf"), "").unwrap();
         whole_grid(&mut f.app);
-        press(&mut f.app, &[KeyCode::F(5)]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         let drawn = buffer(&mut f.app, 62, 26);
         // Documents, Pictures, notes.txt, then the report on the second row.
         assert_eq!(find(&drawn, "report_2026_fina", 0..62), Some((3, 18)));
@@ -587,7 +587,7 @@ mod tests {
         let (mut f, thumbnailer) = pictures();
         fs::write(f.home.join("tall.jpg"), "tall").unwrap();
         whole_grid(&mut f.app);
-        press(&mut f.app, &[KeyCode::F(5)]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
 
         // Drawing only asks: until the picture has been made the stand-in shows.
         let before = buffer(&mut f.app, 62, 26);
@@ -634,7 +634,8 @@ mod tests {
         }
         whole_grid(&mut f.app);
         // What the detail column says goes in the footer, under the rule.
-        press(&mut f.app, &[KeyCode::F(5), KeyCode::Char('I')]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::Char('I')]);
         buffer(&mut f.app, 62, 27);
         settle(&mut f.app);
         let cut = buffer(&mut f.app, 62, 27);
@@ -662,7 +663,7 @@ mod tests {
         let (mut f, thumbnailer) = pictures();
         fs::write(f.home.join("notes.txt"), "broken").unwrap();
         whole_grid(&mut f.app);
-        press(&mut f.app, &[KeyCode::F(5)]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         for _ in 0..3 {
             buffer(&mut f.app, 62, 26);
             settle(&mut f.app);
@@ -677,7 +678,7 @@ mod tests {
         let later = SystemTime::now() + Duration::from_secs(60);
         let file = File::options().write(true).open(f.home.join("notes.txt"));
         file.unwrap().set_modified(later).unwrap();
-        press(&mut f.app, &[KeyCode::F(5)]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         buffer(&mut f.app, 62, 26);
         settle(&mut f.app);
         let mended = buffer(&mut f.app, 62, 26);

@@ -1,0 +1,36 @@
+# function-key-bar
+
+Objective: in two-panes mode, a bar of function keys at the bottom (F2 Rename, F5 Copy, F6 Move, F7 Mkdir, F8 Delete, F9 New MD, F10 New TXT), the keys doing what the bar says, as the user's SwiftUI FileFinder does (`~/programming/swiftUI/FileFinder`, `Browser/FunctionKeyCommand.swift`, `BrowserWindowModel.swift`, `BrowserModel.swift`, `FileSystem/FileActions.swift`).
+Branch: `feat/function-key-bar` (from `main` bb2bda4). Delivery strategy: `exception-ok` (one commit per work unit; push, PR and merge stay the user's). Test runner: `cargo test`; lint `cargo clippy -- -D warnings` (the `--all-targets` run has one pre-existing error, `type_complexity` on `testing::spotlit`); format `cargo fmt --check`. Toolchain: `export PATH="$(brew --prefix rustup)/bin:$PATH"`.
+
+## Specs
+
+- **S1** (user, verbatim): "In out other FileFinder app, when we are in two panes mode, we get a bar bellow with the F key shortcuts: [Image #2] F2, F5, F6, F7, F8, F9, F10. I want to implement this in here, only when we are in two panes mode"
+- **S2 The bar.** Only while two panes show (`ViewMode::Dual`): one row at the very bottom of the window, under the footer, the body one row shorter. Seven items in this order, spread evenly across the width, each the key in the accent colour then a space and the label in the muted colour: "F2 Rename", "F5 Copy", "F6 Move", "F7 Mkdir", "F8 Delete", "F9 New MD", "F10 New TXT" (the screenshot's labels, verbatim). An item whose command can't run now (the rules in S3) is drawn all muted. Each item is a spot for the mouse: a left click does what its key does. In every other view the window is as it is today: no bar, no row taken.
+- **S3 The keys, in two panes only** (the SwiftUI app's `canPerform`/`perform`; nothing runs while a prompt or field is open):
+  - **F2 Rename**: what F2 does today (the rename prompt), for one item. Unchanged in every view.
+  - **F5 Copy** / **F6 Move**: the active pane's selection (the marked items, else the item under the cursor) copied / moved into the other pane's folder, through the app's existing copy/move machinery: the same never-overwrite rules, the paste-conflict question (S26 of the flea-port spec: keep both / replace / skip), progress, undo. Afterwards both panes show the change, and what arrived is selected in the other pane when it lists it. With nothing selected, nothing happens. The app's clipboard (`y`/`x`/`p`) is left as it was.
+  - **F7 Mkdir**: what `N` does today (the "Folder name" prompt) in the active pane's folder.
+  - **F8 Delete**: the selection moved to the Trash, as `dd` / Move to Trash does (undoable; not a permanent delete — the SwiftUI app's `trashSelection`).
+  - **F9 New MD** / **F10 New TXT**: an empty `new.md` / `new.txt` made in the active pane's folder — the next free name when one is taken (`new 2.md`, `new 3.md`, …, the SwiftUI app's `uniqueDestination`) — selected, and the rename prompt opened on it. Undo removes it.
+  - F5 no longer refreshes anywhere: Ctrl+R is the refresh key in every view (changed by L3). Outside two panes F5–F10 do nothing; Shift+F10 keeps opening the menu everywhere.
+- **S4 Docs.** The key sheet (`?`) and the README list the bar and its keys (two panes only), and give Ctrl+R (not F5) as the refresh key.
+- **S5** (user, verbatim, L3): "remove F5 for refresh and use Ctrl+R everywhere for refresh"
+
+### Assumptions (mine; not the user's words)
+
+- **A1** ~~In two panes F5 copies, so refreshing there is Ctrl+R~~ — superseded by S5: Ctrl+R is the only refresh key everywhere.
+- **A2** F7 keeps this app's prompt-first flow (`N`) rather than the SwiftUI app's make-then-rename, since `N` already exists here; F9/F10 make the file first, then rename, as the SwiftUI app does (there is no "new file" prompt here to reuse).
+
+## Tasks
+
+- [x] **T1** S1–S5 — the bar, its keys and clicks, two panes only. Route: delegated (Writer trigger b, context backstop: the parent session is far past 150k tokens); independent verifier (Risk item 1). Commit: see L6.
+
+## Log
+
+- **L1** (2026-11-14, user, verbatim): "In out other FileFinder app, when we are in two panes mode, we get a bar bellow with the F key shortcuts: [Image #2] F2, F5, F6, F7, F8, F9, F10. I want to implement this in here, only when we are in two panes mode"
+- **L2** (2026-11-14) Read the SwiftUI app: the bar's commands and labels (`FunctionKeyCommand`), F5/F6 transfer into the other pane's folder with conflict resolution and select what landed (`transferToOtherPane`), F8 is `trashSelection`, F9/F10 make `new.md`/`new.txt` with the next free name, select and rename (`createAndRename`, `createEmptyFile`). Current keys here: F2 rename, F5 refresh, Shift+F10 menu; F6–F9 and plain F10 free. Branch `feat/function-key-bar` made from `main`.
+- **L3** (2026-11-14, user, verbatim, while T1 was being written): "remove F5 for refresh and use Ctrl+R everywhere for refresh". S3 and S4 rewritten, S5 added, A1 superseded; the writer told.
+- **L4** (2026-11-14) T1 written by one bounded writer: `src/ui/fkeys.rs` (the bar), `FnKey` and `Spot::FnKey` and `App::can_run` in `src/app.rs`; `p` and F5/F6 now share one transfer path (`send`), F5/F6 leave the clipboard alone and select what landed in the other pane; F7 `ask_new_folder`; F8 `delete_key` (the Delete key's: in the Trash it asks before deleting for good); F9/F10 `ops::new_file` (`new.md`, `new 2.md`…, undoable) then the rename prompt; F5 removed from refresh and from the places panel's keys. RED observed for 10 of 12 new tests (two guards passed from the start, by design); 43 existing F5-refresh presses switched to Ctrl+R; layout pins of the two-panes view moved one row. Writer's differential check of `y`/`x`/`p` against `bb2bda4`: identical files on disk. 505 tests.
+- **L5** (2026-11-14) Independent verifier (Risk item 1: F5/F6/F8 move and copy real files): no blockers, S1–S5 met. Probes with full before/after file trees: both panes on one folder (F5 asks; Replace and Skip change nothing; Keep both makes a copy that undo takes away; F6 refused "It is already in this folder."), a folder into itself or below it (refused "Can't put Pictures inside itself.", also after Replace), clashes with Replace (the old item to the Trash first; undo restores), Skip and Keep both over two marked items, no-op keys, undo of F6. `p` paste traced in 43 steps identical to the baseline. Advisories: labels ran together at 60 columns; F8 in the Trash asks to delete for good (the Delete key's rule); Replace onto the same item reports a skip (as the baseline). Parent turned the data-safety probes into regression tests (`fn_key_safety_tests`: one folder in both panes, never into itself, keys with nothing to do) and fixed the narrow bar: each item keeps a cell of air (RED first, `on_a_narrow_window_the_items_keep_a_cell_apart`). 509 tests; clippy clean on the app build; tmux at 140 and 60 columns.
+

@@ -157,7 +157,10 @@ mod tests {
         let width = panes(&f.app, 120).panel.end as usize;
         let lines = screen(&mut f.app, 120, 30);
         let row = |line: &String| line.chars().take(width).collect::<String>();
-        lines[2..28]
+        // The body ends over the bottom rule, a row higher in two panes,
+        // where the function key bar takes the last row.
+        let end = if f.app.shows_fn_bar() { 27 } else { 28 };
+        lines[2..end]
             .iter()
             .map(|line| row(line).trim().to_string())
             .collect()
@@ -192,7 +195,7 @@ mod tests {
         fs::write(f.home.join("Music"), "").unwrap();
         fs::create_dir(f.volumes.join("Backup")).unwrap();
         std::os::unix::fs::symlink("/", f.volumes.join("Macintosh HD")).unwrap();
-        f.app.handle_key(key(KeyCode::F(5)));
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         f
     }
 
@@ -261,12 +264,14 @@ mod tests {
             // The names in the foreground, the glyphs in their kind's colour.
             assert_eq!(drawn[(3, 4)].fg, theme::FOREGROUND);
             assert_eq!(drawn[(1, 4)].fg, theme::ICON_FOLDER);
-            // The line right of it, all the way down and into the rules.
-            for y in 2..28 {
+            // The line right of it, all the way down and into the rules; in
+            // two panes the bottom rule is a row higher, over the bar.
+            let rule = if f.app.shows_fn_bar() { 27 } else { 28 };
+            for y in 2..rule {
                 assert_eq!(drawn[(line, y)].symbol(), "│", "{view:?} {y}");
             }
             assert_eq!(drawn[(line, 1)].symbol(), "┬");
-            assert_eq!(drawn[(line, 28)].symbol(), "┴");
+            assert_eq!(drawn[(line, rule)].symbol(), "┴");
             f.app.handle_key(ctrl(KeyCode::Char('1')));
         }
     }

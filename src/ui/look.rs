@@ -224,7 +224,7 @@ fn bar(entry: &crate::model::Entry, fact: &str, width: usize) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::testing::{fixture, pictures, press, settle};
+    use crate::app::testing::{ctrl, fixture, pictures, press, settle};
     use crate::thumbs::testing::painted;
     use crate::ui::testing::{buffer, find};
     use ratatui::buffer::Buffer;
@@ -242,10 +242,8 @@ mod tests {
         let mut f = fixture();
         let lines: String = (1..=12).map(|n| format!("line {n}\n")).collect();
         fs::write(f.home.join("notes.txt"), lines).unwrap();
-        press(
-            &mut f.app,
-            &[KeyCode::F(5), KeyCode::End, KeyCode::Char(' ')],
-        );
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::End, KeyCode::Char(' ')]);
         f.app.tick();
         let drawn = buffer(&mut f.app, 120, 30);
         // The frame, from the row under the top rule to the one over the

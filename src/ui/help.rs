@@ -64,7 +64,7 @@ pub const ROWS: &[(usize, &str, &str)] = &[
     (2, "s", "Sort"),
     (2, "S", "Reverse sort"),
     (2, ": / ctrl-l", "Go to folder"),
-    (2, "ctrl-r / f5", "Reload"),
+    (2, "ctrl-r", "Reload"),
     (3, "y / ctrl-c", "Copy"),
     (3, "x / ctrl-x", "Cut"),
     (3, "p / ctrl-v", "Paste"),
@@ -76,6 +76,12 @@ pub const ROWS: &[(usize, &str, &str)] = &[
     (3, "z / ctrl-z", "Undo"),
     (3, "ctrl-shift-z / ctrl-y", "Redo"),
     (3, "ctrl-shift-n / N", "New folder"),
+    (3, "f5 (two panes)", "Copy to other pane"),
+    (3, "f6 (two panes)", "Move to other pane"),
+    (3, "f7 (two panes)", "New folder"),
+    (3, "f8 (two panes)", "Move to Trash"),
+    (3, "f9 (two panes)", "New Markdown file"),
+    (3, "f10 (two panes)", "New text file"),
     (3, "E", "Edit in $EDITOR"),
     (3, "v", "Select"),
     (3, "J / shift-down", "Extend down"),
@@ -363,6 +369,14 @@ mod tests {
             "U",
             "tab / shift-tab",
             "ctrl-b",
+            "ctrl-r",
+            "r / f2",
+            "f5 (two panes)",
+            "f6 (two panes)",
+            "f7 (two panes)",
+            "f8 (two panes)",
+            "f9 (two panes)",
+            "f10 (two panes)",
         ] {
             assert_eq!(
                 keys.iter().filter(|keys| **keys == wanted).count(),
@@ -377,6 +391,16 @@ mod tests {
             Some(&(0, "tab / shift-tab", "Cycle focus"))
         );
         assert_eq!(says("ctrl-b"), Some(&(1, "ctrl-b", "Places panel")));
+        // Ctrl+R alone reloads; F5 is the bar's Copy, in two panes.
+        assert_eq!(says("ctrl-r"), Some(&(2, "ctrl-r", "Reload")));
+        assert!(
+            keys.iter()
+                .all(|keys| !keys.contains("f5") || keys.contains("two panes"))
+        );
+        assert_eq!(
+            says("f5 (two panes)"),
+            Some(&(3, "f5 (two panes)", "Copy to other pane"))
+        );
         let words: Vec<&str> = ROWS.iter().map(|(_, _, does)| *does).collect();
         for does in [
             "Close or go back",

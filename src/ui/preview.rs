@@ -363,7 +363,7 @@ fn several(selection: &[&Entry], width: usize) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::testing::{fixture, pictures, press, settle, shift};
+    use crate::app::testing::{ctrl, fixture, pictures, press, settle, shift};
     use crate::icons;
     use crate::theme;
     use crate::thumbs::testing::painted;
@@ -421,7 +421,8 @@ mod tests {
             })
             .collect();
         fs::write(f.home.join("notes.txt"), lines).unwrap();
-        press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::End]);
         f.app.tick();
         let drawn = buffer(&mut f.app, 120, 30);
         assert!(
@@ -515,7 +516,8 @@ mod tests {
         let mut f = fixture();
         fs::write(f.home.join("main.rs"), "fn main\nlet s = \"hi\"\n").unwrap();
         f.app.highlighter = Some(Highlighter::new(Arc::new(FakeColourer::default())));
-        f.app.handle_key(crate::app::testing::key(KeyCode::F(5)));
+        f.app
+            .handle_key(crate::app::testing::ctrl(KeyCode::Char('r')));
         press(&mut f.app, &[KeyCode::Down, KeyCode::Down]);
         f.app.tick();
         assert_eq!(f.app.pane().selected().unwrap().name, "main.rs");

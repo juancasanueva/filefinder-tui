@@ -2,7 +2,7 @@
 //! exists, Home, the usual folders in it that exist, then the Trash),
 //! PINNED (the folders the user pinned that are there), TAGS (the colour tags some file carries, in Finder's order) and
 //! DEVICES (the system's own volume, iCloud Drive when it is on, then the
-//! other mounted volumes). Read on start, on F5 and when the keyboard
+//! other mounted volumes). Read on start, on Ctrl+R and when the keyboard
 //! enters the panel; never while drawing.
 
 use std::fs;

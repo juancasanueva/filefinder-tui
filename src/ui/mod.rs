@@ -1,9 +1,11 @@
 //! Drawing: the frame of a header, a rule, the body, a rule and the
-//! footer, with one function per region.
+//! footer, and in two panes the function key bar under it, with one
+//! function per region.
 
 mod card;
 mod columns;
 mod dual;
+mod fkeys;
 mod footer;
 mod grid;
 mod help;
@@ -78,15 +80,22 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
         too_small(frame, area);
         return;
     }
-    let [header, top_rule, body, bottom_rule, footer] = Layout::vertical([
+    // The function key bar under the footer while two panes show, when
+    // the body keeps a row.
+    let bar = u16::from(app.shows_fn_bar() && area.height > CHROME_ROWS + 1);
+    let [header, top_rule, body, bottom_rule, footer, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(area.height - CHROME_ROWS),
+        Constraint::Length(area.height - CHROME_ROWS - bar),
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(bar),
     ])
     .areas(area);
     topbar::draw(frame, app, header, hits);
+    if bar > 0 {
+        fkeys::draw(frame, app, keys, hits);
+    }
 
     let preview = app.shows_preview();
     let needed = places::needed(&app.places);
@@ -649,7 +658,13 @@ mod tests {
         let lines: Vec<u16> = (0..width)
             .filter(|x| drawn[(*x, 1)].symbol() == "┬")
             .collect();
-        for y in [1, drawn.area.height - 2] {
+        // The bottom rule: over the footer, or in two panes over the footer
+        // and the function key bar.
+        let bottom = (2..drawn.area.height)
+            .rev()
+            .find(|y| (0..width).any(|x| drawn[(x, *y)].symbol() == "┴"))
+            .expect("the bottom rule");
+        for y in [1, bottom] {
             for x in 0..width {
                 let wanted = if (from..=to).contains(&x) {
                     theme::ACCENT
@@ -665,7 +680,7 @@ mod tests {
             } else {
                 theme::BORDER
             };
-            for y in 2..drawn.area.height - 2 {
+            for y in 2..bottom {
                 assert_eq!(drawn[(x, y)].fg, wanted, "{label}: line {x}, {y}");
             }
         }
@@ -852,7 +867,8 @@ mod tests {
             "",
         )
         .unwrap();
-        press(&mut f.app, &[KeyCode::Esc, KeyCode::F(5)]);
+        press(&mut f.app, &[KeyCode::Esc]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         let cut = buffer(&mut f.app, 120, 30);
         let (ellipsis, y) = find(&cut, "… ", files.clone()).expect("the cut name");
         assert_eq!(y, 5);
@@ -877,7 +893,7 @@ mod tests {
             fs::Permissions::from_mode(0o000),
         )
         .unwrap();
-        press(&mut f.app, &[KeyCode::F(5)]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         // Trip, a.jpg, link, run.sh, secret.txt.
         let drawn = buffer(&mut f.app, 120, 30);
         let files = panes(&f.app, 120).files;
@@ -916,7 +932,7 @@ mod tests {
     fn without_colour_the_cursor_row_is_reverse_video_and_marked_rows_are_underlined() {
         let mut f = in_pictures();
         fs::write(f.home.join("Pictures").join("b.jpg"), "b").unwrap();
-        press(&mut f.app, &[KeyCode::F(5)]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         f.app.handle_key(shift(KeyCode::Down));
         f.app.depth = Depth::Mono;
         let drawn = buffer(&mut f.app, 120, 30);
@@ -1057,7 +1073,8 @@ mod tests {
 
         // Several selected: how many of how many, and their size.
         fs::write(f.home.join("Pictures").join("b.jpg"), "four").unwrap();
-        press(&mut f.app, &[KeyCode::F(5), KeyCode::Down]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::Down]);
         f.app.handle_key(shift(KeyCode::Down));
         let drawn = buffer(&mut f.app, 120, 30);
         assert_eq!(find(&drawn, "2 of 3 selected · 7 B", 0..120), Some((1, 29)));
@@ -1498,18 +1515,20 @@ mod tests {
         let div = start + dual::divider(files.end - start);
         // Each pane's columns: its edge, its glyph and its names three in.
         let (left_edge, right_edge) = (start, div + 1);
-        for y in 2..28 {
+        // The body ends a row higher than in one pane: the function key
+        // bar takes the bottom row, under the footer.
+        for y in 2..27 {
             assert_eq!(right[(div, y)].symbol(), "│", "row {y}");
             // The right pane has the keyboard: the line left of it is lit.
             assert_eq!(right[(div, y)].fg, theme::ACCENT);
         }
         assert_eq!(
-            (right[(div, 1)].symbol(), right[(div, 28)].symbol()),
+            (right[(div, 1)].symbol(), right[(div, 27)].symbol()),
             ("┬", "┴")
         );
         for x in (0..120).filter(|x| *x != line && *x != div) {
             assert_eq!(
-                (right[(x, 1)].symbol(), right[(x, 28)].symbol()),
+                (right[(x, 1)].symbol(), right[(x, 27)].symbol()),
                 ("─", "─")
             );
         }

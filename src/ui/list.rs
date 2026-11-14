@@ -615,7 +615,7 @@ pub fn notice(frame: &mut Frame, area: Rect, glyph: &str, text: &str, style: Sty
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::testing::{ctrl, key, pictures_through, settle};
+    use crate::app::testing::{ctrl, pictures_through, settle};
     use crate::ui::testing::{buffer, find, panes};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
@@ -639,7 +639,7 @@ mod tests {
         for view in ['1', '2'] {
             let (mut f, _thumbnailer) = pictures_through(ProtocolType::Kitty);
             fs::write(f.home.join("Safari.app"), "x").unwrap();
-            f.app.handle_key(key(KeyCode::F(5)));
+            f.app.handle_key(ctrl(KeyCode::Char('r')));
             f.app.handle_key(ctrl(KeyCode::Char(view)));
             let columns = panes(&f.app, 120).files;
             // Until the icon is ready, the glyph shows.
@@ -664,7 +664,7 @@ mod tests {
         // two cells of them make no icon.
         let (mut f, _thumbnailer) = pictures_through(ProtocolType::Halfblocks);
         fs::write(f.home.join("Safari.app"), "x").unwrap();
-        f.app.handle_key(key(KeyCode::F(5)));
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         buffer(&mut f.app, 120, 30);
         settle(&mut f.app);
         let drawn = buffer(&mut f.app, 120, 30);
@@ -705,7 +705,7 @@ mod tests {
         let path = f.home.join("report.pdf");
         fs::write(&path, vec![0u8; 2048]).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-        f.app.handle_key(key(KeyCode::F(5)));
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         let user = model::owner(entry(&f.home, "report.pdf").uid);
         let drawn = buffer(&mut f.app, 200, 30);
         let files = panes(&f.app, 200).files;
@@ -799,7 +799,7 @@ mod tests {
         let locked = f.home.join("locked.txt");
         fs::write(&locked, "x").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        f.app.handle_key(key(KeyCode::F(5)));
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         let report = entry(&f.home, "report.pdf");
         let user = model::owner(report.uid);
         let drawn = buffer(&mut f.app, 200, 30);
@@ -985,12 +985,13 @@ mod tests {
 
     #[test]
     fn tags_show_in_the_list_the_columns_the_grid_and_the_preview_head() {
-        use crate::app::testing::{ctrl, fixture, key, press};
+        use crate::app::testing::{ctrl, fixture, press};
         use crate::ui::testing::{buffer, find};
         use ratatui::crossterm::event::KeyCode;
         let mut f = fixture();
         tag(&f.home.join("notes.txt"), &["Green\n2"]);
-        press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::End]);
         let green = theme::TAGS[3];
         let after = |drawn: &ratatui::buffer::Buffer, at: (u16, u16)| {
             let cell = &drawn[(at.0 + "notes.txt".len() as u16 + 1, at.1)];
@@ -1011,7 +1012,7 @@ mod tests {
         assert_eq!(after(&drawn, listed), square);
         // The grid's caption.
         f.app.handle_key(ctrl(KeyCode::Char('3')));
-        f.app.handle_key(key(KeyCode::F(5)));
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
         let drawn = buffer(&mut f.app, 120, 30);
         let caption = find(&drawn, "notes.txt", 0..80).expect("the caption");
         assert_eq!(after(&drawn, caption), square);

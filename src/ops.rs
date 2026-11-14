@@ -53,6 +53,8 @@ pub enum Kind {
     Duplicate,
     Rename,
     NewFolder,
+    /// An empty file made under a free name: F9 and F10.
+    NewFile,
     Trash,
     Compress,
     Restore,
@@ -1178,6 +1180,34 @@ pub fn new_folder(folder: &Path, name: &str) -> Result<Option<Change>, Error> {
         }
         Err(error) => Err(Error(format!("Couldn't create {name}{}", because(&error)))),
     }
+}
+
+/// Makes an empty file in a folder under the first free name of
+/// `stem.extension`, `stem 2.extension`, `stem 3.extension` and so on.
+/// Nothing is written over: a name taken, even by a link, is passed by.
+pub fn new_file(folder: &Path, stem: &str, extension: &str) -> Result<Change, Error> {
+    for n in 1..TRIES {
+        let name = match n {
+            1 => format!("{stem}.{extension}"),
+            n => format!("{stem} {n}.{extension}"),
+        };
+        let at = folder.join(&name);
+        match OpenOptions::new().write(true).create_new(true).open(&at) {
+            Ok(_) => {
+                return Ok(Change {
+                    kind: Kind::NewFile,
+                    steps: vec![Step::Created { at, parked: None }],
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error(format!("Couldn't create {name}{}", because(&error))));
+            }
+        }
+    }
+    Err(Error(format!(
+        "Couldn't create {stem}.{extension}: every name for it is taken."
+    )))
 }
 
 fn check_name(name: &str) -> Result<(), Error> {

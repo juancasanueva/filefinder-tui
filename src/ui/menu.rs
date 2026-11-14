@@ -363,7 +363,8 @@ mod tests {
         for n in 10..50 {
             fs::write(f.home.join(format!("{n}.txt")), "").unwrap();
         }
-        press(&mut f.app, &[KeyCode::F(5), KeyCode::End]);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        press(&mut f.app, &[KeyCode::End]);
         f.app.handle_key(key(KeyCode::Char('m')));
         let drawn = buffer(&mut f.app, 120, 40);
         let files = panes(&f.app, 120).files;
