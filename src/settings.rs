@@ -194,7 +194,7 @@ pub fn rows(app: &App, section: Section) -> Vec<Row> {
                 value: Value::Choice(app.detail.label()),
                 caption: Some("columns view"),
             },
-            Row::Heading("COLUMNS"),
+            Row::Heading("LIST VIEW COLUMNS"),
             column(app, 0),
             column(app, 1),
             column(app, 2),
@@ -452,7 +452,7 @@ mod tests {
         let view = rows(&app, Section::View);
         let at = view
             .iter()
-            .position(|row| *row == Row::Heading("COLUMNS"))
+            .position(|row| *row == Row::Heading("LIST VIEW COLUMNS"))
             .unwrap();
         assert!(matches!(
             view[at - 1],

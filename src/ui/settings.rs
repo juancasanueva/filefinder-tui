@@ -372,7 +372,7 @@ mod tests {
         let (_, view) = find_in(&drawn, &f.app, "VIEW").unwrap();
         let (_, detail) = find_in(&drawn, &f.app, "Detail column").unwrap();
         // The section after the view's rows is the columns'.
-        let (sx, sorting) = find_in(&drawn, &f.app, "COLUMNS").unwrap();
+        let (sx, sorting) = find_in(&drawn, &f.app, "LIST VIEW COLUMNS").unwrap();
         // None above the first heading: it is the first row of the body.
         assert_eq!(
             view,
