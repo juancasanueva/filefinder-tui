@@ -30,7 +30,12 @@ pub enum ViewMode {
     Grid,
     List,
     Columns,
+    /// Two lists side by side: Ctrl+4.
+    Dual,
 }
+
+/// The most tabs there can be: `1` to `9` reach each of them.
+pub const MOST_TABS: usize = 9;
 
 /// How big the grid's tiles are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,6 +324,8 @@ pub enum Spot {
     Crumb { pane: usize, path: PathBuf },
     /// The search field, `/`.
     SearchField,
+    /// A tab's label in the header's strip, by its place among the tabs.
+    Tab(usize),
     /// A row of the parent folder's listing, left of the list.
     Parent(usize),
     /// The preview pane.
@@ -742,6 +749,42 @@ impl Pane {
     }
 }
 
+/// One tab: a whole way of browsing, with its view and its pane or two,
+/// each with its folder, history, cursor, marks and listing.
+pub struct Tab {
+    pub panes: Vec<Pane>,
+    /// The pane that has the keyboard.
+    pub active: usize,
+    pub view: ViewMode,
+    /// The view two panes were opened from, where Ctrl+4 returns.
+    before: ViewMode,
+}
+
+impl Tab {
+    fn new(cwd: PathBuf, view: ViewMode) -> Self {
+        Self {
+            panes: vec![Pane::new(cwd, Vec::new())],
+            active: 0,
+            view,
+            before: view,
+        }
+    }
+
+    /// The view with one pane: the view itself, or the one two panes were
+    /// opened from.
+    pub fn single_view(&self) -> ViewMode {
+        match self.view {
+            ViewMode::Dual => self.before,
+            view => view,
+        }
+    }
+
+    /// The pane that has the keyboard.
+    pub fn pane(&self) -> &Pane {
+        &self.panes[self.active]
+    }
+}
+
 pub struct Config {
     pub home: PathBuf,
     /// A folder to open, or a file to select in its folder.
@@ -760,10 +803,11 @@ pub struct Config {
 
 pub struct App {
     pub home: PathBuf,
-    pub panes: Vec<Pane>,
-    pub active: usize,
+    /// The tabs, in the order the strip shows them; never none.
+    pub tabs: Vec<Tab>,
+    /// Which of them is showing.
+    pub current: usize,
     pub focus: Focus,
-    pub view: ViewMode,
     pub tile: TileSize,
     pub sort: SortMode,
     /// What the list's right-hand column shows: `I`.
@@ -840,11 +884,10 @@ impl App {
             .map(state::load_trashed)
             .unwrap_or_default();
         let mut app = Self {
-            panes: vec![Pane::new(config.home.clone(), Vec::new())],
+            tabs: vec![Tab::new(config.home.clone(), saved.view)],
+            current: 0,
             home: config.home,
-            active: 0,
             focus: Focus::List,
-            view: saved.view,
             tile: saved.tile,
             sort: saved.sort,
             detail: saved.detail,
@@ -906,12 +949,37 @@ impl App {
         app
     }
 
+    /// The tab that is showing: what every key and click acts on.
+    pub fn tab(&self) -> &Tab {
+        &self.tabs[self.current]
+    }
+
+    pub fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.current]
+    }
+
+    /// The panes of the tab that is showing.
+    pub fn panes(&self) -> &[Pane] {
+        &self.tab().panes
+    }
+
+    /// Which of them has the keyboard.
+    pub fn active(&self) -> usize {
+        self.tab().active
+    }
+
+    /// The view of the tab that is showing.
+    pub fn view(&self) -> ViewMode {
+        self.tab().view
+    }
+
     pub fn pane(&self) -> &Pane {
-        &self.panes[self.active]
+        self.tab().pane()
     }
 
     fn pane_mut(&mut self) -> &mut Pane {
-        &mut self.panes[self.active]
+        let tab = self.tab_mut();
+        &mut tab.panes[tab.active]
     }
 
     pub fn selected(&self) -> Option<&Entry> {
@@ -923,10 +991,10 @@ impl App {
         self.work.as_ref().map(|work| work.label.as_str())
     }
 
-    /// Whether the list view shows the parent folder and the preview beside
-    /// a single pane.
+    /// Whether the preview pane shows: beside a single pane in every view,
+    /// never beside two.
     pub fn shows_preview(&self) -> bool {
-        self.preview_visible && self.view == ViewMode::List && self.panes.len() == 1
+        self.preview_visible && self.view() != ViewMode::Dual
     }
 
     /// The volume the active pane's folder is on, as `tick` last asked.
@@ -943,14 +1011,15 @@ impl App {
     pub fn tick(&mut self) {
         let now = (self.clock)();
         self.collect_work();
-        for pane in &mut self.panes {
+        // A search goes on in a tab that isn't showing.
+        for pane in self.tabs.iter_mut().flat_map(|tab| &mut tab.panes) {
             pane.collect_found();
         }
         if let Some(thumbs) = &mut self.thumbs {
             thumbs.collect();
         }
         let (hidden, sort) = (self.show_hidden, self.sort);
-        let selected = self.panes[self.active].selected();
+        let selected = self.tabs[self.current].pane().selected();
         let current = match (&self.facts, selected) {
             (Some(facts), Some(entry)) => facts.describes(entry, hidden, sort),
             (None, None) => true,
@@ -1071,7 +1140,7 @@ impl App {
             _ => (None, false),
         };
         let ctrl_shift = ctrl && (capital || shift);
-        let grid = self.view == ViewMode::Grid;
+        let grid = self.view() == ViewMode::Grid;
         match key.code {
             // Changing files.
             KeyCode::Char('d') if plain => self.trash_key(armed),
@@ -1159,8 +1228,17 @@ impl App {
             KeyCode::Char('1') if alt => self.toggle_split(),
             KeyCode::Char('+') if plain => self.set_tile(self.tile.bigger()),
             KeyCode::Char('-') if plain => self.set_tile(self.tile.smaller()),
-            // Closing the last tab quits; there is one tab.
-            KeyCode::Char('w') if plain || ctrl => self.quit(),
+            // Tabs. Digits are never counts.
+            KeyCode::Char('t') if plain => self.new_tab(),
+            KeyCode::Char('O') if plain => self.open_in_new_tab(),
+            KeyCode::Char('w') if plain || ctrl => self.close_tab(),
+            KeyCode::Char(']') if plain => self.step_tab(1),
+            KeyCode::Char('[') if plain => self.step_tab(-1),
+            KeyCode::Char('}') if plain => self.move_tab(1),
+            KeyCode::Char('{') if plain => self.move_tab(-1),
+            KeyCode::Char(digit @ '1'..='9') if plain => {
+                self.go_to_tab(digit as usize - '1' as usize)
+            }
             KeyCode::Char('q' | 'Q') if plain => self.quit(),
             _ => {}
         }
@@ -1182,7 +1260,7 @@ impl App {
         };
         // As with a key, the user takes over from a search that was asked
         // to put the cursor somewhere.
-        for pane in &mut self.panes {
+        for pane in &mut self.tab_mut().panes {
             pane.want(Vec::new());
         }
         match (mouse.kind, down) {
@@ -1231,9 +1309,11 @@ impl App {
             (true, Spot::Parent(index)) => self.open_parent_row(index),
             (true, Spot::Preview) => self.focus_preview(),
             (true, Spot::Crumb { pane, path }) => {
-                self.active = pane.min(self.panes.len() - 1);
+                let tab = self.tab_mut();
+                tab.active = pane.min(tab.panes.len() - 1);
                 self.navigate(&path);
             }
+            (true, Spot::Tab(index)) => self.switch_tab(index),
             (true, Spot::SearchField) => self.search(),
             (false, Spot::Item { pane, index }) => {
                 self.enter_pane(pane);
@@ -1297,7 +1377,8 @@ impl App {
     /// The keyboard goes to a pane's files.
     fn enter_pane(&mut self, pane: usize) {
         self.focus = Focus::List;
-        self.active = pane.min(self.panes.len() - 1);
+        let tab = self.tab_mut();
+        tab.active = pane.min(tab.panes.len() - 1);
     }
 
     /// The keyboard goes to the preview pane, when it shows.
@@ -1310,7 +1391,7 @@ impl App {
     /// A click on a row of the parent folder's listing: goes into the
     /// folder it is, or to the parent folder with the file selected.
     fn open_parent_row(&mut self, index: usize) {
-        self.enter_pane(self.active);
+        self.enter_pane(self.active());
         let Some(entry) = self.pane().parent.get(index) else {
             return;
         };
@@ -1342,14 +1423,14 @@ impl App {
         pane.point_at(index);
         pane.collapse();
         let again = |click: &Click| {
-            click.pane == self.active
+            click.pane == self.active()
                 && click.path == path
                 && now.saturating_duration_since(click.at) <= DOUBLE_CLICK
         };
         if last.as_ref().is_some_and(again) {
             self.open_selected();
         } else {
-            let pane = self.active;
+            let pane = self.active();
             self.last_click = Some(Click {
                 pane,
                 path,
@@ -1362,7 +1443,10 @@ impl App {
     /// view: goes to that folder with the row selected. False when it couldn't.
     fn click_above(&mut self, pane: usize, depth: usize, index: usize) -> bool {
         let now = (self.clock)();
-        let above = self.panes.get(pane).and_then(|it| it.ancestors.get(depth));
+        let above = self
+            .panes()
+            .get(pane)
+            .and_then(|it| it.ancestors.get(depth));
         let Some(entry) = above.and_then(|above| above.entries.get(index)) else {
             return false;
         };
@@ -1373,7 +1457,7 @@ impl App {
         self.enter_pane(pane);
         let arrived = self.go_to(&folder, Some(&name));
         if arrived {
-            let pane = self.active;
+            let pane = self.active();
             self.last_click = Some(Click {
                 pane,
                 path,
@@ -1400,8 +1484,8 @@ impl App {
         }
         match spot {
             Some(Spot::Item { pane, .. } | Spot::Above { pane, .. } | Spot::Pane(pane)) => {
-                let grid = self.view == ViewMode::Grid;
-                let Some(pane) = self.panes.get_mut(pane) else {
+                let grid = self.view() == ViewMode::Grid;
+                let Some(pane) = self.tab_mut().panes.get_mut(pane) else {
                     return;
                 };
                 if grid {
@@ -2445,57 +2529,183 @@ impl App {
             let wanted = paths.iter().cloned().chain(selected).chain(neighbour);
             self.pane_mut().want(wanted.collect());
         }
-        for index in 0..self.panes.len() {
-            // The files used lately and what a search found are not asked
-            // for again on another pane's account.
-            if index != self.active && self.panes[index].is_folder() {
-                let was = self.panes[index].position();
-                if self.in_pane(index, Self::reload) {
-                    self.panes[index].put_back(was);
-                }
+        let active = self.active();
+        for index in 0..self.panes().len() {
+            if index != active {
+                self.relist_pane(index);
+            }
+        }
+    }
+
+    /// Lists another pane's folder again behind its back and puts it back
+    /// where it was. The files used lately and what a search found are not
+    /// asked for again on another pane's account.
+    fn relist_pane(&mut self, index: usize) {
+        if self.panes()[index].is_folder() {
+            let was = self.panes()[index].position();
+            if self.in_pane(index, Self::reload) {
+                self.tab_mut().panes[index].put_back(was);
             }
         }
     }
 
     /// Does to a pane what is written for the active one.
     fn in_pane<T>(&mut self, index: usize, act: impl FnOnce(&mut Self) -> T) -> T {
-        let active = std::mem::replace(&mut self.active, index);
+        let active = std::mem::replace(&mut self.tab_mut().active, index);
         let done = act(self);
-        self.active = active;
+        self.tab_mut().active = active;
         done
     }
 
     /// Lists what every pane shows again: the sort order and the hidden
-    /// files are the same in all of them.
+    /// files are the same in all of them. Other tabs catch up when they
+    /// show again.
     fn reload_all(&mut self) {
-        for index in 0..self.panes.len() {
+        for index in 0..self.panes().len() {
             self.in_pane(index, Self::reload);
         }
     }
 
-    /// A second pane on the right, in the folder of the first,
-    /// with the keyboard. Two are as many as there are.
+    /// `t`: a new tab after the others, in the folder showing, in the view
+    /// showing.
+    fn new_tab(&mut self) {
+        let folder = self.pane().cwd.clone();
+        self.open_tab(folder);
+    }
+
+    /// `O`: the folder under the cursor in a new tab.
+    fn open_in_new_tab(&mut self) {
+        if self.tabs_full() {
+            return;
+        }
+        match self.selected().filter(|entry| entry.is_dir) {
+            Some(entry) => {
+                let folder = entry.path.clone();
+                self.open_tab(folder);
+            }
+            None => self.note("Only a folder opens in a new tab"),
+        }
+    }
+
+    /// Says so when there is no room for another tab.
+    fn tabs_full(&mut self) -> bool {
+        let full = self.tabs.len() >= MOST_TABS;
+        if full {
+            self.note("Nine tabs is the most");
+        }
+        full
+    }
+
+    /// Opens a folder in a new tab at the end of the strip and shows it.
+    fn open_tab(&mut self, folder: PathBuf) {
+        if self.tabs_full() {
+            return;
+        }
+        let was = self.current;
+        let view = self.tab().single_view();
+        self.tabs.push(Tab::new(folder.clone(), view));
+        self.current = self.tabs.len() - 1;
+        if self.show_folder(&folder, None) {
+            self.focus = Focus::List;
+            self.last_click = None;
+        } else {
+            // Why was said; a tab with nothing to show is no use.
+            self.tabs.pop();
+            self.current = was;
+        }
+    }
+
+    /// Shows another tab, its folders read again, since what changed while
+    /// it wasn't showing may be in them.
+    pub fn switch_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() || index == self.current {
+            return;
+        }
+        self.current = index;
+        self.arrive();
+    }
+
+    /// A tab is showing again: the keyboard in its list and its folders
+    /// read again, each where it was.
+    fn arrive(&mut self) {
+        self.focus = Focus::List;
+        self.last_click = None;
+        for index in 0..self.panes().len() {
+            self.relist_pane(index);
+        }
+    }
+
+    /// `w` and Ctrl+W: closes the tab showing, and the tab that takes its
+    /// place shows. Closing the last tab quits.
+    fn close_tab(&mut self) {
+        if self.tabs.len() == 1 {
+            return self.quit();
+        }
+        self.tabs.remove(self.current);
+        self.current = self.current.min(self.tabs.len() - 1);
+        self.arrive();
+    }
+
+    /// `]` and `[`: the next or the previous tab, round from the last to
+    /// the first and back.
+    fn step_tab(&mut self, delta: isize) {
+        let count = self.tabs.len() as isize;
+        let index = (self.current as isize + delta).rem_euclid(count);
+        self.switch_tab(index as usize);
+    }
+
+    /// `}` and `{`: moves the tab showing one place right or left, as far
+    /// as the ends. It stays the one showing.
+    fn move_tab(&mut self, delta: isize) {
+        let last = self.tabs.len() as isize - 1;
+        let to = (self.current as isize + delta).clamp(0, last) as usize;
+        if to != self.current {
+            let tab = self.tabs.remove(self.current);
+            self.tabs.insert(to, tab);
+            self.current = to;
+        }
+    }
+
+    /// `1` to `9`: the tab with that number.
+    fn go_to_tab(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.switch_tab(index);
+        } else {
+            self.note(&format!("No tab {}", index + 1));
+        }
+    }
+
+    /// A second pane on the right, in the folder of the first, with the
+    /// keyboard: the two-pane view. Two are as many as there are.
     fn split(&mut self) {
-        if self.panes.len() > 1 {
+        if self.panes().len() > 1 {
             return;
         }
         let folder = self.pane().cwd.clone();
-        self.panes.push(Pane::new(folder.clone(), Vec::new()));
+        let tab = self.tab_mut();
+        tab.before = tab.view;
+        tab.view = ViewMode::Dual;
+        tab.panes.push(Pane::new(folder.clone(), Vec::new()));
         let shown = self.in_pane(1, |app| app.show_folder(&folder, None));
         if shown {
-            self.active = 1;
+            self.tab_mut().active = 1;
             self.focus = Focus::List;
+            // The parent's column and the folders above go with one pane.
+            self.in_pane(0, Self::refresh_ancestors);
         } else {
             // Why was said; a pane with nothing to show is no use.
-            self.panes.pop();
+            let tab = self.tab_mut();
+            tab.panes.pop();
+            tab.view = tab.before;
         }
     }
 
     /// Ctrl+4, `|` and Alt+1: two panes, or back to one pane in the view
-    /// that was showing.
+    /// they were opened from.
     fn toggle_split(&mut self) {
-        if self.panes.len() > 1 {
-            self.close_split();
+        if self.view() == ViewMode::Dual {
+            let before = self.tab().before;
+            self.set_view(before);
         } else {
             self.split();
         }
@@ -2503,9 +2713,11 @@ impl App {
 
     /// Closes the right pane. The left one has the keyboard from then on.
     fn close_split(&mut self) {
-        if self.panes.len() > 1 {
-            self.panes.truncate(1);
-            self.active = 0;
+        let tab = self.tab_mut();
+        if tab.panes.len() > 1 {
+            tab.panes.truncate(1);
+            tab.active = 0;
+            tab.view = tab.before;
             self.focus = Focus::List;
         }
     }
@@ -2559,7 +2771,7 @@ impl App {
 
     /// `j` and `k`, Down and Up: one item further, or in the grid one row.
     fn step(&mut self, delta: isize) {
-        let grid = self.view == ViewMode::Grid;
+        let grid = self.view() == ViewMode::Grid;
         let pane = self.pane_mut();
         if grid {
             let columns = pane.grid_columns.max(1);
@@ -2576,7 +2788,7 @@ impl App {
 
     /// Ctrl+D and Ctrl+U, Page Down and Page Up: a screenful further.
     fn page(&mut self, pages: isize) {
-        let grid = self.view == ViewMode::Grid;
+        let grid = self.view() == ViewMode::Grid;
         let pane = self.pane();
         let columns = if grid { pane.grid_columns.max(1) } else { 1 };
         let page = (pane.page_rows.max(1) * columns) as isize;
@@ -2592,7 +2804,7 @@ impl App {
     /// Shift+Down and Shift+Up: one further, or in the grid one row,
     /// marking the way.
     fn extend_row(&mut self, down: bool) {
-        let grid = self.view == ViewMode::Grid;
+        let grid = self.view() == ViewMode::Grid;
         let pane = self.pane_mut();
         let columns = pane.grid_columns.max(1);
         pane.extend(|pane| {
@@ -2638,19 +2850,21 @@ impl App {
 
     /// Tab and Shift+Tab: each pane in turn, then the preview when it shows.
     fn move_focus(&mut self, delta: isize) {
-        let mut stops: Vec<(Focus, Option<usize>)> = (0..self.panes.len())
+        let mut stops: Vec<(Focus, Option<usize>)> = (0..self.panes().len())
             .map(|pane| (Focus::List, Some(pane)))
             .collect();
         if self.shows_preview() {
             stops.push((Focus::Preview, None));
         }
         let here = |(focus, pane): &(Focus, Option<usize>)| {
-            *focus == self.focus && pane.is_none_or(|pane| pane == self.active)
+            *focus == self.focus && pane.is_none_or(|pane| pane == self.active())
         };
         let index = stops.iter().position(here).unwrap_or(0) as isize;
         let (focus, pane) = stops[(index + delta).rem_euclid(stops.len() as isize) as usize];
         self.focus = focus;
-        self.active = pane.unwrap_or(self.active);
+        if let Some(pane) = pane {
+            self.tab_mut().active = pane;
+        }
     }
 
     fn open_selected(&mut self) {
@@ -2740,9 +2954,11 @@ impl App {
         }
     }
 
+    /// Ctrl+1, Ctrl+2 and Ctrl+3: the tab's view, with one pane.
     fn set_view(&mut self, view: ViewMode) {
-        self.view = view;
-        for index in 0..self.panes.len() {
+        self.close_split();
+        self.tab_mut().view = view;
+        for index in 0..self.panes().len() {
             self.in_pane(index, Self::refresh_ancestors);
         }
         self.remember();
@@ -2758,7 +2974,7 @@ impl App {
     fn remember(&self) {
         if let Some(dir) = &self.state_dir {
             let saved = Saved {
-                view: self.view,
+                view: self.tab().single_view(),
                 tile: self.tile,
                 preview: self.preview_visible,
                 sort: self.sort,
@@ -2842,14 +3058,14 @@ impl App {
     /// them: the columns view all of them, the list view the parent. What
     /// a search found is a column on its own.
     fn refresh_ancestors(&mut self) {
-        let ancestors = if self.view == ViewMode::Columns && self.pane().results().is_none() {
+        let ancestors = if self.view() == ViewMode::Columns && self.pane().results().is_none() {
             self.list_ancestors(&self.pane().cwd)
         } else {
             Vec::new()
         };
         let parent = match self.pane().cwd.parent() {
             // A folder that can't be read leaves the column empty.
-            Some(parent) if self.view == ViewMode::List => {
+            Some(parent) if self.view() == ViewMode::List => {
                 model::list_dir(parent, self.show_hidden, self.sort).unwrap_or_default()
             }
             _ => Vec::new(),
@@ -3217,7 +3433,7 @@ pub mod testing {
         };
         let mut app = App::new(config, Box::new(system.clone()));
         // The tests written against the list keep it; the others switch with Ctrl+1 or Ctrl+3.
-        app.view = ViewMode::List;
+        app.tab_mut().view = ViewMode::List;
         Fixture {
             app,
             system,
@@ -3249,6 +3465,8 @@ pub mod testing {
             fs::write(f.home.join(format!("{name}.txt")), name).unwrap();
         }
         f.app.handle_key(ctrl(KeyCode::Char('3')));
+        // The preview hidden: the grid takes the whole body.
+        f.app.handle_key(alt(KeyCode::Char('p')));
         f.app.handle_key(key(KeyCode::F(5)));
         // The body of a window 62 across and 26 down is 62 by 22.
         crate::ui::testing::screen(&mut f.app, 62, 26);
@@ -3466,14 +3684,25 @@ mod tests {
         // Escape gives it back to the list.
         press(&mut f.app, &[KeyCode::Esc]);
         assert_eq!(f.app.focus, Focus::List);
-        // Without the preview, or in another view, Tab stays in the list.
+        // Without the preview Tab stays in the list.
         f.app.handle_key(alt(KeyCode::Char('p')));
         press(&mut f.app, &[KeyCode::Tab]);
         assert_eq!(f.app.focus, Focus::List);
+        // The columns and the grid show the preview too.
         f.app.handle_key(alt(KeyCode::Char('p')));
-        f.app.handle_key(ctrl(KeyCode::Char('2')));
-        press(&mut f.app, &[KeyCode::Tab]);
-        assert_eq!(f.app.focus, Focus::List);
+        for view in ['2', '3'] {
+            f.app.handle_key(ctrl(KeyCode::Char(view)));
+            press(&mut f.app, &[KeyCode::Tab]);
+            assert_eq!(f.app.focus, Focus::Preview, "view {view}");
+            press(&mut f.app, &[KeyCode::Tab]);
+            assert_eq!(f.app.focus, Focus::List, "view {view}");
+        }
+        // Two panes have no preview: Tab goes from one list to the other.
+        f.app.handle_key(ctrl(KeyCode::Char('4')));
+        for active in [0, 1, 0] {
+            press(&mut f.app, &[KeyCode::Tab]);
+            assert_eq!((f.app.focus, f.app.active()), (Focus::List, active));
+        }
     }
 
     #[test]
@@ -3705,29 +3934,29 @@ mod tests {
         let f = fixture();
         let state = tempfile::tempdir().unwrap();
         let mut app = launch(&f.home, Some(state.path()));
-        assert_eq!(app.view, ViewMode::List);
+        assert_eq!(app.view(), ViewMode::List);
         assert!(
             !state.path().join("state").exists(),
             "nothing is written until something changes"
         );
 
         app.handle_key(ctrl(KeyCode::Char('2')));
-        assert_eq!(app.view, ViewMode::Columns);
+        assert_eq!(app.view(), ViewMode::Columns);
         assert_eq!(
-            launch(&f.home, Some(state.path())).view,
+            launch(&f.home, Some(state.path())).view(),
             ViewMode::Columns,
             "the next launch opens in the same view"
         );
         app.handle_key(ctrl(KeyCode::Char('1')));
-        assert_eq!(app.view, ViewMode::List);
+        assert_eq!(app.view(), ViewMode::List);
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
             "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\n"
         );
         app.handle_key(ctrl(KeyCode::Char('3')));
-        assert_eq!(app.view, ViewMode::Grid);
-        assert_eq!(launch(&f.home, Some(state.path())).view, ViewMode::Grid);
+        assert_eq!(app.view(), ViewMode::Grid);
+        assert_eq!(launch(&f.home, Some(state.path())).view(), ViewMode::Grid);
     }
 
     #[test]
@@ -4936,7 +5165,7 @@ mod tests {
             assert_eq!(path_field(&f.app).0, "qsS/? ", "{other:?}");
         }
         assert!(!f.app.should_quit && !f.app.help_visible && f.app.dialog.is_none());
-        let (sort, view, hidden) = (f.app.sort, f.app.view, f.app.show_hidden);
+        let (sort, view, hidden) = (f.app.sort, f.app.view(), f.app.show_hidden);
         assert_eq!(
             (sort, view, hidden),
             (SortMode::Name, ViewMode::List, false)
@@ -5180,7 +5409,7 @@ mod tests {
             assert!(typing_a_search(&f.app), "{other:?}");
         }
         assert!(!f.app.should_quit && !f.app.help_visible && f.app.dialog.is_none());
-        let (sort, view, hidden) = (f.app.sort, f.app.view, f.app.show_hidden);
+        let (sort, view, hidden) = (f.app.sort, f.app.view(), f.app.show_hidden);
         assert_eq!(
             (sort, view, hidden),
             (SortMode::Name, ViewMode::List, false)
@@ -5254,18 +5483,20 @@ mod tests {
     }
 
     fn pane_names(app: &App, pane: usize) -> Vec<&str> {
-        let entries = app.panes[pane].entries.iter();
+        let entries = app.panes()[pane].entries.iter();
         entries.map(|entry| entry.name.as_str()).collect()
     }
 
     /// The name of the item a pane's cursor is on.
     fn under_cursor(app: &App, pane: usize) -> Option<&str> {
-        app.panes[pane].selected().map(|entry| entry.name.as_str())
+        app.panes()[pane]
+            .selected()
+            .map(|entry| entry.name.as_str())
     }
 
     /// Where the keyboard is: the region, and the pane that is the active one.
     fn keyboard(app: &App) -> (Focus, usize) {
-        (app.focus, app.active)
+        (app.focus, app.active())
     }
 
     #[test]
@@ -5275,25 +5506,25 @@ mod tests {
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
 
         press(&mut f.app, &[KeyCode::Char('|')]);
-        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(f.app.panes().len(), 2);
         assert_eq!(keyboard(&f.app), (Focus::List, 1));
         assert_eq!(f.app.pane().cwd, pictures);
 
         // Pressed again it closes the right pane, as Ctrl+W does.
         press(&mut f.app, &[KeyCode::Char('|')]);
-        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(f.app.panes().len(), 1);
         assert_eq!(keyboard(&f.app), (Focus::List, 0));
 
         // Some terminals send the bar with Shift held, since it takes Shift to type.
         f.app
             .handle_key(KeyEvent::new(KeyCode::Char('|'), KeyModifiers::SHIFT));
-        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(f.app.panes().len(), 2);
 
         // In a prompt it is just a character.
         press(&mut f.app, &[KeyCode::Char('|')]);
         f.app.handle_key(ctrl(KeyCode::Char('l')));
         press(&mut f.app, &[KeyCode::Char('|')]);
-        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(f.app.panes().len(), 1);
         assert_eq!(f.app.prompt.as_ref().unwrap().input.text(), "|");
     }
 
@@ -5303,16 +5534,16 @@ mod tests {
         // Alt, the app gets Alt+1 instead.
         let mut f = fixture();
         f.app.handle_key(alt(KeyCode::Char('1')));
-        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(f.app.panes().len(), 2);
         assert_eq!(keyboard(&f.app), (Focus::List, 1));
         f.app.handle_key(alt(KeyCode::Char('1')));
-        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(f.app.panes().len(), 1);
         assert_eq!(keyboard(&f.app), (Focus::List, 0));
 
         // Ctrl+1 still means the grid, and splits nothing.
         f.app.handle_key(ctrl(KeyCode::Char('3')));
-        assert_eq!(f.app.view, ViewMode::Grid);
-        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(f.app.view(), ViewMode::Grid);
+        assert_eq!(f.app.panes().len(), 1);
     }
 
     #[test]
@@ -5324,21 +5555,21 @@ mod tests {
 
         // The new pane is on the right, in the same folder, with the keyboard.
         f.app.handle_key(ctrl(KeyCode::Char('4')));
-        assert_eq!(f.app.panes.len(), 2);
+        assert_eq!(f.app.panes().len(), 2);
         assert_eq!(keyboard(&f.app), (Focus::List, 1));
         assert_eq!(f.app.pane().cwd, pictures);
         assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
         assert_eq!(selected_name(&f.app), Some("Trip"));
-        assert_eq!(f.app.panes[0].cwd, pictures);
+        assert_eq!(f.app.panes()[0].cwd, pictures);
         assert_eq!(under_cursor(&f.app, 0), Some("a.jpg"));
 
         // From the left pane too it is the right one that closes, and the
         // view is the one it came from.
         press(&mut f.app, &[KeyCode::BackTab]);
         f.app.handle_key(ctrl(KeyCode::Char('4')));
-        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(f.app.panes().len(), 1);
         assert_eq!(keyboard(&f.app), (Focus::List, 0));
-        assert_eq!(f.app.view, ViewMode::Columns);
+        assert_eq!(f.app.view(), ViewMode::Columns);
         assert_eq!(f.app.pane().cwd, pictures);
         assert_eq!(selected_name(&f.app), Some("a.jpg"));
     }
@@ -5366,7 +5597,7 @@ mod tests {
         split(&mut f.app);
         press(&mut f.app, &[KeyCode::Down, KeyCode::Enter, KeyCode::Enter]);
         assert_eq!(f.app.pane().cwd, pictures.join("Trip"));
-        assert_eq!(f.app.panes[0].cwd, f.home);
+        assert_eq!(f.app.panes()[0].cwd, f.home);
         assert_eq!(under_cursor(&f.app, 0), Some("Pictures"));
 
         // Back in the right pane; the left one has nowhere to go back to.
@@ -5389,7 +5620,7 @@ mod tests {
         // Out of the field, then on to the right pane.
         press(&mut f.app, &[KeyCode::Tab, KeyCode::Tab]);
         assert_eq!(keyboard(&f.app), (Focus::List, 1));
-        assert!(f.app.panes[0].results().is_some());
+        assert!(f.app.panes()[0].results().is_some());
 
         // Up from there is the right pane's business alone.
         press(&mut f.app, &[KeyCode::Backspace]);
@@ -5431,14 +5662,14 @@ mod tests {
             &[KeyCode::Backspace, KeyCode::Down, KeyCode::Enter],
         );
         assert_eq!(f.app.pane().cwd, pictures);
-        assert_eq!(f.app.panes[0].cwd, documents);
+        assert_eq!(f.app.panes()[0].cwd, documents);
 
         // Go to starts from the right pane's folder.
         open_path_field(&mut f.app);
         type_text(&mut f.app, "Trip");
         press(&mut f.app, &[KeyCode::Enter]);
         assert_eq!(f.app.pane().cwd, pictures.join("Trip"));
-        assert_eq!(f.app.panes[0].cwd, documents);
+        assert_eq!(f.app.panes()[0].cwd, documents);
         press(&mut f.app, &[KeyCode::Char('H')]);
         // A new folder is made in its folder.
         f.app.handle_key(ctrl_shift('n'));
@@ -5451,7 +5682,7 @@ mod tests {
         open_path_field(&mut f.app);
         type_text(&mut f.app, "../Pictures/Trip");
         press(&mut f.app, &[KeyCode::Enter]);
-        assert_eq!(f.app.panes[0].cwd, pictures.join("Trip"));
+        assert_eq!(f.app.panes()[0].cwd, pictures.join("Trip"));
         press(&mut f.app, &[KeyCode::Char('H')]);
         assert_eq!(f.app.pane().cwd, documents);
         // F5 reads the one pane again.
@@ -5469,7 +5700,7 @@ mod tests {
         select(&mut f.app, "notes.txt");
         split(&mut f.app);
         press(&mut f.app, &[KeyCode::Enter, KeyCode::BackTab]);
-        assert_eq!(f.app.panes[1].cwd, documents);
+        assert_eq!(f.app.panes()[1].cwd, documents);
 
         // Copied on the left, pasted on the right.
         f.app.handle_key(ctrl(KeyCode::Char('c')));
@@ -5478,7 +5709,7 @@ mod tests {
         finish_work(&mut f.app);
         assert_eq!(read(documents.join("notes.txt")), "hello");
         assert_eq!(read(f.home.join("notes.txt")), "hello");
-        assert_eq!(f.app.active, 1);
+        assert_eq!(f.app.active(), 1);
         assert_eq!(names(&f.app), ["notes.txt"]);
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
         assert_eq!(pane_names(&f.app, 0), FOLDER);
@@ -5494,7 +5725,7 @@ mod tests {
         assert_eq!(on_disk(&pictures), ["Trip", "a.jpg", "notes.txt"]);
         assert!(on_disk(&documents).is_empty());
         assert_eq!(read(pictures.join("notes.txt")), "hello");
-        assert_eq!(f.app.active, 0);
+        assert_eq!(f.app.active(), 0);
         assert_eq!(selected_name(&f.app), Some("notes.txt"));
         assert!(pane_names(&f.app, 1).is_empty(), "the right pane saw it go");
         assert_eq!(said(&f.app), ("Moved 1 item.", false));
@@ -5505,7 +5736,7 @@ mod tests {
         let mut f = several();
         select(&mut f.app, "c.txt");
         split(&mut f.app);
-        f.app.panes[0].offset = 2;
+        f.app.tab_mut().panes[0].offset = 2;
 
         // A folder made on the right shows on the left, which stays on its item.
         f.app.handle_key(ctrl_shift('n'));
@@ -5518,7 +5749,7 @@ mod tests {
             ["Album", "Documents", "Pictures"]
         );
         assert_eq!(under_cursor(&f.app, 0), Some("c.txt"));
-        assert_eq!(f.app.panes[0].offset, 2, "scrolled where it was");
+        assert_eq!(f.app.panes()[0].offset, 2, "scrolled where it was");
 
         // The item the left pane is on goes, from the right: the one that
         // takes its row is the left pane's now.
@@ -5546,7 +5777,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::Enter]);
         f.app.handle_key(ctrl(KeyCode::Char('v')));
         finish_work(&mut f.app);
-        let listed = &f.app.panes[0].entries[1];
+        let listed = &f.app.panes()[0].entries[1];
         assert_eq!(listed.name, "Documents");
         assert_eq!(listed.item_count(), Some(1));
         assert_eq!(under_cursor(&f.app, 0), Some("d.txt"));
@@ -5555,7 +5786,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::BackTab]);
         f.app.handle_key(ctrl(KeyCode::Char('z')));
         assert!(pane_names(&f.app, 1).is_empty());
-        assert_eq!(f.app.panes[0].entries[1].item_count(), Some(0));
+        assert_eq!(f.app.panes()[0].entries[1].item_count(), Some(0));
     }
 
     #[test]
@@ -5586,12 +5817,14 @@ mod tests {
         assert_eq!(pane_names(&f.app, 0), ["Trip", "big.bin", "a.jpg"]);
         assert_eq!(under_cursor(&f.app, 0), Some("Trip"));
 
-        // The columns list the folders above in each pane.
+        // Ctrl+2 leaves the two panes for the columns of the left one,
+        // which lists the folders above it.
         f.app.handle_key(ctrl(KeyCode::Char('2')));
-        assert_eq!(f.app.panes[0].ancestors.len(), 1);
-        assert_eq!(f.app.panes[1].ancestors.len(), 0);
+        assert_eq!(f.app.panes().len(), 1);
+        assert_eq!(f.app.pane().cwd, pictures);
+        assert_eq!(f.app.panes()[0].ancestors.len(), 1);
         f.app.handle_key(ctrl(KeyCode::Char('1')));
-        assert_eq!(f.app.panes[0].ancestors.len(), 0);
+        assert_eq!(f.app.panes()[0].ancestors.len(), 0);
     }
 
     #[test]
@@ -5608,7 +5841,7 @@ mod tests {
         // The new chords' letters alone, or with Alt alone, are only letters.
         type_text(&mut f.app, "nwa");
         f.app.handle_key(alt(KeyCode::Char('n')));
-        assert_eq!(f.app.panes.len(), 1);
+        assert_eq!(f.app.panes().len(), 1);
         assert_eq!(chosen(&f.app), ["Documents"]);
         assert_eq!((f.app.working(), &f.app.message), (None, &None));
         assert_eq!(on_disk(&f.home), FOLDER);
@@ -6433,7 +6666,7 @@ mod tests {
     fn remembering(f: &Fixture) -> (App, PathBuf) {
         let state = f.home.join(".state");
         let mut app = launch(&f.home, Some(&state));
-        app.view = ViewMode::List;
+        app.tab_mut().view = ViewMode::List;
         (app, state)
     }
 
@@ -7301,7 +7534,7 @@ mod mouse_tests {
             let at = if view == '3' { (x, y - 3) } else { (x, y) };
             click(&mut f.app, at);
             assert_eq!(f.app.focus, Focus::List, "view {view}");
-            assert_eq!(f.app.active, 0);
+            assert_eq!(f.app.active(), 0);
             assert_eq!(cursor_name(&f.app), "c.txt", "view {view}");
             assert_eq!(selection(&f.app), ["c.txt"], "view {view}");
             assert_eq!(f.app.pane().cwd, f.home);
@@ -7316,19 +7549,27 @@ mod mouse_tests {
             f.app.handle_key(ctrl(KeyCode::Char(view)));
             split(&mut f.app);
             press(&mut f.app, &[KeyCode::Down]);
-            assert_eq!(f.app.active, 1);
+            assert_eq!(f.app.active(), 1);
             let at = spot(&mut f.app, "a.txt", 0..60);
             click(&mut f.app, at);
-            assert_eq!((f.app.active, f.app.focus), (0, Focus::List), "view {view}");
+            assert_eq!(
+                (f.app.active(), f.app.focus),
+                (0, Focus::List),
+                "view {view}"
+            );
             assert_eq!(cursor_name(&f.app), "a.txt", "view {view}");
-            assert_eq!(f.app.panes[1].cursor, 1, "the other pane's cursor stays");
+            assert_eq!(f.app.panes()[1].cursor, 1, "the other pane's cursor stays");
 
             // Empty space in the right pane: active, its cursor where it was.
             draw(&mut f.app);
             click(&mut f.app, (90, 36));
-            assert_eq!((f.app.active, f.app.focus), (1, Focus::List), "view {view}");
-            assert_eq!(f.app.panes[1].cursor, 1, "view {view}");
-            assert_eq!(f.app.panes[0].cursor, 2, "view {view}");
+            assert_eq!(
+                (f.app.active(), f.app.focus),
+                (1, Focus::List),
+                "view {view}"
+            );
+            assert_eq!(f.app.panes()[1].cursor, 1, "view {view}");
+            assert_eq!(f.app.panes()[0].cursor, 2, "view {view}");
         }
     }
 
@@ -7635,8 +7876,8 @@ mod mouse_tests {
         let crumb = spot(&mut f.app, "~", 56..86);
         assert_eq!(crumb.1, 2);
         click(&mut f.app, crumb);
-        assert_eq!(f.app.panes[1].cwd, f.home);
-        assert_eq!(f.app.active, 1);
+        assert_eq!(f.app.panes()[1].cwd, f.home);
+        assert_eq!(f.app.active(), 1);
     }
 
     fn said(app: &App) -> Option<&str> {
@@ -7821,5 +8062,273 @@ mod mouse_tests {
         right_click(&mut f.app, (28, 5));
         assert_eq!(f.app.pane().cursor, 0);
         assert!(f.app.menu.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::testing::*;
+    use super::*;
+    use std::fs;
+
+    /// What the footer says, if anything.
+    fn said(app: &App) -> Option<&str> {
+        app.message.as_ref().map(|message| message.text.as_str())
+    }
+
+    /// The folder each tab shows, in the strip's order.
+    fn folders(app: &App) -> Vec<PathBuf> {
+        let cwd = |tab: &Tab| tab.pane().cwd.clone();
+        app.tabs.iter().map(cwd).collect()
+    }
+
+    #[test]
+    fn t_opens_a_tab_in_the_folder_showing_at_the_end_of_the_strip_and_shows_it() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        press(
+            &mut f.app,
+            &[KeyCode::Down, KeyCode::Enter, KeyCode::Char('t')],
+        );
+        assert_eq!(folders(&f.app), [pictures.clone(), pictures.clone()]);
+        assert_eq!(f.app.current, 1);
+        assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
+        // From the first tab, the new one still goes after the last.
+        press(&mut f.app, &[KeyCode::Char('1'), KeyCode::Char('h')]);
+        press(&mut f.app, &[KeyCode::Char('t')]);
+        assert_eq!(
+            folders(&f.app),
+            [f.home.clone(), pictures.clone(), f.home.clone()]
+        );
+        assert_eq!(f.app.current, 2);
+    }
+
+    #[test]
+    fn nine_tabs_is_the_most() {
+        let mut f = fixture();
+        for _ in 0..8 {
+            press(&mut f.app, &[KeyCode::Char('t')]);
+        }
+        assert_eq!((f.app.tabs.len(), f.app.current), (9, 8));
+        assert_eq!(said(&f.app), None);
+        press(&mut f.app, &[KeyCode::Char('t')]);
+        assert_eq!((f.app.tabs.len(), f.app.current), (9, 8));
+        assert_eq!(said(&f.app), Some("Nine tabs is the most"));
+        // `O` on a folder says the same.
+        f.app.message = None;
+        press(&mut f.app, &[KeyCode::Char('O')]);
+        assert_eq!(f.app.tabs.len(), 9);
+        assert_eq!(said(&f.app), Some("Nine tabs is the most"));
+        assert_eq!(f.app.pane().cwd, f.home);
+    }
+
+    #[test]
+    fn w_and_ctrl_w_close_the_tab_the_next_takes_its_place_and_the_last_one_quits() {
+        let mut f = fixture();
+        let (documents, pictures) = (f.home.join("Documents"), f.home.join("Pictures"));
+        // Home, Documents, Pictures.
+        press(
+            &mut f.app,
+            &[KeyCode::Char('O'), KeyCode::Char('1'), KeyCode::Down],
+        );
+        press(&mut f.app, &[KeyCode::Char('O'), KeyCode::Char('2')]);
+        assert_eq!(
+            folders(&f.app),
+            [f.home.clone(), documents.clone(), pictures.clone()]
+        );
+        assert_eq!(f.app.current, 1);
+
+        press(&mut f.app, &[KeyCode::Char('w')]);
+        assert_eq!(folders(&f.app), [f.home.clone(), pictures.clone()]);
+        assert_eq!((f.app.current, f.app.pane().cwd.clone()), (1, pictures));
+        // The last in the strip closed, the one before it shows.
+        f.app.handle_key(ctrl(KeyCode::Char('w')));
+        assert_eq!(folders(&f.app), [f.home.clone()]);
+        assert_eq!(f.app.current, 0);
+        assert!(!f.app.should_quit);
+        press(&mut f.app, &[KeyCode::Char('w')]);
+        assert!(f.app.should_quit, "closing the last tab quits");
+    }
+
+    #[test]
+    fn brackets_go_to_the_next_and_previous_tab_round_the_ends() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('t'), KeyCode::Char('t')]);
+        assert_eq!(f.app.current, 2);
+        press(&mut f.app, &[KeyCode::Char(']')]);
+        assert_eq!(f.app.current, 0);
+        press(&mut f.app, &[KeyCode::Char('[')]);
+        assert_eq!(f.app.current, 2);
+        press(&mut f.app, &[KeyCode::Char('['), KeyCode::Char('[')]);
+        assert_eq!(f.app.current, 0);
+        // With one tab, nothing moves.
+        press(&mut f.app, &[KeyCode::Char('w'), KeyCode::Char('w')]);
+        press(&mut f.app, &[KeyCode::Char(']'), KeyCode::Char('[')]);
+        assert_eq!((f.app.tabs.len(), f.app.current), (1, 0));
+    }
+
+    #[test]
+    fn braces_move_the_tab_one_place_as_far_as_the_ends_and_it_stays_showing() {
+        let mut f = fixture();
+        let (documents, pictures) = (f.home.join("Documents"), f.home.join("Pictures"));
+        press(
+            &mut f.app,
+            &[KeyCode::Char('O'), KeyCode::Char('1'), KeyCode::Down],
+        );
+        press(&mut f.app, &[KeyCode::Char('O'), KeyCode::Char('1')]);
+        let home = f.home.clone();
+        press(&mut f.app, &[KeyCode::Char('}')]);
+        assert_eq!(
+            folders(&f.app),
+            [documents.clone(), home.clone(), pictures.clone()]
+        );
+        assert_eq!(f.app.current, 1);
+        press(&mut f.app, &[KeyCode::Char('}'), KeyCode::Char('}')]);
+        assert_eq!(
+            folders(&f.app),
+            [documents.clone(), pictures.clone(), home.clone()]
+        );
+        assert_eq!((f.app.current, f.app.pane().cwd.clone()), (2, home.clone()));
+        press(&mut f.app, &[KeyCode::Char('{')]);
+        assert_eq!(
+            folders(&f.app),
+            [documents.clone(), home.clone(), pictures.clone()]
+        );
+        assert_eq!(f.app.current, 1);
+        press(&mut f.app, &[KeyCode::Char('{'), KeyCode::Char('{')]);
+        assert_eq!(folders(&f.app), [home.clone(), documents, pictures]);
+        assert_eq!(f.app.current, 0);
+    }
+
+    #[test]
+    fn digits_go_to_that_tab_and_a_missing_one_says_so() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
+        assert_eq!(f.app.current, 1);
+        press(&mut f.app, &[KeyCode::Char('1')]);
+        assert_eq!(f.app.current, 0);
+        assert_eq!(said(&f.app), None);
+        press(&mut f.app, &[KeyCode::Char('5')]);
+        assert_eq!(f.app.current, 0);
+        assert_eq!(said(&f.app), Some("No tab 5"));
+        // A digit is never a count: the cursor stays where it was.
+        press(&mut f.app, &[KeyCode::Char('2'), KeyCode::Char('j')]);
+        assert_eq!((f.app.current, f.app.pane().cursor), (1, 1));
+    }
+
+    #[test]
+    fn capital_o_opens_the_folder_under_the_cursor_in_a_new_tab_and_no_file() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
+        assert_eq!(folders(&f.app), [f.home.clone(), f.home.join("Pictures")]);
+        assert_eq!(names(&f.app), ["Trip", "a.jpg"]);
+        // The first tab stays where it was, on Pictures.
+        assert_eq!(f.app.tabs[0].pane().cursor, 1);
+
+        press(
+            &mut f.app,
+            &[KeyCode::Char('1'), KeyCode::End, KeyCode::Char('O')],
+        );
+        assert_eq!(f.app.tabs.len(), 2);
+        assert_eq!(f.app.current, 0);
+        assert_eq!(said(&f.app), Some("Only a folder opens in a new tab"));
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_folder_view_marks_and_history() {
+        let mut f = fixture();
+        let pictures = f.home.join("Pictures");
+        // The first tab: Pictures in the grid, a.jpg marked.
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Enter]);
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        press(&mut f.app, &[KeyCode::Right, KeyCode::Char('v')]);
+        // The second opens in the same folder and view, nothing marked and
+        // no history; it goes home in the list.
+        press(&mut f.app, &[KeyCode::Char('t')]);
+        assert_eq!(f.app.view(), ViewMode::Grid);
+        assert_eq!(f.app.pane().selection().count(), 1);
+        assert!(!f.app.pane().is_marked(1));
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        press(&mut f.app, &[KeyCode::Char('h')]);
+        assert_eq!(f.app.pane().cwd, f.home);
+
+        press(&mut f.app, &[KeyCode::Char('1')]);
+        assert_eq!(f.app.view(), ViewMode::Grid);
+        assert_eq!(f.app.pane().cwd, pictures);
+        assert!(f.app.pane().is_marked(1), "a.jpg is still marked");
+        press(&mut f.app, &[KeyCode::Char('H')]);
+        assert_eq!(f.app.pane().cwd, f.home, "its own way back");
+
+        press(&mut f.app, &[KeyCode::Char('2')]);
+        assert_eq!(f.app.view(), ViewMode::List);
+        assert_eq!(f.app.pane().cwd, f.home);
+        press(&mut f.app, &[KeyCode::Char('H')]);
+        assert_eq!(f.app.pane().cwd, pictures, "its own way back");
+        press(&mut f.app, &[KeyCode::Char('H')]);
+        assert_eq!(f.app.pane().cwd, pictures, "and no further");
+    }
+
+    #[test]
+    fn a_tab_lists_its_folder_again_when_it_shows_keeping_its_place() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::End, KeyCode::Char('t')]);
+        fs::write(f.home.join("later.txt"), "").unwrap();
+        press(&mut f.app, &[KeyCode::Char('1')]);
+        assert_eq!(
+            names(&f.app),
+            ["Documents", "Pictures", "later.txt", "notes.txt"]
+        );
+        assert_eq!(
+            f.app.selected().map(|entry| entry.name.as_str()),
+            Some("notes.txt")
+        );
+    }
+
+    #[test]
+    fn two_panes_belong_to_their_tab_and_ctrl_4_returns_to_the_view_they_came_from() {
+        let mut f = fixture();
+        f.app.handle_key(ctrl(KeyCode::Char('2')));
+        f.app.handle_key(ctrl(KeyCode::Char('4')));
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Dual, 2));
+        // A new tab from two panes opens with one, in the view they came from.
+        press(&mut f.app, &[KeyCode::Char('t')]);
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Columns, 1));
+        f.app.handle_key(ctrl(KeyCode::Char('3')));
+        f.app.handle_key(key(KeyCode::Char('|')));
+        assert_eq!(f.app.view(), ViewMode::Dual);
+        f.app.handle_key(alt(KeyCode::Char('1')));
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Grid, 1));
+
+        press(&mut f.app, &[KeyCode::Char('1')]);
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Dual, 2));
+        f.app.handle_key(ctrl(KeyCode::Char('4')));
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Columns, 1));
+        // Ctrl+1 from two panes is the list with one.
+        f.app.handle_key(ctrl(KeyCode::Char('4')));
+        f.app.handle_key(ctrl(KeyCode::Char('1')));
+        assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::List, 1));
+    }
+
+    #[test]
+    fn m_moves_from_one_pane_into_the_other_ones_folder() {
+        let mut f = fixture();
+        let documents = f.home.join("Documents");
+        press(&mut f.app, &[KeyCode::End, KeyCode::Char('y')]);
+        f.app.handle_key(ctrl(KeyCode::Char('4')));
+        press(
+            &mut f.app,
+            &[KeyCode::Home, KeyCode::Enter, KeyCode::Char('M')],
+        );
+        finish_work(&mut f.app);
+        assert_eq!(names(&f.app), ["notes.txt"]);
+        assert!(!f.home.join("notes.txt").exists());
+        assert!(documents.join("notes.txt").exists());
+        // The left pane saw it go.
+        let left: Vec<&str> = f.app.panes()[0]
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(left, ["Documents", "Pictures"]);
     }
 }

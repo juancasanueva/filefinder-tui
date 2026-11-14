@@ -6,11 +6,12 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 
 - **The screen**: the parent folder's items on the left (the folder you are in lifted), the list in the middle with a glyph, the name and the size on each row, and the preview on the right. Links show in cyan with where they point, programs in green. Alt+P hides or shows the preview, and the choice is remembered.
 - **Preview pane**: the name, kind, size and date, then a folder's items, a text file's lines with line numbers, a picture with its pixel size, or what several selected items add up to. Tab moves the keyboard into it to scroll. Space opens Quick Look.
-- **Other views**: Finder-style columns and a grid with real thumbnails. Ctrl+1/2/3 switches between the list, the columns and the grid; the choice is remembered.
+- **Four views**: Ctrl+1 the list (the default); Ctrl+2 Miller columns from home down to the folder (three at usual widths), then the preview; Ctrl+3 a grid of real thumbnails with two-line names, beside the preview; Ctrl+4 two lists side by side, each under its own path. The view is remembered, two panes excepted.
+- **Tabs**: `t` opens one in the folder you are in, `O` the folder under the cursor; `[` / `]` go round them, `1`–`9` jump to one, `{` / `}` move it, `w` closes it (the last one quits). Each tab keeps its own folder, view, panes, marks and history; the strip in the header shows once there are two, at most nine.
 - **Colours**: truecolor when `COLORTERM` says so, the nearest of 256 colours otherwise, and none with `NO_COLOR` (the cursor row is then reverse video and marked rows underlined). `FILEFINDER_ICONS=plain` replaces the Nerd Font glyphs with plain marks.
 - **Trash**: `~/.Trash`, with Restore and Empty Trash in its menu; reach it with `:`.
 - **File operations** that never overwrite: copy, cut, paste, duplicate, rename, new folder, compress, edit in `$EDITOR`, move to the trash, and delete permanently after asking. Everything except a permanent delete can be undone.
-- **Split** the window in two with Ctrl+4, `|` or Alt+1 to move things between folders; the same key closes it again.
+- **Two panes** with Ctrl+4, `|` or Alt+1 to move things between folders (`y`/`x` in one, `p` or `M` in the other); the same key goes back to the view you came from.
 - **Search** this folder and below with `/`, or go to a path with `:`.
 - **Mouse friendly**: click, double-click, right-click for the menu, Shift+click for a range.
 
@@ -95,10 +96,16 @@ flea's own terminal keys. Digits are never counts.
 | `m`, Menu, Shift+F10 | The menu |
 | Ctrl+T | Open a terminal here |
 | Ctrl+1 / 2 / 3 | List, columns, grid |
-| Ctrl+4, `\|`, Alt+1 | Two panes, or back to one (on a Spanish Mac keyboard `\|` is Option+1) |
+| Ctrl+4, `\|`, Alt+1 | Two panes, or back to the view before (on a Spanish Mac keyboard `\|` is Option+1) |
 | `+` / `-` | Bigger, smaller tiles |
+| `t` | New tab, in the folder you are in |
+| `O` | Open the folder under the cursor in a new tab |
+| `w`, Ctrl+W | Close the tab (closing the last one quits) |
+| `[` / `]` | Previous tab, next tab |
+| `{` / `}` | Move the tab left, right |
+| `1` … `9` | Go to that tab |
 | `?` | Every shortcut |
-| `q`, `w`, Ctrl+W | Quit |
+| `q` | Quit |
 
 Rename, Folder name and Go to ask on the bottom row. A paste that meets names already taken asks there too: Enter or `b` keeps both (`name copy.ext`), `r` replaces (the one there goes to the Trash, and undo brings it back), `s` skips, Escape cancels.
 

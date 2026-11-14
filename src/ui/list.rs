@@ -3,7 +3,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
@@ -42,28 +42,7 @@ pub fn row(
     query: &str,
     folder: Option<&str>,
 ) -> Line<'static> {
-    let lifted = look.cursor || look.marked;
-    // The preview's and the parent's rows are never read from here; what
-    // can't be read shows as such only in the list itself.
-    let dimmed = !look.parent && !look.quiet && entry.unreadable();
-    let ink = if dimmed {
-        theme::MUTED
-    } else if lifted {
-        theme::FOREGROUND
-    } else if look.parent || look.quiet {
-        theme::MUTED
-    } else if entry.link.is_some() {
-        theme::SYMLINK
-    } else if !entry.is_dir && entry.mode & 0o111 != 0 {
-        theme::EXECUTABLE
-    } else {
-        theme::FOREGROUND
-    };
-    let meta = if lifted && !dimmed {
-        theme::FOREGROUND
-    } else {
-        theme::MUTED
-    };
+    let (ink, meta) = inks(entry, look);
     let fill = theme::row_fill(look.cursor, look.focused, look.marked);
     let text = |color| fill.fg(theme::ink(color));
     if width == 0 {
@@ -106,8 +85,38 @@ pub fn row(
     Line::from(spans)
 }
 
+/// The colour of an item's name and of what goes with it (the glyph, the
+/// detail, where a link points), the first rule that fits winning: what
+/// can't be read muted, under the cursor or marked the foreground, links
+/// cyan, programs green, everything else the foreground.
+pub fn inks(entry: &Entry, look: Look) -> (Color, Color) {
+    let lifted = look.cursor || look.marked;
+    // The preview's and the parent's rows are never read from here; what
+    // can't be read shows as such only in the list itself.
+    let dimmed = !look.parent && !look.quiet && entry.unreadable();
+    let ink = if dimmed {
+        theme::MUTED
+    } else if lifted {
+        theme::FOREGROUND
+    } else if look.parent || look.quiet {
+        theme::MUTED
+    } else if entry.link.is_some() {
+        theme::SYMLINK
+    } else if !entry.is_dir && entry.mode & 0o111 != 0 {
+        theme::EXECUTABLE
+    } else {
+        theme::FOREGROUND
+    };
+    let meta = if lifted && !dimmed {
+        theme::FOREGROUND
+    } else {
+        theme::MUTED
+    };
+    (ink, meta)
+}
+
 /// A name in pieces, what `query` matches in it bold.
-fn bold_match(name: &str, query: &str, style: Style) -> Vec<Span<'static>> {
+pub fn bold_match(name: &str, query: &str, style: Style) -> Vec<Span<'static>> {
     match match_range(name, query) {
         Some((start, end)) => vec![
             Span::styled(name[..start].to_string(), style),
@@ -153,7 +162,7 @@ pub fn draw(
     let caption = app.caption;
     let (detail, style) = (app.detail, app.date_style);
     let now = std::time::SystemTime::now();
-    let pane = &mut app.panes[index];
+    let pane = &mut app.tab_mut().panes[index];
     let rows = area.height as usize;
     pane.page_rows = rows.max(1);
     if pane.entries.is_empty() {

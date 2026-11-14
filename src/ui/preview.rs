@@ -42,8 +42,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
     };
     app.preview_rows = body.height.max(1) as usize;
     let App {
-        panes,
-        active,
+        tabs,
+        current,
         facts,
         thumbs,
         preview_scroll,
@@ -52,7 +52,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
         date_style,
         ..
     } = app;
-    let pane = &panes[*active];
+    let pane = tabs[*current].pane();
     if pane.selection().nth(1).is_some() {
         let selection: Vec<&Entry> = pane.selection().collect();
         let lines = several(&selection, inner.width as usize);

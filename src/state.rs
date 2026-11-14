@@ -76,6 +76,8 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
         ViewMode::Grid => "grid",
         ViewMode::List => "list",
         ViewMode::Columns => "columns",
+        // Two panes are never where the next launch starts.
+        ViewMode::Dual => "list",
     };
     let tiles = match saved.tile {
         TileSize::Small => "small",

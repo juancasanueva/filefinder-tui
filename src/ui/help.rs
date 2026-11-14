@@ -55,8 +55,14 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+1 / 2 / 3", "List, columns, grid"),
     ("Ctrl+4  |  Alt+1", "Two panes, or back to one"),
     ("+ / -", "Bigger or smaller tiles"),
+    ("t", "New tab"),
+    ("O", "Open in new tab"),
+    ("w / Ctrl+W", "Close tab (closing the last one quits)"),
+    ("[ / ]", "Previous tab / next tab"),
+    ("{ / }", "Move tab left / right"),
+    ("1 … 9", "Select tab"),
     ("?", "Show these shortcuts"),
-    ("q / w", "Quit"),
+    ("q", "Quit"),
 ];
 
 const KEY_WIDTH: usize = 26;
@@ -280,7 +286,7 @@ mod tests {
     #[test]
     fn a_short_window_that_is_wide_enough_shows_two_columns() {
         let mut f = fixture();
-        let screens = read_through(&mut f.app, 200, 24);
+        let screens = read_through(&mut f.app, 200, 31);
         assert_eq!(screens.len(), 1, "it all fits side by side");
         assert!(!screens[0].contains("more"));
         for (keys, does) in SHORTCUTS {
@@ -296,7 +302,7 @@ mod tests {
         assert!(row(&screens[0], first.0).is_some());
         assert_eq!(row(&screens[0], first.0), row(&screens[0], half.0));
         // With room for one column, it is one column.
-        let tall = show(&mut f.app, 200, 50);
+        let tall = show(&mut f.app, 200, 60);
         assert_ne!(row(&tall, first.0), row(&tall, half.0));
     }
 
@@ -309,35 +315,35 @@ mod tests {
         let has =
             |shown: &str, (keys, does): (&str, &str)| shown.contains(&format!("{keys:<26}{does}"));
         press(&mut f.app, &[KeyCode::Char('?')]);
-        let top = show(&mut f.app, 120, 24);
+        let top = show(&mut f.app, 120, 34);
         assert!(has(&top, first) && !has(&top, last));
 
         press(&mut f.app, &[KeyCode::Down]);
-        let one_down = show(&mut f.app, 120, 24);
+        let one_down = show(&mut f.app, 120, 34);
         assert!(!has(&one_down, first) && has(&one_down, second));
         press(&mut f.app, &[KeyCode::Up]);
-        assert_eq!(show(&mut f.app, 120, 24), top);
+        assert_eq!(show(&mut f.app, 120, 34), top);
         press(&mut f.app, &[KeyCode::Up, KeyCode::PageUp]);
         assert_eq!(
-            show(&mut f.app, 120, 24),
+            show(&mut f.app, 120, 34),
             top,
             "the top is as far as it goes"
         );
 
         press(&mut f.app, &[KeyCode::PageDown]);
-        let end = show(&mut f.app, 120, 24);
+        let end = show(&mut f.app, 120, 34);
         assert!(
             has(&end, last) && !has(&end, second),
             "a page reaches further"
         );
         press(&mut f.app, &[KeyCode::PageDown, KeyCode::Down]);
         assert_eq!(
-            show(&mut f.app, 120, 24),
+            show(&mut f.app, 120, 34),
             end,
             "the end is as far as it goes"
         );
         press(&mut f.app, &[KeyCode::PageUp]);
-        assert_eq!(show(&mut f.app, 120, 24), top);
+        assert_eq!(show(&mut f.app, 120, 34), top);
 
         // None of that reached the files underneath, and nothing else does.
         press(
@@ -352,7 +358,7 @@ mod tests {
         press(&mut f.app, &[KeyCode::Down, KeyCode::Esc]);
         assert!(!f.app.help_visible);
         press(&mut f.app, &[KeyCode::Char('?')]);
-        assert_eq!(show(&mut f.app, 120, 24), top);
+        assert_eq!(show(&mut f.app, 120, 34), top);
         press(&mut f.app, &[KeyCode::Char('?')]);
         assert!(!f.app.help_visible);
     }

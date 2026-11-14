@@ -27,8 +27,54 @@ pub fn sort_label(sort: SortMode) -> String {
     format!("{} {arrow}", sort.key.label())
 }
 
-/// Draws the header row; each folder of the path and each field is a spot
-/// for the mouse.
+/// A tab's label in the strip: ` N name `, with `~` for home and `/` for
+/// the root.
+pub fn tab_label(app: &App, index: usize) -> String {
+    let cwd = &app.tabs[index].pane().cwd;
+    let name = if *cwd == app.home {
+        "~".to_string()
+    } else {
+        match cwd.file_name() {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => cwd.display().to_string(),
+        }
+    };
+    format!(" {} {name} ", index + 1)
+}
+
+/// The tab strip in `inner` cells of header, flea's way: none with one tab;
+/// else the room left of the sort label, the path's share first and then
+/// the labels, as many as fit from the one before the tab showing, the last
+/// one cut with `…` when it doesn't fit whole. Each label with its tab.
+pub fn tab_strip(app: &App, inner: usize) -> (usize, Vec<(usize, String)>) {
+    if app.tabs.len() < 2 {
+        return (0, Vec::new());
+    }
+    let sort = sort_label(app.sort).width();
+    let available = inner.saturating_sub(sort + 2).max(1);
+    let width = |index: usize| tab_label(app, index).width();
+    // As many before the tab showing as fit whole with it.
+    let mut first = app.current;
+    let mut used = width(first).min(available);
+    while first > 0 && used + width(first - 1) <= available {
+        first -= 1;
+        used += width(first);
+    }
+    let mut labels = Vec::new();
+    let mut used = 0;
+    for index in first..app.tabs.len() {
+        if used == available {
+            break;
+        }
+        let cells = width(index).min(available - used);
+        labels.push((index, fit(&tab_label(app, index), cells)));
+        used += cells;
+    }
+    (available - used, labels)
+}
+
+/// Draws the header row; each folder of the path, each tab's label and
+/// each field is a spot for the mouse.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // One blank cell on each side.
     let inner = (area.width as usize).saturating_sub(2);
@@ -37,14 +83,29 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let sort_width = sort.width().min(inner);
     let room = inner - sort_width;
     let gap = room.min(2);
-    let path_width = room - gap;
+    let (strip_path, labels) = tab_strip(app, inner);
+    let path_width = if labels.is_empty() {
+        room - gap
+    } else {
+        strip_path
+    };
     let left = Rect::new(area.x + 1, area.y, path_width as u16, 1);
+    // The labels follow the path's share, each a spot for the mouse.
+    let mut x = left.right();
+    for (index, label) in labels {
+        let cells = label.width() as u16;
+        let rect = Rect::new(x, area.y, cells, 1).intersection(area);
+        let style = theme::tab_label(index == app.current);
+        frame.render_widget(Paragraph::new(label).style(style), rect);
+        hits.add(rect, Spot::Tab(index));
+        x += cells;
+    }
 
     if let Some(search) = app.pane().search() {
         // A search keeps room for its field: the path gives way first.
         let kept = (SEARCH_WIDTH + 2) as usize;
         let crumbs_width = path_width.saturating_sub(kept);
-        let spans = crumbs(app, app.active, crumbs_width, true, left, hits);
+        let spans = crumbs(app, app.active(), crumbs_width, true, left, hits);
         let used = spans.iter().map(|span| span.content.width()).sum::<usize>() as u16;
         frame.render_widget(Paragraph::new(Line::from(spans)), left);
         let x = left.x + used + 2;
@@ -57,7 +118,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         field(frame, room, "/", &search.input, typing);
         hits.add(room, Spot::SearchField);
     } else {
-        let spans = crumbs(app, app.active, path_width, true, left, hits);
+        let spans = crumbs(app, app.active(), path_width, true, left, hits);
         frame.render_widget(Paragraph::new(Line::from(spans)), left);
     }
 
@@ -90,7 +151,14 @@ pub fn draw_pane_path(frame: &mut Frame, app: &App, pane: usize, area: Rect, hit
         width: area.width.saturating_sub(2),
         ..area
     };
-    let spans = crumbs(app, pane, row.width as usize, pane == app.active, row, hits);
+    let spans = crumbs(
+        app,
+        pane,
+        row.width as usize,
+        pane == app.active(),
+        row,
+        hits,
+    );
     frame.render_widget(Paragraph::new(Line::from(spans)), row);
 }
 
@@ -106,7 +174,7 @@ fn crumbs(
     area: Rect,
     hits: &mut HitMap,
 ) -> Vec<Span<'static>> {
-    let cwd = &app.panes[index].cwd;
+    let cwd = &app.panes()[index].cwd;
     let path = app.shown_path(cwd);
     let split = path.rfind('/').map_or(0, |slash| slash + 1);
     let (parent, name) = path.split_at(split);
@@ -181,6 +249,8 @@ mod tests {
     use crate::theme;
     use crate::ui::testing::{buffer, cursor, find, screen};
     use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::style::Color;
 
     #[test]
     fn the_path_shows_home_as_a_tilde_with_the_parent_muted_and_the_folder_in_the_foreground() {
@@ -276,5 +346,105 @@ mod tests {
         let drawn = buffer(&mut f.app, 120, 24);
         assert_eq!(find(&drawn, "/jp", 0..120), None);
         assert_eq!(drawn[(13, 0)].bg, ratatui::style::Color::Reset);
+    }
+
+    #[test]
+    fn the_tab_strip_shows_with_two_tabs_between_the_path_and_the_sort_label() {
+        let mut f = fixture();
+        let one = screen(&mut f.app, 120, 30);
+        assert_eq!(one[0].trim_end(), format!(" ~{}Name ▴", " ".repeat(111)));
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
+        let drawn = buffer(&mut f.app, 120, 30);
+        let header = screen(&mut f.app, 120, 30).remove(0);
+        // The path's share, the labels packed against the sort label.
+        assert_eq!(
+            header,
+            format!(" ~/Pictures{} 1 ~  2 Pictures   Name ▴ ", " ".repeat(83))
+        );
+        // The tab showing on the tab fill in the foreground, the other muted.
+        for x in 94..99 {
+            assert_eq!(
+                (drawn[(x, 0)].fg, drawn[(x, 0)].bg),
+                (theme::MUTED, Color::Reset),
+                "{x}"
+            );
+        }
+        for x in 99..111 {
+            assert_eq!(
+                (drawn[(x, 0)].fg, drawn[(x, 0)].bg),
+                (theme::FOREGROUND, theme::TAB),
+                "{x}"
+            );
+        }
+        assert_eq!(drawn[(111, 0)].bg, Color::Reset);
+        assert_eq!(drawn[(113, 0)].fg, theme::MUTED, "the sort label");
+
+        // At the root the label is a slash; closed down to one, no strip.
+        f.app.navigate(std::path::Path::new("/"));
+        assert!(screen(&mut f.app, 120, 30)[0].contains(" 1 ~  2 /   Name ▴ "));
+        press(&mut f.app, &[KeyCode::Char('w')]);
+        assert_eq!(screen(&mut f.app, 120, 30)[0], one[0]);
+    }
+
+    #[test]
+    fn the_strip_scrolls_to_keep_the_tab_showing_in_sight() {
+        let mut f = fixture();
+        for _ in 0..8 {
+            press(&mut f.app, &[KeyCode::Char('t')]);
+        }
+        // Thirty cells for the strip: the ninth tab and the five before it,
+        // with no room left for the path.
+        let header = |app: &mut crate::app::App| screen(app, 40, 10).remove(0);
+        assert_eq!(
+            header(&mut f.app),
+            "  4 ~  5 ~  6 ~  7 ~  8 ~  9 ~   Name ▴ "
+        );
+        // The first: it and those after it, as far as there is room.
+        press(&mut f.app, &[KeyCode::Char('1')]);
+        assert_eq!(
+            header(&mut f.app),
+            "  1 ~  2 ~  3 ~  4 ~  5 ~  6 ~   Name ▴ "
+        );
+        // Two cells more: the next label cut with an ellipsis.
+        let wider = screen(&mut f.app, 42, 10).remove(0);
+        assert_eq!(wider, "  1 ~  2 ~  3 ~  4 ~  5 ~  6 ~  …  Name ▴ ");
+        // The fifth: the ones before it that fit whole, then it.
+        press(&mut f.app, &[KeyCode::Char('5')]);
+        assert_eq!(
+            header(&mut f.app),
+            "  1 ~  2 ~  3 ~  4 ~  5 ~  6 ~   Name ▴ "
+        );
+        press(&mut f.app, &[KeyCode::Char('8')]);
+        assert_eq!(
+            header(&mut f.app),
+            "  3 ~  4 ~  5 ~  6 ~  7 ~  8 ~   Name ▴ "
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_tab_label_shows_that_tab() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
+        buffer(&mut f.app, 120, 30);
+        let click = |app: &mut crate::app::App, column| {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        click(&mut f.app, 95);
+        assert_eq!(
+            (f.app.current, f.app.pane().cwd.clone()),
+            (0, f.home.clone())
+        );
+        buffer(&mut f.app, 120, 30);
+        click(&mut f.app, 110);
+        assert_eq!(f.app.current, 1);
+        // Between the labels and the sort label, nothing.
+        buffer(&mut f.app, 120, 30);
+        click(&mut f.app, 112);
+        assert_eq!(f.app.current, 1);
     }
 }

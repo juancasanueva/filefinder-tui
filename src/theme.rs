@@ -247,6 +247,16 @@ pub fn menu_item(lit: bool, enabled: bool) -> Style {
     style.add_modifier(cursor_modifier(lit))
 }
 
+/// A tab's label in the header: the tab showing on the tab fill in the
+/// foreground, the others muted.
+pub fn tab_label(current: bool) -> Style {
+    if current {
+        on(FOREGROUND, TAB).add_modifier(cursor_modifier(true))
+    } else {
+        muted()
+    }
+}
+
 /// A choice in a dialog: the lit one, which Enter takes, on the wash.
 pub fn choice(lit: bool) -> Style {
     if lit {
