@@ -228,12 +228,48 @@ fn titled(title: &str, key: Option<SortKey>, sort: SortMode) -> String {
 }
 
 /// The header over a list `width` cells wide: "Name" over the names, then
-/// each column's title over it, in the muted colour; the sorted one in the
-/// foreground with its arrow.
+/// each column's title over it, bold in the muted colour; the sorted one in
+/// the foreground with its arrow. Drawn on the tab fill.
 pub fn header(table: &[(Column, usize)], width: usize, sort: SortMode) -> Line<'static> {
+    let parts = header_parts(table, width, sort);
+    Line::from(parts.into_iter().map(|(span, _)| span).collect::<Vec<_>>())
+}
+
+/// Where a click on the header sorts: the cells of each title that sorts,
+/// from the list's left edge, with its key.
+pub fn sort_spots(
+    table: &[(Column, usize)],
+    width: usize,
+    sort: SortMode,
+) -> Vec<(std::ops::Range<usize>, SortKey)> {
+    let mut at = 0;
+    let mut spots = Vec::new();
+    for (span, key) in header_parts(table, width, sort) {
+        let cells = span.width();
+        if let Some(key) = key {
+            spots.push((at..at + cells, key));
+        }
+        at += cells;
+    }
+    spots
+}
+
+/// The header's pieces, each title with the key it sorts by.
+fn header_parts(
+    table: &[(Column, usize)],
+    width: usize,
+    sort: SortMode,
+) -> Vec<(Span<'static>, Option<SortKey>)> {
     let muted = Style::default().fg(theme::ink(theme::MUTED));
     let lit = Style::default().fg(theme::ink(theme::FOREGROUND));
-    let style = |key: Option<SortKey>| if key == Some(sort.key) { lit } else { muted };
+    let style = |key: Option<SortKey>| {
+        let ink = if key.is_some() && key == Some(sort.key) {
+            lit
+        } else {
+            muted
+        };
+        ink.add_modifier(Modifier::BOLD)
+    };
     // The same cells a row gives its name and its columns.
     let columns: usize = table.iter().map(|(_, cells)| cells + GAP).sum();
     let around = if table.is_empty() {
@@ -242,27 +278,31 @@ pub fn header(table: &[(Column, usize)], width: usize, sort: SortMode) -> Line<'
         columns - GAP + 3
     };
     if width < 3 + around {
-        return Line::default();
+        return Vec::new();
     }
     let name_width = width - 3 - around;
     let name = fit(&titled("Name", Some(SortKey::Name), sort), name_width);
-    let mut spans = vec![
-        Span::raw("   "),
-        Span::styled(name.clone(), style(Some(SortKey::Name))),
-        Span::raw(" ".repeat(name_width - name.width() + 1)),
+    let name = format!("{name}{}", " ".repeat(name_width - name.width()));
+    let mut parts = vec![
+        (Span::raw("   "), None),
+        (
+            Span::styled(name, style(Some(SortKey::Name))),
+            Some(SortKey::Name),
+        ),
+        (Span::raw(" "), None),
     ];
     for (at, &(column, _)) in table.iter().enumerate() {
         if at > 0 {
-            spans.push(Span::raw(" ".repeat(GAP)));
+            parts.push((Span::raw(" ".repeat(GAP)), None));
         }
         let title = titled(column.title(), column.key(), sort);
         let text = set(&table[at..=at], std::iter::once(title));
-        spans.push(Span::styled(text, style(column.key())));
+        parts.push((Span::styled(text, style(column.key())), column.key()));
     }
     if !table.is_empty() {
-        spans.push(Span::raw("  "));
+        parts.push((Span::raw("  "), None));
     }
-    Line::from(spans)
+    parts
 }
 
 /// The colour of an item's name and of what goes with it (the glyph, the
@@ -369,7 +409,14 @@ pub fn draw(
     let end = (pane.offset + rows).min(pane.entries.len());
     let table = table(&pane.entries[pane.offset.min(end)..end], width, now, style);
     if header {
-        frame.render_widget(Paragraph::new(self::header(&table, width, sort)), head);
+        // On the tab fill, so it reads as the header and not as an item.
+        let fill = Style::default().bg(theme::ink(theme::TAB));
+        let line = self::header(&table, width, sort);
+        frame.render_widget(Paragraph::new(line).style(fill), head);
+        for (cells, key) in sort_spots(&table, width, sort) {
+            let x = head.x + cells.start as u16;
+            hits.add(Rect::new(x, head.y, cells.len() as u16, 1), Spot::Sort(key));
+        }
     }
     if pane.entries.is_empty() {
         empty(frame, area, pane, caption);
@@ -587,6 +634,65 @@ mod tests {
         let drawn = buffer(&mut f.app, 200, 30);
         assert!(x_in(&drawn, top, "Size ▴", files.clone()).is_some());
         assert!(x_in(&drawn, top, "Name ▴", files).is_none());
+    }
+
+    #[test]
+    fn the_header_titles_are_bold_on_a_fill_of_their_own() {
+        use crate::app::testing::fixture;
+        let mut f = fixture();
+        let drawn = buffer(&mut f.app, 200, 30);
+        let files = panes(&f.app, 200).files;
+        let (_, top) = find(&drawn, "Permissions", files.clone()).expect("the header");
+        for title in ["Name ▴", "Size", "User", "Permissions", "Kind", "Modified"] {
+            let x = x_in(&drawn, top, title, files.clone()).expect(title);
+            for x in x..x + title.chars().count() as u16 {
+                let modifier = drawn[(x, top)].modifier;
+                assert!(modifier.contains(Modifier::BOLD), "{title} at {x}");
+            }
+        }
+        // The whole row, gaps included, on the tab fill: not the cursor's.
+        for x in files {
+            assert_eq!(drawn[(x, top)].bg, theme::TAB, "{x}");
+        }
+        assert_ne!(theme::TAB, theme::CURSOR);
+    }
+
+    #[test]
+    fn a_click_on_a_title_sorts_by_it_and_again_the_other_way() {
+        use crate::app::testing::{fixture, launch, launch_one_pane};
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let f = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = launch_one_pane(&f.home, Some(state.path()));
+        let click = |app: &mut App, title: &str| {
+            let drawn = buffer(app, 200, 30);
+            let files = panes(app, 200).files;
+            let (_, top) = find(&drawn, "Permissions", files.clone()).expect("the header");
+            let (x, y) = (x_in(&drawn, top, title, files).expect(title), top);
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+            (app.sort.key, app.sort.reversed)
+        };
+        assert_eq!(click(&mut app, "Size"), (SortKey::Size, false));
+        assert_eq!(click(&mut app, "Size ▴"), (SortKey::Size, true));
+        assert_eq!(click(&mut app, "Modified"), (SortKey::Modified, false));
+        assert_eq!(click(&mut app, "Kind"), (SortKey::Kind, false));
+        // What can't be sorted by leaves the order as it is.
+        assert_eq!(click(&mut app, "User"), (SortKey::Kind, false));
+        assert_eq!(click(&mut app, "Permissions"), (SortKey::Kind, false));
+        assert_eq!(click(&mut app, "Name"), (SortKey::Name, false));
+        // The items follow, and the order is remembered like `s` and `S`.
+        let names: Vec<String> = (app.pane().entries.iter())
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(names.first().map(String::as_str), Some("Documents"));
+        assert_eq!(click(&mut app, "Name ▴"), (SortKey::Name, true));
+        let again = launch(&f.home, Some(state.path()));
+        assert_eq!((again.sort.key, again.sort.reversed), (SortKey::Name, true));
     }
 
     #[test]

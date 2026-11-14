@@ -17,7 +17,7 @@ use ratatui::layout::{Position as Point, Rect};
 use crate::format::DateStyle;
 use crate::input::Input;
 use crate::matcher::{self, Query, Tier};
-use crate::model::{self, Entry, SortMode};
+use crate::model::{self, Entry, SortKey, SortMode};
 use crate::ops::{self, Change, History, Kind, Report, Step};
 use crate::ops::{Collide, Format};
 use crate::places::{self, Section};
@@ -415,6 +415,9 @@ pub enum Spot {
     Tab(usize),
     /// A view's button in the header.
     View(ViewMode),
+    /// A title in a list's header that sorts: by its key, or the other way
+    /// round when the items already are.
+    Sort(SortKey),
     /// The places panel, wherever no place is.
     Places,
     /// A place in the panel, by its place among them all.
@@ -1778,6 +1781,7 @@ impl App {
             (true, Spot::Place(index)) => self.open_place(index),
             (true, Spot::Places) => self.enter_places(),
             (true, Spot::View(view)) => self.choose_view(view),
+            (true, Spot::Sort(key)) => self.sort_by(key),
             (true, Spot::Preview) => self.focus_preview(),
             (true, Spot::Crumb { pane, path }) => {
                 let tab = self.tab_mut();
@@ -4052,6 +4056,20 @@ impl App {
         self.sort = sort;
         self.reload_all();
         self.remember();
+    }
+
+    /// A click on a title in a list's header: sorts by it, A to Z (or
+    /// smallest, oldest first), or the other way round when already sorted
+    /// by it.
+    fn sort_by(&mut self, key: SortKey) {
+        let sort = match self.sort.key == key {
+            true => self.sort.reverse(),
+            false => SortMode {
+                key,
+                reversed: false,
+            },
+        };
+        self.set_sort(sort);
     }
 
     /// Ctrl+R and F5: reads what the pane shows, its volume and the places
