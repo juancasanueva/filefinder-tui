@@ -13,6 +13,7 @@ mod menu;
 mod places;
 mod preview;
 mod prompt;
+mod settings;
 mod topbar;
 
 use ratatui::Frame;
@@ -179,7 +180,8 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
         menu::draw(frame, menu, item, body, hits);
     }
     // A card is the one lit thing: everything behind it is dimmed.
-    if app.help_visible || app.look.is_some() || app.dialog.is_some() {
+    let settings_open = app.settings.is_some();
+    if app.help_visible || app.look.is_some() || app.dialog.is_some() || settings_open {
         card::dim(frame.buffer_mut(), area);
     }
     if app.help_visible {
@@ -191,8 +193,11 @@ fn draw_window(frame: &mut Frame, app: &mut App, hits: &mut HitMap) {
     if let Some(dialog) = &app.dialog {
         card::draw_dialog(frame, dialog, area, hits);
     }
+    if settings_open {
+        settings::draw(frame, app, area, hits);
+    }
     // Over everything, while nothing else has the pointer's attention.
-    let overlay = app.menu.is_some() || app.help_visible || app.look.is_some();
+    let overlay = app.menu.is_some() || app.help_visible || app.look.is_some() || settings_open;
     if !overlay && app.dialog.is_none() {
         topbar::tip(frame, app, hits);
     }

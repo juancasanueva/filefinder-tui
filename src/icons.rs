@@ -12,6 +12,10 @@ use crate::places::Kind;
 use crate::theme;
 
 pub const FOLDER: &str = "\u{f024b}";
+/// The header's settings button: a gear.
+pub const GEAR: &str = "\u{f0493}";
+/// About, in the settings' rail.
+pub const ABOUT: &str = "\u{f02fc}";
 pub const FILE: &str = "\u{f0214}";
 pub const TEXT: &str = "\u{f0219}";
 /// A folder that can't be read.

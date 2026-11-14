@@ -9,6 +9,7 @@ mod model;
 mod ops;
 mod places;
 mod search;
+mod settings;
 mod state;
 mod syntax;
 mod system;

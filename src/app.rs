@@ -22,6 +22,7 @@ use crate::ops::{self, Change, History, Kind, Report, Step};
 use crate::ops::{Collide, Format};
 use crate::places::{self, Section};
 use crate::search::{Hit, Looking, Reach, Walk};
+use crate::settings::{self, Kind as RowKind, SECTIONS, Setting, Settings};
 use crate::state::{self, Saved, Trashed};
 use crate::syntax::Highlighter;
 use crate::system::{Grep, System, Volume};
@@ -415,6 +416,14 @@ pub enum Spot {
     Tab(usize),
     /// A view's button in the header.
     View(ViewMode),
+    /// The settings button in the header, after the views'.
+    Gear,
+    /// The settings card, wherever nothing else of it is.
+    SettingsCard,
+    /// A section in the settings' rail.
+    SettingsSection(crate::settings::Section),
+    /// A row of the settings, by its place among the section's items.
+    SettingsRow(usize),
     /// A title in a list's header that sorts: by its key, or the other way
     /// round when the items already are.
     Sort(SortKey),
@@ -1202,9 +1211,12 @@ pub struct App {
     /// How many colours the terminal shows.
     pub depth: Depth,
     pub help_visible: bool,
-    /// The view button the pointer rests on, which says what it does under
-    /// it until the pointer leaves, a key or a click.
-    pub tip: Option<ViewMode>,
+    /// The header button the pointer rests on (a view's or the settings'),
+    /// which says what it does under it until the pointer leaves, a key or
+    /// a click.
+    pub tip: Option<Spot>,
+    /// The settings card, while it is open: `,` or the gear.
+    pub settings: Option<crate::settings::Settings>,
     /// How many lines the shortcuts are scrolled down; drawing keeps it in range.
     pub help_scroll: usize,
     /// Lines of shortcuts shown last time, for Page Up and Page Down.
@@ -1278,7 +1290,7 @@ impl App {
             tile: saved.tile,
             sort: saved.sort,
             detail: saved.detail,
-            show_hidden: false,
+            show_hidden: saved.hidden,
             preview_visible: saved.preview,
             places: Vec::new(),
             tags_in_use: 0,
@@ -1291,6 +1303,7 @@ impl App {
             depth: config.depth,
             help_visible: false,
             tip: None,
+            settings: None,
             help_scroll: 0,
             help_rows: 1,
             dialog: None,
@@ -1521,6 +1534,9 @@ impl App {
             }
             return;
         }
+        if self.settings.is_some() {
+            return self.settings_key(key);
+        }
         if let Some(dialog) = self.dialog.take() {
             self.dialog_key(dialog, key);
             return;
@@ -1541,6 +1557,13 @@ impl App {
             Some(Field::Search) => return self.search_key(key),
             Some(Field::Filter) => return self.filter_key(key),
             None => {}
+        }
+        // The settings open wherever the keyboard is.
+        let held = key.modifiers;
+        if key.code == KeyCode::Char(',')
+            && !held.intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return self.open_settings();
         }
         if self.focus == Focus::Preview && self.preview_key(key) {
             return;
@@ -1732,10 +1755,9 @@ impl App {
     /// The mouse moved over a menu's line or a card's button: the keyboard
     /// goes there, as the arrows would take it.
     fn hover(&mut self, spot: Option<Spot>) {
-        self.tip = match spot {
-            Some(Spot::View(view)) => Some(view),
-            _ => None,
-        };
+        self.tip = spot
+            .clone()
+            .filter(|spot| matches!(spot, Spot::View(_) | Spot::Gear));
         match (spot, &mut self.menu, &mut self.dialog) {
             (Some(Spot::MenuRow(row)), Some(menu), _) => {
                 if matches!(menu.rows.get(row), Some(MenuRow::Item { .. })) {
@@ -1757,6 +1779,30 @@ impl App {
                 Some(Spot::MenuRow(row)) if left => self.choose_row(row),
                 Some(Spot::Menu | Spot::MenuRow(_)) => {}
                 _ => self.menu = None,
+            }
+            return;
+        }
+        if let Some(mut open) = self.settings {
+            match spot {
+                // A section: its rows, the keyboard in the rail.
+                Some(Spot::SettingsSection(section)) if left => {
+                    open.section = section;
+                    open.in_rail = true;
+                    open.cursor = 0;
+                    self.settings = Some(open);
+                }
+                // A row: the keyboard there, and what Enter does.
+                Some(Spot::SettingsRow(index)) if left => {
+                    open.cursor = index;
+                    open.in_rail = false;
+                    self.settings = Some(open);
+                    let items = settings::items(&settings::rows(self, open.section));
+                    if let Some(setting) = items.get(index) {
+                        self.change_setting(*setting, 1);
+                    }
+                }
+                Some(Spot::SettingsCard | Spot::SettingsSection(_) | Spot::SettingsRow(_)) => {}
+                _ => self.settings = None,
             }
             return;
         }
@@ -1798,6 +1844,7 @@ impl App {
             (true, Spot::Place(index)) => self.open_place(index),
             (true, Spot::Places) => self.enter_places(),
             (true, Spot::View(view)) => self.choose_view(view),
+            (true, Spot::Gear) => self.open_settings(),
             (true, Spot::Sort(key)) => self.sort_by(key),
             (true, Spot::Preview) => self.focus_preview(),
             (true, Spot::Crumb { pane, path }) => {
@@ -4054,6 +4101,7 @@ impl App {
                 sort: self.sort,
                 detail: self.detail,
                 places: self.places_visible,
+                hidden: self.show_hidden,
             };
             // A view that isn't remembered is no reason to interrupt.
             let _ = state::save(dir, saved);
@@ -4063,6 +4111,116 @@ impl App {
     fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         self.reload_all();
+        self.remember();
+    }
+
+    /// `,` or the gear: the settings card, on View with the keyboard in
+    /// its rows.
+    fn open_settings(&mut self) {
+        self.menu = None;
+        self.settings = Some(Settings::new());
+    }
+
+    /// A key while the settings are open: Tab between the rail and the
+    /// rows, `j`/`k` the next or previous of them, `h`/`l` a choice's value,
+    /// Space a check, Enter a row (or into the rows from the rail), Esc away.
+    fn settings_key(&mut self, key: KeyEvent) {
+        let Some(mut open) = self.settings else {
+            return;
+        };
+        let items = settings::items(&settings::rows(self, open.section));
+        let last = items.len().saturating_sub(1);
+        let section = SECTIONS
+            .iter()
+            .position(|s| *s == open.section)
+            .unwrap_or(0);
+        let here = items.get(open.cursor).copied();
+        let mut change = None;
+        match key.code {
+            KeyCode::Esc => {
+                self.settings = None;
+                return;
+            }
+            KeyCode::Tab | KeyCode::BackTab => open.in_rail = !open.in_rail,
+            KeyCode::Down | KeyCode::Char('j') if open.in_rail => {
+                open.section = SECTIONS[(section + 1).min(SECTIONS.len() - 1)];
+                open.cursor = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') if open.in_rail => {
+                open.section = SECTIONS[section.saturating_sub(1)];
+                open.cursor = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => open.cursor = (open.cursor + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => open.cursor = open.cursor.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char(' ') if open.in_rail => open.in_rail = false,
+            KeyCode::Right | KeyCode::Char('l') => change = here.map(|s| (s, 1, RowKind::Choice)),
+            KeyCode::Left | KeyCode::Char('h') => change = here.map(|s| (s, -1, RowKind::Choice)),
+            KeyCode::Char(' ') => change = here.map(|s| (s, 1, RowKind::Check)),
+            KeyCode::Enter => change = here.map(|s| (s, 1, s.kind())),
+            _ => {}
+        }
+        self.settings = Some(open);
+        if let Some((setting, step, wanted)) = change
+            && setting.kind() == wanted
+        {
+            self.change_setting(setting, step);
+        }
+    }
+
+    /// What a row does: a choice stepped by `step`, a check turned over, an
+    /// action run. Its own key's way, so it is remembered the same.
+    fn change_setting(&mut self, setting: Setting, step: isize) {
+        let at = |index: Option<usize>, count| settings::wrap(index.unwrap_or(0), step, count);
+        match setting {
+            Setting::View => {
+                let index = settings::VIEWS.iter().position(|v| *v == self.view());
+                self.pick_view(settings::VIEWS[at(index, 4)]);
+            }
+            Setting::Preview => self.toggle_preview(),
+            Setting::Places => self.toggle_places(),
+            Setting::Detail => {
+                let index = settings::DETAILS.iter().position(|d| *d == self.detail);
+                self.detail = settings::DETAILS[at(index, 4)];
+                self.remember();
+            }
+            Setting::SortBy => {
+                let index = settings::KEYS.iter().position(|k| *k == self.sort.key);
+                let key = settings::KEYS[at(index, 4)];
+                self.set_sort(SortMode {
+                    key,
+                    reversed: self.sort.reversed,
+                });
+            }
+            Setting::Order => self.set_sort(self.sort.reverse()),
+            Setting::Hidden => self.toggle_hidden(),
+            Setting::Keys => {
+                self.settings = None;
+                self.help_visible = true;
+                return;
+            }
+            Setting::Issue => {
+                if self.system.open(Path::new(settings::ISSUES)).is_err() {
+                    self.fail("Couldn't open the issues page.".to_string());
+                }
+                return;
+            }
+            Setting::Version | Setting::BasedOn => return,
+        }
+        if let Some(open) = &mut self.settings {
+            open.saved = true;
+        }
+    }
+
+    /// A view as "Last-used view" picks it: two panes opened or closed the
+    /// way `|` does, so the one-pane view to go back to stays right.
+    fn pick_view(&mut self, view: ViewMode) {
+        let dual = self.view() == ViewMode::Dual;
+        if (view == ViewMode::Dual) != dual {
+            self.toggle_split();
+        }
+        if view != ViewMode::Dual {
+            self.set_view(view);
+        }
     }
 
     /// Alt+P: hides or shows the preview pane, and remembers it.
@@ -5365,7 +5523,7 @@ mod tests {
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
-            "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\n"
+            "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\n"
         );
         app.handle_key(ctrl(KeyCode::Char('3')));
         assert_eq!(app.view(), ViewMode::Grid);
@@ -5495,7 +5653,7 @@ mod tests {
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
-            "view=list\ntiles=large\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\n"
+            "view=list\ntiles=large\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\n"
         );
         assert_eq!(launch(&f.home, Some(state.path())).tile, Large);
     }

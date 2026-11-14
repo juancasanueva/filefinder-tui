@@ -27,7 +27,8 @@ const VIEWS: [ViewMode; 4] = [
 /// The cells a button takes: its glyph with a cell of fill on each side.
 const CHIP_WIDTH: u16 = 3;
 /// The cells the buttons take: four chips, a cell apart.
-const BUTTONS_WIDTH: usize = 4 * CHIP_WIDTH as usize + 3;
+/// The four view buttons and the settings', a cell apart.
+const BUTTONS_WIDTH: usize = 5 * CHIP_WIDTH as usize + 4;
 /// The cells of path the buttons always leave; with fewer they are dropped,
 /// before the sort label is.
 const PATH_BEFORE_BUTTONS: usize = 24;
@@ -162,16 +163,26 @@ fn draw_buttons(frame: &mut Frame, app: &App, x: u16, y: u16, hits: &mut HitMap)
         frame.render_widget(Paragraph::new(chip).style(style), rect);
         hits.add(rect, Spot::View(view));
     }
+    // The settings' gear, a chip like them after the last.
+    let rect = Rect::new(x + (CHIP_WIDTH + 1) * VIEWS.len() as u16, y, CHIP_WIDTH, 1);
+    let style = Style::new()
+        .fg(theme::ink(theme::FOREGROUND))
+        .bg(theme::ink(theme::TAB));
+    let chip = format!(" {} ", icons::mark(icons::GEAR, "⚙"));
+    frame.render_widget(Paragraph::new(chip).style(style), rect);
+    hits.add(rect, Spot::Gear);
 }
 
-/// What a view button's tooltip says: the view, and its keys.
-fn tip_text(view: ViewMode) -> (&'static str, &'static str) {
-    match view {
-        ViewMode::List => ("List view", "ctrl-opt-1"),
-        ViewMode::Columns => ("Columns view", "ctrl-opt-2"),
-        ViewMode::Grid => ("Grid view", "ctrl-opt-3"),
-        ViewMode::Dual => ("Dual pane", "ctrl-opt-4"),
-    }
+/// What a header button's tooltip says: what it does, and its keys.
+fn tip_text(spot: &Spot) -> Option<(&'static str, &'static str)> {
+    Some(match spot {
+        Spot::View(ViewMode::List) => ("List view", "ctrl-opt-1"),
+        Spot::View(ViewMode::Columns) => ("Columns view", "ctrl-opt-2"),
+        Spot::View(ViewMode::Grid) => ("Grid view", "ctrl-opt-3"),
+        Spot::View(ViewMode::Dual) => ("Dual pane", "ctrl-opt-4"),
+        Spot::Gear => ("Settings", ","),
+        _ => return None,
+    })
 }
 
 /// The tooltip of the view button the pointer rests on: a framed line just
@@ -179,12 +190,11 @@ fn tip_text(view: ViewMode) -> (&'static str, &'static str) {
 /// it, the view in the foreground and its keys muted. Nothing when the
 /// button isn't showing.
 pub fn tip(frame: &mut Frame, app: &App, hits: &HitMap) {
-    let Some(view) = app.tip else { return };
-    let Some(button) = hits.rect_of(&Spot::View(view)) else {
+    let Some(spot) = &app.tip else { return };
+    let (Some(button), Some((label, keys))) = (hits.rect_of(spot), tip_text(spot)) else {
         return;
     };
     let screen = frame.area();
-    let (label, keys) = tip_text(view);
     let inside = (label.width() + 2 + keys.width() + 2) as u16;
     let width = inside + 2;
     if width > screen.width || screen.height < button.y + 4 {
@@ -461,15 +471,16 @@ mod tests {
         let mut f = fixture();
         let one = screen(&mut f.app, 120, 30);
         let buttons = format!(
-            " {}   {}   {}   {} ",
+            " {}   {}   {}   {}   {} ",
             crate::icons::VIEW_LIST,
             crate::icons::VIEW_COLUMNS,
             crate::icons::VIEW_GRID,
-            crate::icons::VIEW_DUAL
+            crate::icons::VIEW_DUAL,
+            crate::icons::GEAR
         );
         assert_eq!(
             one[0].trim_end(),
-            format!(" ~{}{buttons}  Name ▴", " ".repeat(94))
+            format!(" ~{}{buttons}  Name ▴", " ".repeat(90))
         );
         press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
         let drawn = buffer(&mut f.app, 120, 30);
@@ -479,25 +490,25 @@ mod tests {
             header,
             format!(
                 " ~/Pictures{} 1 ~  2 Pictures   {buttons}  Name ▴ ",
-                " ".repeat(66)
+                " ".repeat(62)
             )
         );
         // The tab showing on the tab fill in the foreground, the other muted.
-        for x in 77..82 {
+        for x in 73..78 {
             assert_eq!(
                 (drawn[(x, 0)].fg, drawn[(x, 0)].bg),
                 (theme::MUTED, Color::Reset),
                 "{x}"
             );
         }
-        for x in 82..94 {
+        for x in 78..90 {
             assert_eq!(
                 (drawn[(x, 0)].fg, drawn[(x, 0)].bg),
                 (theme::FOREGROUND, theme::TAB),
                 "{x}"
             );
         }
-        assert_eq!(drawn[(94, 0)].bg, Color::Reset);
+        assert_eq!(drawn[(90, 0)].bg, Color::Reset);
         assert_eq!(drawn[(113, 0)].fg, theme::MUTED, "the sort label");
 
         // At the root the label is a slash; closed down to one, no strip.
@@ -548,14 +559,15 @@ mod tests {
         use crate::app::testing::ctrl;
         use crate::icons;
         let mut f = fixture();
-        // Each a chip of three cells, the glyph in the middle, one cell apart.
+        // Each a chip of three cells, the glyph in the middle, one cell
+        // apart, then the settings' gear, never lit.
         let chips = [
-            (96, ViewMode::List, icons::VIEW_LIST),
-            (100, ViewMode::Columns, icons::VIEW_COLUMNS),
-            (104, ViewMode::Grid, icons::VIEW_GRID),
-            (108, ViewMode::Dual, icons::VIEW_DUAL),
+            (92, ViewMode::List, icons::VIEW_LIST),
+            (96, ViewMode::Columns, icons::VIEW_COLUMNS),
+            (100, ViewMode::Grid, icons::VIEW_GRID),
+            (104, ViewMode::Dual, icons::VIEW_DUAL),
         ];
-        for (code, lit) in [('1', 96), ('2', 100), ('3', 104), ('4', 108)] {
+        for (code, lit) in [('1', 92), ('2', 96), ('3', 100), ('4', 104)] {
             f.app.handle_key(ctrl(KeyCode::Char(code)));
             let drawn = buffer(&mut f.app, 120, 30);
             for (x, view, glyph) in chips {
@@ -569,8 +581,13 @@ mod tests {
                     }
                 }
             }
+            assert_eq!(drawn[(109, 0)].symbol(), icons::GEAR);
+            for cell in 108..111 {
+                let style = (drawn[(cell, 0)].fg, drawn[(cell, 0)].bg);
+                assert_eq!(style, (theme::FOREGROUND, theme::TAB), "the gear {cell}");
+            }
             // A cell between the chips, two before the sort label.
-            for x in [99, 103, 107, 111, 112] {
+            for x in [95, 99, 103, 107, 111, 112] {
                 assert_eq!(drawn[(x, 0)].symbol(), " ", "{x}");
                 assert_eq!(drawn[(x, 0)].bg, Color::Reset, "{x}");
             }
@@ -584,12 +601,13 @@ mod tests {
         press(&mut f.app, &[KeyCode::Down, KeyCode::Char('O')]);
         let header = screen(&mut f.app, 120, 30).remove(0);
         let wanted = format!(
-            " ~/Pictures{} 1 ~  2 Pictures    {}   {}   {}   {}   Name ▴ ",
-            " ".repeat(66),
+            " ~/Pictures{} 1 ~  2 Pictures    {}   {}   {}   {}   {}   Name ▴ ",
+            " ".repeat(62),
             icons::VIEW_LIST,
             icons::VIEW_COLUMNS,
             icons::VIEW_GRID,
-            icons::VIEW_DUAL
+            icons::VIEW_DUAL,
+            icons::GEAR
         );
         assert_eq!(header, wanted);
     }
@@ -608,19 +626,19 @@ mod tests {
             });
         };
         // The grid chip's left edge, its glyph, its right edge.
-        click(&mut f.app, 104);
+        click(&mut f.app, 100);
         assert_eq!(f.app.view(), ViewMode::Grid);
-        click(&mut f.app, 108);
+        click(&mut f.app, 104);
         assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Dual, 2));
         // Again, like Ctrl+4: back to the view the two panes came from.
-        click(&mut f.app, 110);
+        click(&mut f.app, 106);
         assert_eq!((f.app.view(), f.app.panes().len()), (ViewMode::Grid, 1));
-        click(&mut f.app, 101);
+        click(&mut f.app, 97);
         assert_eq!(f.app.view(), ViewMode::Columns);
-        click(&mut f.app, 98);
+        click(&mut f.app, 94);
         assert_eq!(f.app.view(), ViewMode::List);
         // Between the chips, nothing.
-        click(&mut f.app, 103);
+        click(&mut f.app, 99);
         assert_eq!(f.app.view(), ViewMode::List);
     }
 
@@ -632,17 +650,17 @@ mod tests {
             let header = screen(app, width, 10).remove(0);
             header.contains(icons::VIEW_LIST)
         };
-        // Room for them and 24 cells of path: 6 + 2 + 15 + 2 + 24 inside.
-        assert!(has_buttons(&mut f.app, 51));
-        assert!(!has_buttons(&mut f.app, 50));
+        // Room for them and 24 cells of path: 6 + 2 + 19 + 2 + 24 inside.
+        assert!(has_buttons(&mut f.app, 55));
+        assert!(!has_buttons(&mut f.app, 54));
         assert_eq!(
             screen(&mut f.app, 42, 10)[0],
             format!(" ~{}Name ▴ ", " ".repeat(33))
         );
         // A longer sort label needs more.
         press(&mut f.app, &[KeyCode::Char('s'), KeyCode::Char('s')]);
-        assert!(!has_buttons(&mut f.app, 54));
-        assert!(has_buttons(&mut f.app, 55));
+        assert!(!has_buttons(&mut f.app, 58));
+        assert!(has_buttons(&mut f.app, 59));
     }
 
     #[test]
@@ -658,17 +676,17 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             });
         };
-        click(&mut f.app, 78);
+        click(&mut f.app, 74);
         assert_eq!(
             (f.app.current, f.app.pane().cwd.clone()),
             (0, f.home.clone())
         );
         buffer(&mut f.app, 120, 30);
-        click(&mut f.app, 93);
+        click(&mut f.app, 89);
         assert_eq!(f.app.current, 1);
         // Between the labels and the view buttons, nothing.
         buffer(&mut f.app, 120, 30);
-        click(&mut f.app, 95);
+        click(&mut f.app, 91);
         assert_eq!(f.app.current, 1);
     }
 }

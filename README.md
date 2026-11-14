@@ -17,6 +17,7 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 - **Compress and Extract**, in the menu (`m`). Compress writes zip, tar, tar.gz, tar.bz2 or tar.xz (and 7z when [7-Zip](https://www.7-zip.org/) is installed as `7zz` or `7z`), named after the item without its extension, or after the folder several are in. Extract unpacks a zip, tar, tar.gz/.tgz, tar.bz2, tar.xz (or 7z) into a new folder beside it named after it without its ending. A name in use is never written over: the next free copy name is taken (`pack copy.tar.gz`, `pack copy 2.tar.gz`, `pack copy`). An archive holding a name from the root, one with `..`, or a link that leads out of its folder is refused with nothing written; one that is damaged or needs a password says so and leaves nothing behind; Escape stops either. Undo moves what was made to the Trash.
 - **Two panes** with Ctrl+Opt+4, `|` or Alt+1 to move things between folders (`y`/`x` in one, `p` or `M` in the other); the same key goes back to the view you came from.
 - **Filter and Find**, both typed on the bottom row. The filter (`/`) narrows the folder you are looking at as you type: part of a name in any case, or a `*` / `?` pattern; close matches (a letter or two off, depending on how long the text is) show only when nothing matches exactly. Tab widens it to every folder below. Find (`f` or Ctrl+F) walks the folders below and ranks what it finds: the whole name, then its start, the start of a word, the letters in order, and typos last. Tab looks in this folder, home, or everywhere; Ctrl+G looks inside files instead, through [ripgrep](https://github.com/BurntSushi/ripgrep) when it is installed. Go to a path with `:`.
+- **Settings** (`,` or the gear after the view buttons), in a card laid out like flea's: a rail with View and About on the left, the rows on the right. View holds what the keys already change — Last-used view, Preview pane, Places panel, Detail column, Sort by, Order, Show hidden files — each row doing what its key does and remembered the same way; About has the version, where the look comes from, the key sheet and a link to report an issue. Tab moves between the rail and the rows, `j`/`k` between rows, `h`/`l` (or Enter) change a choice, Space (or Enter) a check, Esc or a click outside closes it.
 - **Mouse friendly**, by flea's rules: click, double-click, right-click for the menu, Ctrl+click for one more, Shift+click for a range, the wheel to move.
 
 ## Requirements
@@ -83,7 +84,7 @@ flea's own terminal keys. Digits are never counts.
 | `tag:red` | In Find's field: only what carries that tag |
 | `o` | Show what Find found under the cursor in its own folder |
 | Space | Quick Look, in the terminal (see below) |
-| `.` | Show hidden files |
+| `.` | Show hidden files (remembered) |
 | `s` / `S` | Next sort key (name, size, modified, kind) / reverse the sort |
 | `I` | The columns view's detail column: size, modified, mode (`drwx------`), owner |
 | `T` | Finder tags: `1`–`7` turn a tag on or off, Remove All Tags |
@@ -116,6 +117,7 @@ flea's own terminal keys. Digits are never counts.
 | `{` / `}` | Move the tab left, right |
 | `1` … `9` | Go to that tab |
 | `?` | The keyboard shortcuts, in a card that scrolls with `j` / `k` and the page keys |
+| `,` | Settings |
 | `q` | Quit |
 
 Rename, Folder name and Go to ask on the bottom row. A paste that meets names already taken asks there too: Enter or `b` keeps both (`name copy.ext`), `r` replaces (the one there goes to the Trash, and undo brings it back), `s` skips, Escape cancels.
@@ -152,7 +154,7 @@ The mouse is tracked as flea does: presses and drags, and every move only while 
 
 ## Where it keeps things
 
-- `~/.config/filefinder-tui/`: the chosen view, tile size, sort, detail column and whether the preview and the places panel show (`state`), and where trashed items came from (`trashed`).
+- `~/.config/filefinder-tui/`: the chosen view, tile size, sort, detail column and whether the preview, the places panel and hidden files show (`state`), and where trashed items came from (`trashed`).
 - `~/Library/Caches/filefinder-tui/`: Quick Look thumbnails.
 - The Trash is `~/.Trash`. Restore works for items this app moved there.
 

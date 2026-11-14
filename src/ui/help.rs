@@ -49,6 +49,7 @@ pub const ROWS: &[(usize, &str, &str)] = &[
     (1, "I", "Detail column"),
     (1, "alt-p", "Preview column"),
     (1, "ctrl-b", "Places panel"),
+    (1, ",", "Settings"),
     (1, "ctrl-opt-1", "List view"),
     (1, "ctrl-opt-2", "Columns view"),
     (1, "ctrl-opt-3", "Grid view"),
@@ -302,7 +303,7 @@ mod tests {
         );
         assert_eq!(move_x, (title.0, 5));
         assert_eq!(look_x.1, 5);
-        assert_eq!(find_x, (look_x.0, 5 + 13), "under Look's heading and keys");
+        assert_eq!(find_x, (look_x.0, 5 + 14), "under Look's heading and keys");
         assert_eq!(change_x.1, 5);
         assert!(move_x.0 < look_x.0 && look_x.0 < change_x.0);
         assert_eq!(
@@ -346,6 +347,7 @@ mod tests {
             "ctrl-opt-3",
             "ctrl-opt-4 / | / alt-1",
             "alt-t",
+            ",",
             "t",
             "w / ctrl-w",
             "1–9",
