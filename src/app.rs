@@ -7081,6 +7081,42 @@ mod tests {
     }
 
     #[test]
+    fn replace_and_undo_keep_the_spelling_of_a_name_that_differs_only_in_case() {
+        let mut f = fixture();
+        let documents = f.home.join("Documents");
+        fs::write(documents.join("NOTES.TXT"), "old").unwrap();
+        if !documents.join("notes.txt").exists() {
+            // A case-sensitive volume: nothing clashes.
+            return;
+        }
+        select(&mut f.app, "notes.txt");
+        press(&mut f.app, &[KeyCode::Char('y')]);
+        select(&mut f.app, "Documents");
+        press(&mut f.app, &[KeyCode::Enter, KeyCode::Char('p')]);
+        let asked = f.app.question.as_ref().map(PasteQuestion::text);
+        assert_eq!(
+            asked.as_deref(),
+            Some("NOTES.TXT already exists in Documents.")
+        );
+        assert_eq!(selected_name(&f.app), Some("NOTES.TXT"));
+        press(&mut f.app, &[KeyCode::Char('r')]);
+        finish_work(&mut f.app);
+        assert_eq!(on_disk(&documents), ["notes.txt"]);
+        assert_eq!(read(documents.join("notes.txt")), "hello");
+        assert_eq!(on_disk(&f.trash), ["NOTES.TXT"]);
+        let record = f.app.trashed(&f.trash.join("NOTES.TXT")).unwrap();
+        assert_eq!(record.from, documents.join("NOTES.TXT"));
+        press(&mut f.app, &[KeyCode::Char('z')]);
+        assert_eq!(on_disk(&documents), ["NOTES.TXT"]);
+        assert_eq!(read(documents.join("NOTES.TXT")), "old");
+        f.app.handle_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(on_disk(&documents), ["notes.txt"]);
+        press(&mut f.app, &[KeyCode::Char('z')]);
+        assert_eq!(on_disk(&documents), ["NOTES.TXT"]);
+        assert_eq!(read(documents.join("NOTES.TXT")), "old");
+    }
+
+    #[test]
     fn replace_moves_the_one_there_to_the_trash_and_undo_brings_it_back() {
         let mut f = clash();
         let documents = f.home.join("Documents");

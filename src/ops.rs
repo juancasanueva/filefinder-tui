@@ -172,15 +172,37 @@ pub enum Collide {
 /// order of the items. An item a move would leave where it is meets none.
 pub fn clashes(items: &[PathBuf], folder: &Path, moving: bool) -> Vec<String> {
     let stays = |item: &&PathBuf| moving && in_folder(item, folder);
-    let taken = |item: &PathBuf| {
-        let name = item.file_name()?;
-        exists(&folder.join(name)).then(|| name.to_string_lossy().into_owned())
-    };
+    let taken = |item: &PathBuf| Some(shown(&taken_place(folder, item.file_name()?)?));
     items
         .iter()
         .filter(|item| !stays(item))
         .filter_map(taken)
         .collect()
+}
+
+/// The item in `folder` that has `name`, as the volume decides: the same
+/// name, or on a volume that ignores case one spelled otherwise. Its path is
+/// spelled the way the folder lists it, so that what is said about it, and
+/// where it goes and comes back to, keep its own spelling. `None` when the
+/// name is free.
+fn taken_place(folder: &Path, name: &OsStr) -> Option<PathBuf> {
+    let asked = folder.join(name);
+    let meta = fs::symlink_metadata(&asked).ok()?;
+    let listed = fs::read_dir(folder).ok().into_iter().flatten().flatten();
+    let mut same_item = None;
+    for entry in listed {
+        let listed_name = entry.file_name();
+        if listed_name == name {
+            return Some(asked);
+        }
+        let path = folder.join(&listed_name);
+        let is_it = fs::symlink_metadata(&path)
+            .is_ok_and(|other| other.dev() == meta.dev() && other.ino() == meta.ino());
+        if is_it && same_item.is_none() {
+            same_item = Some(path);
+        }
+    }
+    Some(same_item.unwrap_or(asked))
 }
 
 /// Copies or moves files and folders into a folder, treating the names
@@ -215,10 +237,7 @@ fn transfer_with(
 ) -> Report {
     let kind = if moving { Kind::Move } else { Kind::Copy };
     each(kind, items, cancel, |item| {
-        let taken = item
-            .file_name()
-            .map(|name| folder.join(name))
-            .filter(|place| exists(place));
+        let taken = item.file_name().and_then(|name| taken_place(folder, name));
         let keeps_both = |item: &Path| {
             if moving {
                 move_one(item, folder, cancel, rename)
@@ -273,8 +292,13 @@ fn replace_one(
     if inside(item, place) {
         return Turn::failed(format!("Can't replace {}: it holds {name}.", shown(place)));
     }
+    // The new item comes in under its own name, whatever the spelling of
+    // the one it replaces, which keeps its own in the trash and back.
+    let arriving = item
+        .file_name()
+        .map_or_else(|| place.to_path_buf(), |own| folder.join(own));
     // A name this disk can't give the item stops it before anything moves.
-    if let Some(error) = clash(place, Some(item)) {
+    if let Some(error) = clash(&arriving, Some(item)) {
         let verb = if moving { "move" } else { "copy" };
         return Turn::failed(format!("Couldn't {verb} {name}{}", because(&error)));
     }
@@ -292,16 +316,16 @@ fn replace_one(
         to: parked.clone(),
     };
     let placed = if moving {
-        move_new(item, place, cancel, rename)
+        move_new(item, &arriving, cancel, rename)
     } else {
-        copy_new(item, place, cancel).map(|()| Landed::Moved)
+        copy_new(item, &arriving, cancel).map(|()| Landed::Moved)
     };
     let arrived = match (moving, &placed) {
         (true, Ok(Landed::Moved)) => Step::Moved {
             from: item.to_path_buf(),
-            to: place.to_path_buf(),
+            to: arriving.clone(),
         },
-        _ => created(place.to_path_buf()),
+        _ => created(arriving.clone()),
     };
     let unfinished = match placed {
         Ok(Landed::Moved) => {
@@ -324,8 +348,8 @@ fn replace_one(
         Halt::Cancelled => End::Stopped,
         Halt::Taken => End::Failed(Error(format!(
             "{} already exists in {}.",
-            shown(place),
-            folder_name(place)
+            shown(&arriving),
+            folder_name(&arriving)
         ))),
         Halt::Failed(error) if moving => End::Failed(Error(format!(
             "Couldn't move {name}: {}",
@@ -726,7 +750,9 @@ impl Step {
             return Some(format!("{} isn't where it was left.", shown(item)));
         };
         let taken = free.filter(|place| {
-            exists(place) && !only_case_differs(source, place) && !freed.contains(&place.as_path())
+            exists(place)
+                && !only_case_differs(source, place)
+                && !freed.iter().any(|freed| same_entry(freed, place))
         })?;
         Some(format!(
             "{} already exists in {}.",
@@ -1567,6 +1593,16 @@ fn only_case_differs(a: &Path, b: &Path) -> bool {
         _ => false,
     };
     same_item && a.parent() == b.parent() && name_a != name_b && lower(name_a) == lower(name_b)
+}
+
+/// Whether two paths name one item: the same path, or, on a volume that
+/// ignores case, two spellings of a name that lead to the same item.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    a == b
+        || match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
 }
 
 /// Whether anything is at a path, a link that leads nowhere included.
@@ -3468,6 +3504,67 @@ mod tests {
         assert_eq!(w.read("Docs/Docs"), "inside");
         assert!(docs.is_dir());
         assert!(w.names(".Trash").is_empty());
+    }
+
+    /// Whether the volume a folder is on tells names apart only by letters,
+    /// not by case, as APFS and HFS+ do by default.
+    fn ignores_case(folder: &Path) -> bool {
+        let probe = folder.join("case-probe");
+        fs::write(&probe, "").unwrap();
+        let ignores = folder.join("CASE-PROBE").exists();
+        fs::remove_file(probe).unwrap();
+        ignores
+    }
+
+    #[test]
+    fn a_replace_by_a_name_that_differs_only_in_case_gives_the_original_its_own_back() {
+        let w = world();
+        let into = w.folder("Into");
+        if !ignores_case(&into) {
+            // A case-sensitive volume: there is no clash to replace.
+            return;
+        }
+        let a = w.file("a.txt", "new");
+        let there = w.file("Into/A.TXT", "old");
+        let original = inode(&there);
+        // What is asked about is the name on disk.
+        assert_eq!(clashes(std::slice::from_ref(&a), &into, false), ["A.TXT"]);
+        let report = transfer(&[a], &into, false, Collide::Replace, &w.trash, &go());
+        assert_eq!((said(&report), report.done), (None, 1));
+        assert_eq!(w.names("Into"), ["a.txt"]);
+        assert_eq!(w.read("Into/a.txt"), "new");
+        // In the trash under its own spelling, so that Restore keeps it.
+        assert_eq!(w.names(".Trash"), ["A.TXT"]);
+        assert_eq!(inode(&w.path(".Trash/A.TXT")), original);
+
+        let mut history = History::default();
+        history.record(report.change);
+        for _ in 0..2 {
+            history.undo(&w.trash).unwrap().unwrap();
+            assert_eq!(w.names("Into"), ["A.TXT"], "its own spelling");
+            assert_eq!(w.read("Into/A.TXT"), "old");
+            assert_eq!(inode(&w.path("Into/A.TXT")), original);
+            history.redo(&w.trash).unwrap().unwrap();
+            assert_eq!(w.names("Into"), ["a.txt"]);
+            assert_eq!(w.read("Into/a.txt"), "new");
+            assert!(w.names(".Trash").contains(&"A.TXT".to_string()));
+        }
+    }
+
+    #[test]
+    fn a_clash_is_named_after_the_entry_with_that_exact_name_when_there_is_one() {
+        // Simulates what a case-sensitive volume relies on: the folder holds
+        // an entry with the exact name, and another name for the same file
+        // (a hard link); the exact one is the name used.
+        let w = world();
+        let into = w.folder("Into");
+        let there = w.file("Into/a.txt", "old");
+        fs::hard_link(&there, w.path("Into/Z.txt")).unwrap();
+        let a = w.file("a.txt", "new");
+        assert_eq!(clashes(std::slice::from_ref(&a), &into, false), ["a.txt"]);
+        // A name nothing has is no clash, whatever the volume.
+        let b = w.file("b.txt", "b");
+        assert!(clashes(&[b], &into, false).is_empty());
     }
 
     #[test]
