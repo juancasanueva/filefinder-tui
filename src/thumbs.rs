@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{self, Child, Command};
+use std::process::{self, Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -65,10 +65,15 @@ impl MacThumbnailer {
 
     /// Has `qlmanage` draw the file into a folder of its own and reads the result.
     fn quick_look(&self, path: &Path) -> Option<DynamicImage> {
+        self.in_scratch(|out| quick_look_into(path, out))
+    }
+
+    /// Runs `make` with a folder of its own to write into, removed after.
+    fn in_scratch(&self, make: impl FnOnce(&Path) -> Option<DynamicImage>) -> Option<DynamicImage> {
         let run = self.runs.fetch_add(1, Ordering::Relaxed);
         let out = self.scratch.join(format!("{}-{run}", process::id()));
         fs::create_dir_all(&out).ok()?;
-        let image = quick_look_into(path, &out);
+        let image = make(&out);
         let _ = fs::remove_dir_all(&out);
         image
     }
@@ -84,6 +89,7 @@ impl Thumbnailer for MacThumbnailer {
                 decode(path).or_else(|| self.quick_look(path))
             }
             Category::Image | Category::Video | Category::Pdf => self.quick_look(path),
+            Category::App => self.in_scratch(|out| app_icon_into(path, out)),
             _ if QUICK_LOOK_DOCUMENTS.contains(&extension.as_str()) => self.quick_look(path),
             _ => None,
         }
@@ -133,6 +139,47 @@ fn quick_look_into(path: &Path, out: &Path) -> Option<DynamicImage> {
     let mut name = path.file_name()?.to_os_string();
     name.push(".png");
     image::open(out.join(name)).ok().map(shrink)
+}
+
+/// An app's icon: the `.icns` file its Info.plist names, which `sips`
+/// turns into `<out>/icon.png`. Apps that keep their icon only in an asset
+/// catalog have none here. Quick Look isn't asked: it can wait on an app
+/// for good.
+fn app_icon_into(app: &Path, out: &Path) -> Option<DynamicImage> {
+    let contents = app.join("Contents");
+    let named = Command::new("plutil")
+        .args(["-extract", "CFBundleIconFile", "raw", "-o", "-"])
+        .arg(contents.join("Info.plist"))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let name = String::from_utf8(named.stdout).ok()?;
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let file = if name.ends_with(".icns") {
+        name.to_string()
+    } else {
+        format!("{name}.icns")
+    };
+    let icon = contents.join("Resources").join(file);
+    if !icon.is_file() {
+        return None;
+    }
+    let png = out.join("icon.png");
+    let mut command = Command::new("sips");
+    command
+        .args(["-s", "format", "png", "-Z", &THUMB_PIXELS.to_string()])
+        .arg(&icon)
+        .arg("--out")
+        .arg(&png);
+    let child = quiet(&mut command).spawn().ok()?;
+    // `sips` says it succeeded even when it wrote nothing: the picture decides.
+    finished_in_time(child, QUICK_LOOK_PATIENCE);
+    image::open(&png).ok().map(shrink)
 }
 
 /// Waits for a child, killing it when it takes too long.
@@ -582,7 +629,7 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::GrayImage;
+    use image::{GrayImage, RgbaImage};
 
     fn entry(path: PathBuf) -> Entry {
         Entry::from_path(path).unwrap()
@@ -632,6 +679,60 @@ mod tests {
             assert!(thumbnailer.thumbnail(&file).is_none(), "{name}");
         }
         assert!(!cache.exists(), "nothing was written anywhere");
+    }
+
+    /// An app bundle whose Info.plist names `icon` as its icon file, with
+    /// that icon made from a picture `side` pixels square when given.
+    fn app(dir: &Path, name: &str, icon: &str, side: Option<u32>) -> PathBuf {
+        let bundle = dir.join(name);
+        let contents = bundle.join("Contents");
+        fs::create_dir_all(contents.join("Resources")).unwrap();
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <plist version=\"1.0\"><dict>\
+             <key>CFBundleIconFile</key><string>{icon}</string>\
+             </dict></plist>\n"
+        );
+        fs::write(contents.join("Info.plist"), plist).unwrap();
+        if let Some(side) = side {
+            // `iconutil` makes an icon from a folder of pictures named by size.
+            let set = dir.join(format!("{name}.iconset"));
+            fs::create_dir_all(&set).unwrap();
+            let png = set.join(format!("icon_{}x{}@2x.png", side / 2, side / 2));
+            RgbaImage::new(side, side).save(&png).unwrap();
+            let file = if icon.ends_with(".icns") {
+                icon.to_string()
+            } else {
+                format!("{icon}.icns")
+            };
+            let status = Command::new("iconutil")
+                .args(["-c", "icns"])
+                .arg(&set)
+                .arg("-o")
+                .arg(contents.join("Resources").join(file))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        bundle
+    }
+
+    #[test]
+    fn an_app_shows_the_icon_its_info_plist_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let thumbnailer = MacThumbnailer::new(&dir.path().join("cache"));
+        // The name with or without its extension, as apps write it.
+        for icon in ["AppIcon", "Tool.icns"] {
+            let bundle = app(dir.path(), &format!("{icon}.app"), icon, Some(1024));
+            let picture = thumbnailer.thumbnail(&bundle).expect(icon);
+            assert_eq!((picture.width(), picture.height()), (512, 512), "{icon}");
+        }
+        // An icon file that isn't there: no picture.
+        let missing = app(dir.path(), "Missing.app", "Gone", None);
+        assert!(thumbnailer.thumbnail(&missing).is_none());
+        // No scratch is left behind.
+        let left = fs::read_dir(dir.path().join("cache/quicklook")).map_or(0, |d| d.count());
+        assert_eq!(left, 0);
     }
 
     #[test]
