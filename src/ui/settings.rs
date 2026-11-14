@@ -28,16 +28,20 @@ fn glyph(section: Section) -> &'static str {
     }
 }
 
-/// How many body rows a section takes, its "Saved" row and the one above it
-/// included.
+/// How many body rows a section takes: its head, its rows, a blank row
+/// above each heading but the first, and its "Saved" row with the one
+/// above it.
 fn height(app: &App, section: Section) -> usize {
-    let rows = settings::rows(app, section).len();
+    let rows = settings::rows(app, section);
+    let headings = (rows.iter())
+        .filter(|row| matches!(row, Row::Heading(_)))
+        .count();
     let head = if section == Section::About {
         ABOUT_HEAD
     } else {
         0
     };
-    head + rows + 2
+    head + rows.len() + headings.saturating_sub(1) + 2
 }
 
 fn ink(color: Color) -> Style {
@@ -138,6 +142,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     for row in settings::rows(app, open.section) {
         match row {
             Row::Heading(text) => {
+                // A blank row between sections.
+                if y > pane.y {
+                    y += 1;
+                }
                 put(
                     frame,
                     y,
@@ -344,6 +352,39 @@ mod tests {
     fn row_of(drawn: &Buffer, app: &crate::app::App, label: &str) -> String {
         let (_, y) = find_in(drawn, app, label).expect(label);
         line(drawn, y)
+    }
+
+    #[test]
+    fn a_blank_row_stands_between_sections() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char(',')]);
+        let drawn = buffer(&mut f.app, 120, 30);
+        let (_, view) = find_in(&drawn, &f.app, "VIEW").unwrap();
+        let (_, detail) = find_in(&drawn, &f.app, "Detail column").unwrap();
+        let (sx, sorting) = find_in(&drawn, &f.app, "SORTING").unwrap();
+        // None above the first heading: it is the first row of the body.
+        assert_eq!(
+            view,
+            f.app
+                .hits
+                .rect_of(&crate::app::Spot::SettingsSection(Section::View))
+                .unwrap()
+                .y
+        );
+        assert_eq!(sorting, detail + 2);
+        let blank: String = (sx..sx + 20)
+            .map(|x| drawn[(x, detail + 1)].symbol())
+            .collect();
+        assert_eq!(blank.trim(), "");
+        // The rows under it keep their place among the items: the gap is no row.
+        let (_, sort_by) = find_in(&drawn, &f.app, "Sort by").unwrap();
+        assert_eq!(sort_by, sorting + 1);
+        let card = f.app.hits.rect_of(&crate::app::Spot::SettingsCard).unwrap();
+        let (x, y) = (sx, detail + 1);
+        assert!(card.contains(ratatui::layout::Position::new(x, y)));
+        click(&mut f.app, (x, y));
+        assert!(f.app.settings.is_some(), "a click on the gap does nothing");
+        assert_eq!(f.app.settings.map(|s| s.saved), Some(false));
     }
 
     #[test]
