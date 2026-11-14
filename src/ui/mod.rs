@@ -7,7 +7,7 @@ mod dual;
 mod footer;
 mod grid;
 mod help;
-mod list;
+pub(crate) mod list;
 mod look;
 mod menu;
 mod places;

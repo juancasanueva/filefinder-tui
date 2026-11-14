@@ -113,12 +113,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         body.height,
     );
     let width = pane.width as usize;
-    let mut y = pane.y;
     let put = |frame: &mut Frame, y: u16, line: Line<'static>| {
         if y < pane.bottom() {
             frame.render_widget(Paragraph::new(line), Rect::new(pane.x, y, pane.width, 1));
         }
     };
+    // The section's lines, each with the row it is when it is one.
+    let mut lines: Vec<(Line<'static>, Option<usize>)> = Vec::new();
     if open.section == Section::About {
         let bold = ink(theme::FOREGROUND).add_modifier(Modifier::BOLD);
         let head = vec![
@@ -129,28 +130,25 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             ),
             Span::styled(fit(NAME, width.saturating_sub(4)), bold),
         ];
-        put(frame, y, Line::from(head));
         let tagline = fit(TAGLINE, width.saturating_sub(1));
-        put(
-            frame,
-            y + 1,
+        lines.push((Line::from(head), None));
+        lines.push((
             Line::from(Span::styled(format!(" {tagline}"), ink(theme::MUTED))),
-        );
-        y += ABOUT_HEAD as u16;
+            None,
+        ));
+        lines.push((Line::default(), None));
     }
     let mut item = 0;
+    let mut cursor_line = 0;
     for row in settings::rows(app, open.section) {
         match row {
             Row::Heading(text) => {
                 // A blank row between sections.
-                if y > pane.y {
-                    y += 1;
+                if !lines.is_empty() {
+                    lines.push((Line::default(), None));
                 }
-                put(
-                    frame,
-                    y,
-                    Line::from(Span::styled(format!(" {text}"), ink(theme::MUTED))),
-                );
+                let heading = Span::styled(format!(" {text}"), ink(theme::MUTED));
+                lines.push((Line::from(heading), None));
             }
             Row::Item {
                 label,
@@ -159,14 +157,26 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 ..
             } => {
                 let lit = !open.in_rail && item == open.cursor;
-                put(frame, y, item_line(label, caption, &value, lit, width));
-                if y < pane.bottom() {
-                    hits.add(Rect::new(pane.x, y, pane.width, 1), Spot::SettingsRow(item));
+                if item == open.cursor {
+                    cursor_line = lines.len();
                 }
+                lines.push((item_line(label, caption, &value, lit, width), Some(item)));
                 item += 1;
             }
         }
-        y += 1;
+    }
+    // A card shorter than its section scrolls, the keyboard's row in sight;
+    // the last two rows stay for "Saved".
+    let shown = (pane.height as usize).saturating_sub(2).max(1);
+    let top = (cursor_line + 1).saturating_sub(shown);
+    for (at, (line, row)) in lines.into_iter().skip(top).take(shown).enumerate() {
+        let y = pane.y + at as u16;
+        put(frame, y, line);
+        if let Some(row) = row
+            && y < pane.bottom()
+        {
+            hits.add(Rect::new(pane.x, y, pane.width, 1), Spot::SettingsRow(row));
+        }
     }
     if open.saved {
         let saved = Line::from(Span::styled(" Saved", ink(theme::MUTED)));
@@ -361,7 +371,8 @@ mod tests {
         let drawn = buffer(&mut f.app, 120, 30);
         let (_, view) = find_in(&drawn, &f.app, "VIEW").unwrap();
         let (_, detail) = find_in(&drawn, &f.app, "Detail column").unwrap();
-        let (sx, sorting) = find_in(&drawn, &f.app, "SORTING").unwrap();
+        // The section after the view's rows is the columns'.
+        let (sx, sorting) = find_in(&drawn, &f.app, "COLUMNS").unwrap();
         // None above the first heading: it is the first row of the body.
         assert_eq!(
             view,
@@ -377,14 +388,40 @@ mod tests {
             .collect();
         assert_eq!(blank.trim(), "");
         // The rows under it keep their place among the items: the gap is no row.
-        let (_, sort_by) = find_in(&drawn, &f.app, "Sort by").unwrap();
-        assert_eq!(sort_by, sorting + 1);
+        let (_, size) = find_in(&drawn, &f.app, "Size  ").unwrap();
+        assert_eq!(size, sorting + 1);
         let card = f.app.hits.rect_of(&crate::app::Spot::SettingsCard).unwrap();
         let (x, y) = (sx, detail + 1);
         assert!(card.contains(ratatui::layout::Position::new(x, y)));
         click(&mut f.app, (x, y));
         assert!(f.app.settings.is_some(), "a click on the gap does nothing");
         assert_eq!(f.app.settings.map(|s| s.saved), Some(false));
+    }
+
+    #[test]
+    fn a_short_window_scrolls_the_rows_to_keep_the_keyboard_s_row_in_sight() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char(',')]);
+        let drawn = buffer(&mut f.app, 120, 18);
+        assert!(find_in(&drawn, &f.app, "Last-used view").is_some());
+        assert!(find_in(&drawn, &f.app, "Space previews in").is_none());
+        // Down to the last row: it shows, on the cursor's fill.
+        for _ in 0..20 {
+            press(&mut f.app, &[KeyCode::Char('j')]);
+        }
+        let drawn = buffer(&mut f.app, 120, 18);
+        let (x, y) = find_in(&drawn, &f.app, "Space previews in").expect("the last row");
+        assert_eq!(drawn[(x, y)].bg, theme::CURSOR);
+        assert!(find_in(&drawn, &f.app, "Last-used view").is_none());
+        // A click on it is a click on that row.
+        click(&mut f.app, (x, y));
+        assert_eq!(f.app.space_look, crate::app::SpaceLook::QuickLook);
+        // Back up, the first row again.
+        for _ in 0..20 {
+            press(&mut f.app, &[KeyCode::Char('k')]);
+        }
+        let drawn = buffer(&mut f.app, 120, 18);
+        assert!(find_in(&drawn, &f.app, "Last-used view").is_some());
     }
 
     #[test]

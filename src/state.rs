@@ -1,7 +1,8 @@
 //! What is remembered between launches: the view, the size of the tiles,
 //! whether the preview pane shows, the sort, the list's detail column,
 //! whether the places panel shows, whether hidden items show, where Space
-//! shows an item, and where what is in the trash came from.
+//! shows an item, which of the list's columns show, and where what is in
+//! the trash came from.
 
 use std::fs;
 use std::io;
@@ -29,7 +30,12 @@ pub struct Saved {
     pub hidden: bool,
     /// Where Space shows the item under the cursor.
     pub space: SpaceLook,
+    /// Which of the list's columns show, in their order.
+    pub columns: [bool; 5],
 }
+
+/// The list's columns as the state file names them, in their order.
+const COLUMNS: [&str; 5] = ["size", "user", "permissions", "kind", "modified"];
 
 impl Default for Saved {
     fn default() -> Self {
@@ -42,6 +48,7 @@ impl Default for Saved {
             places: true,
             hidden: false,
             space: SpaceLook::Terminal,
+            columns: [true; 5],
         }
     }
 }
@@ -80,6 +87,10 @@ pub fn load(dir: &Path) -> Saved {
             ("hidden", "off") => saved.hidden = false,
             ("space", "terminal") => saved.space = SpaceLook::Terminal,
             ("space", "quicklook") => saved.space = SpaceLook::QuickLook,
+            ("columns", names) => {
+                let names: Vec<&str> = names.split(',').map(str::trim).collect();
+                saved.columns = COLUMNS.map(|column| names.contains(&column));
+            }
             _ => {}
         }
     }
@@ -106,6 +117,11 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
     let detail = saved.detail.label().to_lowercase();
     let places = if saved.places { "on" } else { "off" };
     let hidden = if saved.hidden { "on" } else { "off" };
+    let columns: Vec<&str> = (COLUMNS.iter().zip(saved.columns))
+        .filter(|(_, shown)| *shown)
+        .map(|(name, _)| *name)
+        .collect();
+    let columns = columns.join(",");
     let space = match saved.space {
         SpaceLook::Terminal => "terminal",
         SpaceLook::QuickLook => "quicklook",
@@ -114,7 +130,7 @@ pub fn save(dir: &Path, saved: Saved) -> io::Result<()> {
     fs::write(
         dir.join(FILE),
         format!(
-            "view={view}\ntiles={tiles}\npreview={preview}\nsort={sort}\nreverse={reverse}\ndetail={detail}\nplaces={places}\nhidden={hidden}\nspace={space}\n"
+            "view={view}\ntiles={tiles}\npreview={preview}\nsort={sort}\nreverse={reverse}\ndetail={detail}\nplaces={places}\nhidden={hidden}\nspace={space}\ncolumns={columns}\n"
         ),
     )
 }
@@ -207,6 +223,7 @@ mod tests {
                 places: true,
                 hidden: false,
                 space: SpaceLook::Terminal,
+                columns: [true; 5],
             }
         );
     }
@@ -228,11 +245,12 @@ mod tests {
             places: true,
             hidden: true,
             space: SpaceLook::QuickLook,
+            columns: [true, false, true, true, false],
         };
         save(&folder, saved).unwrap();
         assert_eq!(
             fs::read_to_string(folder.join("state")).unwrap(),
-            "view=columns\ntiles=small\npreview=off\nsort=modified\nreverse=on\ndetail=mode\nplaces=on\nhidden=on\nspace=quicklook\n"
+            "view=columns\ntiles=small\npreview=off\nsort=modified\nreverse=on\ndetail=mode\nplaces=on\nhidden=on\nspace=quicklook\ncolumns=size,permissions,kind\n"
         );
         assert_eq!(load(&folder), saved);
         let shown = Saved {
@@ -262,6 +280,7 @@ mod tests {
                 places: true,
                 hidden: false,
                 space: SpaceLook::Terminal,
+                columns: [true; 5],
             }
         );
     }
@@ -277,7 +296,7 @@ mod tests {
         save(dir.path(), hidden).unwrap();
         let text = fs::read_to_string(dir.path().join("state")).unwrap();
         assert!(
-            text.ends_with("detail=size\nplaces=off\nhidden=off\nspace=terminal\n"),
+            text.ends_with("detail=size\nplaces=off\nhidden=off\nspace=terminal\ncolumns=size,user,permissions,kind,modified\n"),
             "{text}"
         );
         assert_eq!(load(dir.path()), hidden);

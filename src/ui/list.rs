@@ -200,7 +200,8 @@ impl Column {
     }
 }
 
-/// The columns a list `width` cells wide shows for `entries`, each with its
+/// The columns a list `width` cells wide shows for `entries`, of those
+/// `keep` says (in [`COLUMNS`]' order), each with its
 /// width: its widest value or its title, up to [`Column::widest`]. Columns
 /// stand while the name keeps [`NAME_ROOM`] cells.
 pub fn table(
@@ -208,10 +209,12 @@ pub fn table(
     width: usize,
     now: std::time::SystemTime,
     style: DateStyle,
+    keep: [bool; 5],
 ) -> Vec<(Column, usize)> {
     let mut shown = Vec::new();
     let mut used = ROW_CHROME + NAME_ROOM;
-    for column in COLUMNS {
+    let kept = COLUMNS.into_iter().zip(keep).filter(|(_, kept)| *kept);
+    for (column, _) in kept {
         let widest = (entries.iter())
             .map(|entry| column.value(entry, now, style).width())
             .max()
@@ -469,7 +472,7 @@ pub fn draw(
     hits: &mut HitMap,
 ) {
     let caption = app.caption;
-    let (sort, style) = (app.sort, app.date_style);
+    let (sort, style, keep) = (app.sort, app.date_style, app.columns);
     let now = std::time::SystemTime::now();
     let me = crate::ops::user_id();
     let pane = &mut app.tab_mut().panes[index];
@@ -492,7 +495,13 @@ pub fn draw(
     pane.offset = scroll(pane.offset, pane.cursor, rows);
     // The columns fit what shows, so they don't grow for what is out of sight.
     let end = (pane.offset + rows).min(pane.entries.len());
-    let table = table(&pane.entries[pane.offset.min(end)..end], width, now, style);
+    let table = table(
+        &pane.entries[pane.offset.min(end)..end],
+        width,
+        now,
+        style,
+        keep,
+    );
     if header {
         // On the tab fill, so it reads as the header and not as an item.
         let fill = Style::default().bg(theme::ink(theme::TAB));
@@ -847,13 +856,44 @@ mod tests {
     }
 
     #[test]
+    fn the_list_shows_only_the_columns_the_settings_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        let entries = [entry(dir.path(), "notes.txt")];
+        let now = std::time::SystemTime::now();
+        let shown = |width, keep| -> Vec<Column> {
+            let table = table(&entries, width, now, DateStyle::MonthFirst, keep);
+            table.iter().map(|(column, _)| *column).collect()
+        };
+        let keep = [true, false, true, false, true];
+        let all = shown(400, keep);
+        assert_eq!(all, [Column::Size, Column::Permissions, Column::Modified]);
+        assert_eq!(shown(400, [false; 5]), []);
+        // Narrow, the last of those give way first, as ever.
+        for width in 0..400 {
+            let columns = shown(width, keep);
+            assert_eq!(columns, all[..columns.len()], "{width}");
+        }
+        // In the list itself, the header and the rows leave them out.
+        use crate::app::testing::fixture;
+        let mut f = fixture();
+        f.app.columns = keep;
+        let drawn = buffer(&mut f.app, 200, 30);
+        let files = panes(&f.app, 200).files;
+        let (_, top) = find(&drawn, "Permissions", files.clone()).expect("the header");
+        assert_eq!(x_in(&drawn, top, "User", files.clone()), None);
+        assert_eq!(x_in(&drawn, top, "Kind", files.clone()), None);
+        assert!(x_in(&drawn, top, "Modified", files).is_some());
+    }
+
+    #[test]
     fn a_narrow_list_drops_its_last_columns_first() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("notes.txt"), "hello").unwrap();
         let entries = [entry(dir.path(), "notes.txt")];
         let now = std::time::SystemTime::now();
         let shown = |width| -> Vec<Column> {
-            let table = table(&entries, width, now, DateStyle::MonthFirst);
+            let table = table(&entries, width, now, DateStyle::MonthFirst, [true; 5]);
             table.iter().map(|(column, _)| *column).collect()
         };
         assert_eq!(shown(20), []);

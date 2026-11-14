@@ -1238,6 +1238,9 @@ pub struct App {
     pub settings: Option<crate::settings::Settings>,
     /// Where Space shows the item under the cursor: a setting.
     pub space_look: SpaceLook,
+    /// Which of the list's columns show, in their order (Size, User,
+    /// Permissions, Kind, Modified): a setting.
+    pub columns: [bool; 5],
     /// How many lines the shortcuts are scrolled down; drawing keeps it in range.
     pub help_scroll: usize,
     /// Lines of shortcuts shown last time, for Page Up and Page Down.
@@ -1326,6 +1329,7 @@ impl App {
             tip: None,
             settings: None,
             space_look: saved.space,
+            columns: saved.columns,
             help_scroll: 0,
             help_rows: 1,
             dialog: None,
@@ -4129,6 +4133,7 @@ impl App {
                 places: self.places_visible,
                 hidden: self.show_hidden,
                 space: self.space_look,
+                columns: self.columns,
             };
             // A view that isn't remembered is no reason to interrupt.
             let _ = state::save(dir, saved);
@@ -4220,6 +4225,10 @@ impl App {
             }
             Setting::Order => self.set_sort(self.sort.reverse()),
             Setting::Hidden => self.toggle_hidden(),
+            Setting::Column(index) => {
+                self.columns[index] = !self.columns[index];
+                self.remember();
+            }
             Setting::Space => {
                 self.space_look = match self.space_look {
                     SpaceLook::Terminal => SpaceLook::QuickLook,
@@ -5557,7 +5566,7 @@ mod tests {
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
-            "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\nspace=terminal\n"
+            "view=list\ntiles=normal\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\nspace=terminal\ncolumns=size,user,permissions,kind,modified\n"
         );
         app.handle_key(ctrl(KeyCode::Char('3')));
         assert_eq!(app.view(), ViewMode::Grid);
@@ -5687,7 +5696,7 @@ mod tests {
         let saved = fs::read_to_string(state.path().join("state")).unwrap();
         assert_eq!(
             saved,
-            "view=list\ntiles=large\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\nspace=terminal\n"
+            "view=list\ntiles=large\npreview=on\nsort=name\nreverse=off\ndetail=size\nplaces=on\nhidden=off\nspace=terminal\ncolumns=size,user,permissions,kind,modified\n"
         );
         assert_eq!(launch(&f.home, Some(state.path())).tile, Large);
     }

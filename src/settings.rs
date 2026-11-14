@@ -40,6 +40,8 @@ pub enum Setting {
     SortBy,
     Order,
     Hidden,
+    /// Whether one of the list's columns shows, by its place among them.
+    Column(usize),
     Space,
     Version,
     BasedOn,
@@ -66,7 +68,9 @@ impl Setting {
             Setting::View | Setting::Detail | Setting::SortBy | Setting::Order | Setting::Space => {
                 Kind::Choice
             }
-            Setting::Preview | Setting::Places | Setting::Hidden => Kind::Check,
+            Setting::Preview | Setting::Places | Setting::Hidden | Setting::Column(_) => {
+                Kind::Check
+            }
             Setting::Keys | Setting::Issue => Kind::Action,
             Setting::Version | Setting::BasedOn => Kind::Fact,
         }
@@ -154,6 +158,16 @@ fn item(setting: Setting, label: &'static str, value: Value) -> Row {
     }
 }
 
+/// A check for whether one of the list's columns shows.
+fn column(app: &App, index: usize) -> Row {
+    let title = crate::ui::list::COLUMNS[index].title();
+    item(
+        Setting::Column(index),
+        title,
+        Value::Check(app.columns[index]),
+    )
+}
+
 /// A section's lines as the app stands.
 pub fn rows(app: &App, section: Section) -> Vec<Row> {
     match section {
@@ -180,6 +194,12 @@ pub fn rows(app: &App, section: Section) -> Vec<Row> {
                 value: Value::Choice(app.detail.label()),
                 caption: Some("columns view"),
             },
+            Row::Heading("COLUMNS"),
+            column(app, 0),
+            column(app, 1),
+            column(app, 2),
+            column(app, 3),
+            column(app, 4),
             Row::Heading("SORTING"),
             item(
                 Setting::SortBy,
@@ -255,6 +275,23 @@ mod tests {
     use ratatui::crossterm::event::KeyCode;
     use std::path::PathBuf;
 
+    /// Steps the open card's keyboard to a row with `j` or `k`.
+    fn reach(app: &mut crate::app::App, setting: Setting) {
+        let open = app.settings.expect("the settings are open");
+        let target = items(&rows(app, open.section))
+            .iter()
+            .position(|s| *s == setting)
+            .expect("the row");
+        let (key, times) = match target >= open.cursor {
+            true => (KeyCode::Char('j'), target - open.cursor),
+            false => (KeyCode::Char('k'), open.cursor - target),
+        };
+        for _ in 0..times {
+            press(app, &[key]);
+        }
+        assert_eq!(app.settings.map(|s| s.cursor), Some(target));
+    }
+
     #[test]
     fn comma_opens_the_settings_on_view_with_the_keyboard_in_the_rows_and_esc_closes_them() {
         let mut f = fixture();
@@ -289,6 +326,11 @@ mod tests {
                 Setting::Preview,
                 Setting::Places,
                 Setting::Detail,
+                Setting::Column(0),
+                Setting::Column(1),
+                Setting::Column(2),
+                Setting::Column(3),
+                Setting::Column(4),
                 Setting::SortBy,
                 Setting::Order,
                 Setting::Hidden,
@@ -315,12 +357,14 @@ mod tests {
         press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
         assert!(!app.places_visible);
         // Detail column, Sort by, Order.
-        press(&mut app, &[KeyCode::Char('j'), KeyCode::Char('l')]);
+        reach(&mut app, Setting::Detail);
+        press(&mut app, &[KeyCode::Char('l')]);
         assert_eq!(app.detail, Detail::Modified);
         // Space leaves a choice as it is.
         press(&mut app, &[KeyCode::Char(' ')]);
         assert_eq!(app.detail, Detail::Modified);
-        press(&mut app, &[KeyCode::Char('j'), KeyCode::Char('l')]);
+        reach(&mut app, Setting::SortBy);
+        press(&mut app, &[KeyCode::Char('l')]);
         assert_eq!((app.sort.key, app.sort.reversed), (SortKey::Size, false));
         press(&mut app, &[KeyCode::Char('j'), KeyCode::Enter]);
         assert_eq!((app.sort.key, app.sort.reversed), (SortKey::Size, true));
@@ -331,7 +375,7 @@ mod tests {
         press(&mut app, &[KeyCode::Char('j'), KeyCode::Char('l')]);
         assert_eq!(app.space_look, SpaceLook::QuickLook);
         press(&mut app, &[KeyCode::Char('j')]);
-        assert_eq!(app.settings.map(|s| s.cursor), Some(7));
+        assert_eq!(app.settings.map(|s| s.cursor), Some(12));
         assert_eq!(app.settings.map(|s| s.saved), Some(true));
         // All of it is there at the next launch, hidden files included.
         let again = launch(&f.home, Some(state.path()));
@@ -372,9 +416,7 @@ mod tests {
             }
         );
         press(&mut f.app, &[KeyCode::Char(',')]);
-        for _ in 0..7 {
-            press(&mut f.app, &[KeyCode::Char('j')]);
-        }
+        reach(&mut f.app, Setting::Space);
         press(&mut f.app, &[KeyCode::Char('l')]);
         let view = rows(&f.app, Section::View);
         assert!(view.contains(&Row::Item {
@@ -392,14 +434,62 @@ mod tests {
         assert_eq!(*f.system.previewed.borrow(), [notes.clone(), notes]);
         // And back.
         press(&mut f.app, &[KeyCode::Char(',')]);
-        for _ in 0..7 {
-            press(&mut f.app, &[KeyCode::Char('j')]);
-        }
+        reach(&mut f.app, Setting::Space);
         press(
             &mut f.app,
             &[KeyCode::Char('h'), KeyCode::Esc, KeyCode::Char(' ')],
         );
         assert!(f.app.look.is_some());
+    }
+
+    #[test]
+    fn the_columns_rows_choose_the_list_s_columns_and_are_remembered() {
+        let f = fixture();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = launch_one_pane(&f.home, Some(state.path()));
+        // All five at first, under their heading, right after the view's rows.
+        assert_eq!(app.columns, [true; 5]);
+        let view = rows(&app, Section::View);
+        let at = view
+            .iter()
+            .position(|row| *row == Row::Heading("COLUMNS"))
+            .unwrap();
+        assert!(matches!(
+            view[at - 1],
+            Row::Item {
+                setting: Setting::Detail,
+                ..
+            }
+        ));
+        let labels: Vec<_> = view[at + 1..at + 6]
+            .iter()
+            .map(|row| match row {
+                Row::Item { label, value, .. } => (*label, value.clone()),
+                Row::Heading(_) => panic!("a heading among the columns"),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            ["Size", "User", "Permissions", "Kind", "Modified"].map(|l| (l, Value::Check(true)))
+        );
+        // Space hides one, Enter another.
+        press(&mut app, &[KeyCode::Char(',')]);
+        reach(&mut app, Setting::Column(1));
+        press(&mut app, &[KeyCode::Char(' ')]);
+        assert_eq!(app.columns, [true, false, true, true, true]);
+        reach(&mut app, Setting::Column(4));
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.columns, [true, false, true, true, false]);
+        // Remembered by name.
+        let text = std::fs::read_to_string(state.path().join("state")).unwrap();
+        assert!(text.contains("columns=size,permissions,kind\n"), "{text}");
+        assert_eq!(launch(&f.home, Some(state.path())).columns, app.columns);
+        // None at all is remembered as none.
+        for column in [0, 2, 3] {
+            reach(&mut app, Setting::Column(column));
+            press(&mut app, &[KeyCode::Char(' ')]);
+        }
+        assert_eq!(launch(&f.home, Some(state.path())).columns, [false; 5]);
     }
 
     #[test]
