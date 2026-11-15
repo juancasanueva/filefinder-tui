@@ -35,8 +35,8 @@ const FAILED: usize = 4000;
 /// How long Quick Look gets for one file before it is given up on.
 const QUICK_LOOK_PATIENCE: Duration = Duration::from_secs(4);
 /// How much of a text file is read for its opening lines.
-const OPENING_BYTES: u64 = 4096;
-const OPENING_LINES: usize = 40;
+const OPENING_BYTES: u64 = 64 * 1024;
+const OPENING_LINES: usize = 1000;
 /// The most items of a folder the preview lists.
 const CHILDREN: usize = 1000;
 
@@ -819,15 +819,15 @@ mod tests {
             ["fn main() {}"]
         );
 
-        // One enormous line: only its first four kilobytes are read.
+        // One enormous line: only its first 64 kilobytes are read.
         let long = facts("long.txt", "x".repeat(100_000).as_bytes());
         assert_eq!(long.opening.len(), 1);
-        assert_eq!(long.opening[0].len(), 4096);
+        assert_eq!(long.opening[0].len(), 65_536);
         // The cut falls inside the last `é`: the text before it still counts.
-        let accents = facts("accents.txt", format!("x{}", "é".repeat(3000)).as_bytes());
-        assert_eq!(accents.opening, [format!("x{}", "é".repeat(2047))]);
-        let many = facts("many.txt", "line\n".repeat(500).as_bytes());
-        assert_eq!(many.opening.len(), 40);
+        let accents = facts("accents.txt", format!("x{}", "é".repeat(40_000)).as_bytes());
+        assert_eq!(accents.opening, [format!("x{}", "é".repeat(32_767))]);
+        let many = facts("many.txt", "line\n".repeat(2000).as_bytes());
+        assert_eq!(many.opening.len(), 1000);
 
         // Not UTF-8, not a text file, rich text: no lines.
         assert!(facts("latin.txt", b"caf\xe9 au lait\n").opening.is_empty());

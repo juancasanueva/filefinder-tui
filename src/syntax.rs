@@ -52,8 +52,17 @@ impl Colourer for Bat {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        // The preview's few kilobytes fit the pipes: no reader thread needed.
-        child.stdin.take()?.write_all(text.as_bytes()).ok()?;
+        // The text and its colours can outgrow the pipes' buffers: feed `bat`
+        // and drain it at once, or both sides wait on each other. Killing
+        // `bat` closes the pipes, which ends both threads.
+        let mut stdin = child.stdin.take()?;
+        let mut stdout = child.stdout.take()?;
+        let text = text.to_owned();
+        thread::spawn(move || stdin.write_all(text.as_bytes()));
+        let reader = thread::spawn(move || {
+            let mut output = String::new();
+            stdout.read_to_string(&mut output).ok().map(|_| output)
+        });
         let deadline = Instant::now() + PATIENCE;
         loop {
             match child.try_wait() {
@@ -66,9 +75,7 @@ impl Colourer for Bat {
                 }
             }
         }
-        let mut output = String::new();
-        child.stdout.take()?.read_to_string(&mut output).ok()?;
-        Some(output)
+        reader.join().ok()?
     }
 }
 
@@ -405,6 +412,26 @@ mod tests {
         // A name it doesn't know: plain text, nothing coloured.
         let plain = Bat.colour("notes.unknown-kind", "fn main").unwrap();
         assert!(runs(&plain).iter().flatten().all(|(role, _)| *role == 0));
+    }
+
+    #[test]
+    fn bat_colours_a_whole_preview_more_than_the_pipes_hold_at_once() {
+        if Bat.colour("main.rs", "fn main").is_none() {
+            eprintln!("bat isn't installed: nothing to check");
+            return;
+        }
+        // About 64 kilobytes of code: its colours outgrow a pipe's buffer.
+        let line = "    let value = compute(\"text\", 42, Some(true));\n";
+        let text = line.repeat(64 * 1024 / line.len());
+        let (sent, got) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sent.send(Bat.colour("main.rs", &text));
+        });
+        let output = got
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bat never finished: the pipes deadlocked")
+            .expect("bat gave no colours");
+        assert_eq!(output.lines().count(), 64 * 1024 / line.len());
     }
 
     #[test]
