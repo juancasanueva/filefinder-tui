@@ -32,7 +32,6 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::supports_keyboard_enhancement;
-use ratatui_image::picker::cap_parser::QueryStdioOptions;
 use ratatui_image::picker::{Picker, ProtocolType};
 
 use app::{App, Config};
@@ -107,9 +106,7 @@ fn give_back(enhanced: bool) {
 /// Asks the terminal how it shows pictures. It has to be asked before any key
 /// is read; one that doesn't say gets them as colored half blocks.
 fn query_picker() -> Picker {
-    let options = picture_question(std::env::var_os("HERDR_ENV").as_deref());
-    let picker =
-        Picker::from_query_stdio_with_options(options).unwrap_or_else(|_| Picker::halfblocks());
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
     if picker.capabilities().is_empty() {
         // The terminal said nothing useful. When it said nothing at all (tmux
         // with nobody attached passes the question on to no one) the picker
@@ -121,6 +118,8 @@ fn query_picker() -> Picker {
         if out.write_all(b"\x1b[5n").and_then(|()| out.flush()).is_ok() {
             drop(io::stdin().lock());
         }
+    } else {
+        hear_late_answers(&mut picker, read_input);
     }
     picker
 }
@@ -165,34 +164,89 @@ fn take_in(app: &mut App, event: Event) {
     }
 }
 
-/// What the picture question asks. herdr (`HERDR_ENV` is set in its panes)
-/// answers the kitty graphics part only after the status report that ends
-/// the question: the picker has stopped reading by then, and the late answer
-/// would come in as keys. Pictures there are half blocks either way.
-fn picture_question(herdr: Option<&std::ffi::OsStr>) -> QueryStdioOptions {
-    let mut options = QueryStdioOptions::default();
-    if herdr.is_some_and(|value| !value.is_empty()) {
-        options.blacklist_protocols = vec![ProtocolType::Kitty];
+/// How long a late answer to the picture question gets to come in, after
+/// the last one.
+const LATE: Duration = Duration::from_millis(150);
+
+/// After the picture question, when it did not say kitty: herdr-app answers
+/// the kitty graphics part only after the status report that ends the
+/// question, once the picker has stopped reading. What comes in late is read
+/// here, so it doesn't reach the app as keys; kitty saying OK turns kitty
+/// graphics on. `read` waits up to its time for what comes in next.
+fn hear_late_answers(picker: &mut Picker, mut read: impl FnMut(Duration) -> Option<Vec<u8>>) {
+    if picker.protocol_type() != ProtocolType::Halfblocks {
+        return;
     }
-    options
+    let mut heard = Vec::new();
+    // Bounded, should the terminal never stop talking.
+    while heard.len() < 4096 {
+        match read(LATE) {
+            Some(bytes) => heard.extend(bytes),
+            None => break,
+        }
+    }
+    let ok = b"\x1b_Gi=31;OK";
+    if heard.windows(ok.len()).any(|window| window == ok) {
+        picker.set_protocol_type(ProtocolType::Kitty);
+    }
+}
+
+/// What the terminal sends next on the standard input, waiting up to `wait`
+/// for it; nothing when it sends nothing in that time.
+fn read_input(wait: Duration) -> Option<Vec<u8>> {
+    let mut ready = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one valid pollfd, and the count says one.
+    if unsafe { libc::poll(&mut ready, 1, millis) } <= 0 {
+        return None;
+    }
+    let mut buffer = [0u8; 512];
+    // SAFETY: reads at most the buffer's length into it.
+    let read = unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
+    let read = usize::try_from(read).ok().filter(|read| *read > 0)?;
+    Some(buffer[..read].to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui_image::picker::cap_parser::Parser;
-    use std::ffi::OsStr;
+    use std::collections::VecDeque;
 
-    /// Whether the picture question asks about kitty graphics.
-    fn asks_kitty(herdr: Option<&OsStr>) -> bool {
-        Parser::query(false, picture_question(herdr)).contains("_Gi=")
+    /// A terminal that sends `chunks` late, one per read, then nothing.
+    fn late(chunks: &[&[u8]]) -> impl FnMut(Duration) -> Option<Vec<u8>> {
+        let mut chunks: VecDeque<Vec<u8>> = chunks.iter().map(|c| c.to_vec()).collect();
+        move |_| chunks.pop_front()
     }
 
     #[test]
-    fn inside_herdr_the_picture_question_leaves_kitty_graphics_out() {
-        assert!(!asks_kitty(Some(OsStr::new("1"))));
-        // Anywhere else it is asked, as before.
-        assert!(asks_kitty(None));
-        assert!(asks_kitty(Some(OsStr::new(""))));
+    fn a_late_kitty_ok_turns_kitty_graphics_on_and_everything_late_is_read() {
+        let mut picker = Picker::halfblocks();
+        let mut chunks = late(&[b"\x1b_Gi=31;OK", b"\x1b\\", b"\x1b[?62;22c"]);
+        let mut reads = 0;
+        hear_late_answers(&mut picker, |wait| {
+            reads += 1;
+            chunks(wait)
+        });
+        assert_eq!(picker.protocol_type(), ProtocolType::Kitty);
+        // Every chunk was read, and the read that found nothing ended it.
+        assert_eq!(reads, 4);
+    }
+
+    #[test]
+    fn without_a_late_kitty_ok_the_picker_keeps_what_it_had() {
+        for chunks in [&[][..], &[&b"\x1b_Gi=31;ENOTSUPPORTED\x1b\\"[..]][..]] {
+            let mut picker = Picker::halfblocks();
+            hear_late_answers(&mut picker, late(chunks));
+            assert_eq!(picker.protocol_type(), ProtocolType::Halfblocks);
+        }
+        // A picker that already draws better isn't kept waiting.
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        hear_late_answers(&mut picker, |_| panic!("read while kitty was known"));
+        assert_eq!(picker.protocol_type(), ProtocolType::Kitty);
     }
 }
