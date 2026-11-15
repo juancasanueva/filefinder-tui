@@ -1335,6 +1335,10 @@ pub struct App {
     pub help_scroll: usize,
     /// Lines of shortcuts shown last time, for Page Up and Page Down.
     pub help_rows: usize,
+    /// What the shortcuts are filtered by: `/` on the sheet types it.
+    pub help_filter: Input,
+    /// Whether keys on the sheet go into its filter.
+    pub help_typing: bool,
     pub dialog: Option<Dialog>,
     /// The menu that is open: `m`.
     pub menu: Option<Menu>,
@@ -1435,6 +1439,8 @@ impl App {
                 .unwrap_or_default(),
             help_scroll: 0,
             help_rows: 1,
+            help_filter: Input::default(),
+            help_typing: false,
             dialog: None,
             menu: None,
             look: None,
@@ -1709,10 +1715,30 @@ impl App {
             return;
         }
         if self.help_visible {
-            // The shortcuts keep every key: these scroll or close them, and
-            // no other reaches the files underneath.
+            // The shortcuts keep every key: these scroll, filter or close
+            // them, and no other reaches the files underneath.
             let page = self.help_rows.max(1);
+            if self.help_typing {
+                // Typing: letters go into the filter; Enter keeps it,
+                // Escape clears it, the arrows and page keys still scroll.
+                match key.code {
+                    KeyCode::Enter => self.help_typing = false,
+                    KeyCode::Esc => self.clear_help_filter(),
+                    KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                    KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                    KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
+                    KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(page),
+                    _ => {
+                        if self.help_filter.handle_key(key) {
+                            self.help_scroll = 0;
+                        }
+                    }
+                }
+                return;
+            }
             match key.code {
+                KeyCode::Char('/') => self.help_typing = true,
+                KeyCode::Esc if !self.help_filter.chars().is_empty() => self.clear_help_filter(),
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q') => {
                     self.help_visible = false
                 }
@@ -1866,7 +1892,7 @@ impl App {
             Command::Escape => self.escape(),
             // Looking.
             Command::Help => {
-                self.help_visible = true;
+                self.open_help();
                 self.help_scroll = 0;
             }
             // The card in the terminal, or macOS's window: a setting.
@@ -2418,6 +2444,19 @@ impl App {
             });
         }
         arrived
+    }
+
+    /// Shows the shortcuts, every one of them: no filter, not typing.
+    fn open_help(&mut self) {
+        self.help_visible = true;
+        self.clear_help_filter();
+    }
+
+    /// Takes the filter off the shortcuts and stops typing into it.
+    fn clear_help_filter(&mut self) {
+        self.help_filter = Input::default();
+        self.help_typing = false;
+        self.help_scroll = 0;
     }
 
     /// A turn of the wheel: over a pane, its cursor one row further, as
@@ -4655,7 +4694,7 @@ impl App {
             }
             Setting::Keys => {
                 self.settings = None;
-                self.help_visible = true;
+                self.open_help();
                 return;
             }
             Setting::Issue => {

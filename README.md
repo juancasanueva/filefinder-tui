@@ -51,7 +51,7 @@ Nothing runs in the background. Folders are read when you open them, and thumbna
 
 ![Find listing Rust files with their folders](docs/screenshots/find.png)
 
-**Keyboard Shortcuts** (`?`), with the keys from your `keys.toml`.
+**Keyboard Shortcuts** (`?`), with the keys from your `keys.toml`; `/` filters them.
 
 ![The key sheet](docs/screenshots/keys.png)
 
@@ -171,7 +171,7 @@ Digits are never counts. These are the default keys; the browsing commands' keys
 | `[` / `]` | Previous tab, next tab |
 | `{` / `}` | Move the tab left, right |
 | `1` … `9` | Go to that tab |
-| `?` | The keyboard shortcuts, in a card that scrolls with `j` / `k` and the page keys |
+| `?` | The keyboard shortcuts, in a card that scrolls with `j` / `k` and the page keys. `/` filters it by keys or words as you type; Enter keeps the filter, Escape clears it |
 | `,` | Settings |
 | `q` | Quit |
 

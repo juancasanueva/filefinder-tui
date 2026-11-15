@@ -1,9 +1,11 @@
 //! The `?` sheet: the card "Keyboard Shortcuts" between the window's rules,
 //! with every key the app has in four groups, each group whole, in
 //! up to three columns four cells apart. It scrolls when they don't fit.
+//! `/` filters it: only the keys whose keys or words hold what is typed,
+//! in any case, as the filter of a folder matches names exactly.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
@@ -11,10 +13,21 @@ use unicode_width::UnicodeWidthStr;
 use super::card::{self, ESC};
 use super::{fit, pad, pad_left, words};
 use crate::app::{App, HitMap, Spot};
+use crate::input::Input;
 use crate::keys::{Command, Keymap};
+use crate::matcher::Query;
 use crate::theme;
 
 pub const TITLE: &str = "Keyboard Shortcuts";
+
+/// What the sheet's last row says while nothing filters it.
+pub const FILTER_HINT: &str = "/ filter";
+
+/// What the sheet says when the filter leaves no key standing.
+pub const NO_MATCH: &str = "No shortcuts match";
+
+/// The filter line's label.
+const FILTER_LABEL: &str = "Filter";
 
 /// The groups, as their headings spell them.
 pub const GROUPS: [&str; 4] = ["MOVE", "LOOK", "FIND", "CHANGE"];
@@ -199,17 +212,35 @@ enum Sheet {
     Words(String),
 }
 
-/// The groups, each row with the keys the keys file gives its commands.
-fn groups(keymap: &Keymap) -> Vec<Vec<Sheet>> {
+/// The groups, each row with the keys the keys file gives its commands;
+/// with a query, only the rows whose keys or words hold it, and only the
+/// groups with a row left.
+fn groups(keymap: &Keymap, query: Option<&Query>) -> Vec<Vec<Sheet>> {
+    let holds = |text: &str| query.is_none_or(|query| query.exact(text).is_some());
     let group = |index: usize| {
-        let mut lines = vec![Sheet::Heading(GROUPS[index])];
         let rows = ROWS.iter().filter(|(group, _, _)| *group == index);
-        lines.extend(
-            rows.map(|(_, keys, does)| Sheet::Binding(keymap.show(commands(keys), keys), does)),
-        );
+        let bindings: Vec<Sheet> = rows
+            .map(|(_, keys, does)| (keymap.show(commands(keys), keys), *does))
+            .filter(|(keys, does)| holds(keys) || holds(does))
+            .map(|(keys, does)| Sheet::Binding(keys, does))
+            .collect();
+        if bindings.is_empty() {
+            return bindings;
+        }
+        let mut lines = vec![Sheet::Heading(GROUPS[index])];
+        lines.extend(bindings);
         lines
     };
-    (0..GROUPS.len()).map(group).collect()
+    (0..GROUPS.len())
+        .map(group)
+        .filter(|lines| !lines.is_empty())
+        .collect()
+}
+
+/// How many keys the groups hold.
+fn bindings(groups: &[Vec<Sheet>]) -> usize {
+    let binding = |line: &&Sheet| matches!(line, Sheet::Binding(..));
+    groups.iter().flatten().filter(binding).count()
 }
 
 /// Groups fill a column in order, and the next group starts a new column
@@ -262,14 +293,13 @@ fn total(columns: &[Vec<Sheet>]) -> usize {
 /// The most columns, up to three, that fit `room` cells with the fewest
 /// rows, `rows` being what the card shows; a screen too narrow for one
 /// column of keys beside their words has each on lines of their own.
-fn sheet(keymap: &Keymap, rows: usize, room: usize) -> Vec<Vec<Sheet>> {
-    let groups = groups(keymap);
+fn sheet(groups: &[Vec<Sheet>], rows: usize, room: usize) -> Vec<Vec<Sheet>> {
     for count in (1..=COLUMNS).rev() {
         let mut capacity = rows.max(1);
-        while pack(&groups, capacity).len() > count {
+        while pack(groups, capacity).len() > count {
             capacity += 1;
         }
-        let columns = pack(&groups, capacity);
+        let columns = pack(groups, capacity);
         if total(&columns) <= room {
             return columns;
         }
@@ -293,15 +323,31 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
     // Inside the frame: the title, the rule, the rows and a blank last row
     // whenever there is room for one.
     let inside = outer_height.saturating_sub(2) as usize;
-    let rows = if inside > 4 {
+    let base = if inside > 4 {
         inside - 3
     } else {
         inside.saturating_sub(2)
     };
+    // While filtering, the filter's line takes the last of the rows, with
+    // a row of air above it when there is room.
+    let filtering = app.help_typing || !app.help_filter.chars().is_empty();
+    let bar = match base {
+        _ if !filtering => 0,
+        0 => 0,
+        1 | 2 => 1,
+        _ => 2,
+    };
+    let rows = base - bar;
     let room = card::room(area.width) as usize;
-    let columns = sheet(&app.keymap, rows, room);
+    let query = Query::new(&app.help_filter.text());
+    let every = groups(&app.keymap, None);
+    let found = groups(&app.keymap, query.as_ref());
+    let columns = sheet(&found, rows, room);
     let heading = TITLE.width() + 2 + ESC.width();
-    let need = total(&columns).max(heading).min(room) as u16;
+    // As wide as the whole sheet, so that the card holds still as the
+    // filter narrows it.
+    let widest = total(&sheet(&every, rows, room)).max(total(&columns));
+    let need = widest.max(heading).min(room) as u16;
     let air = card::air(area.width);
     let width = need + 2 * air + 2;
     let outer = Rect {
@@ -335,6 +381,61 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
             break;
         }
     }
+
+    let body = card.body;
+    if filtering && columns.is_empty() && rows > 0 {
+        let text = fit(NO_MATCH, body.width as usize);
+        let line = Span::styled(text, theme::muted());
+        frame.render_widget(line, Rect { height: 1, ..body });
+    }
+    if bar > 0 {
+        let y = body.y + (rows + bar - 1) as u16;
+        let line = Rect {
+            y,
+            height: 1,
+            ..body
+        };
+        let shown = bindings(&found);
+        filter_line(frame, &app.help_filter, app.help_typing, shown, line);
+    } else if inside > 4 && body.width as usize >= FILTER_HINT.width() {
+        // The blank last row says how to filter, against the right edge.
+        let width = FILTER_HINT.width() as u16;
+        let x = body.right() - width;
+        let line = Rect::new(x, body.y + rows as u16, width, 1);
+        frame.render_widget(Span::styled(FILTER_HINT, theme::muted()), line);
+    }
+}
+
+/// The filter's line: its muted label, a space, what is typed on the
+/// field's fill and, room allowing, how many keys it leaves of them all.
+/// While typing, the terminal's cursor is the caret.
+fn filter_line(frame: &mut Frame, input: &Input, typing: bool, shown: usize, area: Rect) {
+    let width = area.width as usize;
+    let used = FILTER_LABEL.width() + 1;
+    let after = format!("  {shown} of {} shown", ROWS.len());
+    // The field keeps a cell for the caret; the count goes first when
+    // the field would be left too narrow.
+    let field = width.saturating_sub(used + 1 + after.width());
+    let (after, field) = if field >= 4 {
+        (after, field)
+    } else {
+        (String::new(), width.saturating_sub(used + 1))
+    };
+    let (text, caret) = input.window(field);
+    let mut spans = vec![
+        Span::styled(FILTER_LABEL, theme::muted()),
+        Span::raw(" "),
+        Span::styled(text.clone(), theme::field()),
+    ];
+    if typing {
+        spans.push(Span::styled(" ", theme::field()));
+    }
+    spans.push(Span::styled(after, theme::muted()));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let at = used + caret as usize;
+    if typing && at < width {
+        frame.set_cursor_position(Position::new(area.x + at as u16, area.y));
+    }
 }
 
 /// One line of a column: a heading in the metadata ink; keys right-aligned
@@ -362,7 +463,7 @@ fn sheet_line(line: &Sheet, key: usize, does: usize, width: usize) -> Line<'stat
 mod tests {
     use super::*;
     use crate::app::App;
-    use crate::app::testing::{fixture, press};
+    use crate::app::testing::{fixture, press, type_text};
     use crate::ui::testing::{buffer, find, screen};
     use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::KeyCode;
@@ -613,5 +714,101 @@ mod tests {
         for (width, height) in [(3, 2), (20, 5), (12, 6), (40, 7), (179, 12)] {
             show(&mut f.app, width, height);
         }
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "tab");
+        for (width, height) in [(3, 2), (20, 5), (12, 6), (40, 7), (179, 12)] {
+            show(&mut f.app, width, height);
+        }
+    }
+
+    #[test]
+    fn the_sheet_says_slash_filters_it() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        assert!(show(&mut f.app, 140, 40).contains(FILTER_HINT));
+    }
+
+    #[test]
+    fn slash_filters_the_sheet_by_keys_or_words_in_any_case() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "TRASH");
+        let drawn = show(&mut f.app, 140, 40);
+        assert!(drawn.contains("Move to Trash"));
+        assert!(drawn.contains("dd / delete"));
+        assert!(drawn.contains("f8 (two panes)"));
+        assert!(drawn.contains("CHANGE"), "the group that holds them");
+        assert!(!drawn.contains("Cursor down"));
+        assert!(!drawn.contains("MOVE"), "a group with nothing left goes");
+        assert!(!drawn.contains(FILTER_HINT));
+        assert!(drawn.contains("Filter TRASH"));
+        assert!(drawn.contains(&format!("2 of {} shown", ROWS.len())));
+
+        // By the keys too.
+        for _ in 0.."TRASH".len() {
+            press(&mut f.app, &[KeyCode::Backspace]);
+        }
+        type_text(&mut f.app, "ctrl-g");
+        let drawn = show(&mut f.app, 140, 40);
+        assert!(drawn.contains("Search contents"));
+        assert!(!drawn.contains("Reload"), "ctrl-r is not ctrl-g");
+    }
+
+    #[test]
+    fn while_typing_every_letter_is_text_and_enter_keeps_the_filter() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        press(&mut f.app, &[KeyCode::Char('/')]);
+        type_text(&mut f.app, "q?jk");
+        assert!(f.app.help_visible, "q and ? are text, not close");
+        assert_eq!(f.app.help_filter.text(), "q?jk");
+        assert_eq!(f.app.help_scroll, 0);
+
+        // Enter stops typing and keeps what it shows.
+        press(&mut f.app, &[KeyCode::Backspace; 4]);
+        type_text(&mut f.app, "tab");
+        press(&mut f.app, &[KeyCode::Enter]);
+        assert!(f.app.help_visible && !f.app.help_typing);
+        assert_eq!(f.app.help_filter.text(), "tab");
+        let kept = show(&mut f.app, 140, 40);
+        assert!(kept.contains("New tab") && !kept.contains("Cursor down"));
+        // j scrolls again rather than typing.
+        press(&mut f.app, &[KeyCode::Char('j')]);
+        assert_eq!(f.app.help_filter.text(), "tab");
+
+        // Escape clears the filter first, then closes the sheet.
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.help_visible);
+        assert_eq!(f.app.help_filter.text(), "");
+        assert!(show(&mut f.app, 140, 40).contains("Cursor down"));
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(!f.app.help_visible);
+    }
+
+    #[test]
+    fn escape_while_typing_clears_the_filter_and_the_sheet_stays() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?'), KeyCode::Char('/')]);
+        type_text(&mut f.app, "zoom");
+        press(&mut f.app, &[KeyCode::Esc]);
+        assert!(f.app.help_visible && !f.app.help_typing);
+        assert_eq!(f.app.help_filter.text(), "");
+    }
+
+    #[test]
+    fn nothing_matching_says_so_and_the_sheet_opens_again_unfiltered() {
+        let mut f = fixture();
+        press(&mut f.app, &[KeyCode::Char('?'), KeyCode::Char('/')]);
+        type_text(&mut f.app, "xyzzy");
+        let drawn = show(&mut f.app, 140, 40);
+        assert!(drawn.contains(NO_MATCH));
+        assert!(drawn.contains(&format!("0 of {} shown", ROWS.len())));
+        press(&mut f.app, &[KeyCode::Enter, KeyCode::Char('q')]);
+        assert!(!f.app.help_visible && !f.app.should_quit);
+        press(&mut f.app, &[KeyCode::Char('?')]);
+        assert_eq!(f.app.help_filter.text(), "");
+        assert!(!f.app.help_typing);
+        assert!(show(&mut f.app, 140, 40).contains("Cursor down"));
     }
 }
