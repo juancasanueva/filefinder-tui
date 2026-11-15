@@ -188,16 +188,21 @@ fn card() -> Style {
     theme::on(theme::MUTED, theme::TAB)
 }
 
-/// A plain card with a folder's tab on its top left.
+/// A plain card with a folder's tab on its top left, in the blue of the
+/// folder glyphs.
 pub(super) fn folder_card(frame: &mut Frame, thumb: Rect) {
     let tab = "▄".repeat((thumb.width / 3) as usize);
-    frame.render_widget(Paragraph::new(tab).style(theme::fg(theme::TAB)), thumb);
+    let folder = theme::fg(theme::ICON_FOLDER);
+    frame.render_widget(Paragraph::new(tab).style(folder), thumb);
     let body = Rect {
         y: thumb.y + 1,
         height: thumb.height - 1,
         ..thumb
     };
-    frame.render_widget(Block::new().style(card()), body);
+    frame.render_widget(
+        Block::new().style(theme::on(theme::MUTED, theme::ICON_FOLDER)),
+        body,
+    );
 }
 
 /// What a file shows until it has a picture of its own: a box with the glyph
@@ -478,13 +483,14 @@ mod tests {
         whole_grid(&mut f.app);
         let buffer = buffer(&mut f.app, 62, 26);
 
-        // Pictures: the tab on the top left, the card under it.
+        // Pictures: the tab on the top left, the card under it, in the
+        // blue of the folder glyphs.
         assert_eq!(buffer[(23, 3)].symbol(), "▄");
-        assert_eq!(buffer[(23, 3)].fg, theme::TAB);
+        assert_eq!(buffer[(23, 3)].fg, theme::ICON_FOLDER);
         assert_eq!(buffer[(38, 3)].symbol(), " ");
         assert_eq!(buffer[(38, 3)].bg, Color::Reset);
-        assert_eq!(buffer[(23, 4)].bg, theme::TAB);
-        assert_eq!(buffer[(38, 8)].bg, theme::TAB);
+        assert_eq!(buffer[(23, 4)].bg, theme::ICON_FOLDER);
+        assert_eq!(buffer[(38, 8)].bg, theme::ICON_FOLDER);
 
         // notes.txt: a box, the glyph of its kind in the middle, the extension in a corner.
         assert_eq!(buffer[(43, 3)].bg, theme::TAB);
@@ -614,7 +620,7 @@ mod tests {
         }
         // Folders keep their card and are never asked for.
         assert_eq!(after[(23, 3)].symbol(), "▄");
-        assert_eq!(after[(23, 4)].bg, theme::TAB);
+        assert_eq!(after[(23, 4)].bg, theme::ICON_FOLDER);
         let mut asked = thumbnailer.asked();
         asked.sort();
         assert_eq!(asked, ["notes.txt", "tall.jpg"]);
