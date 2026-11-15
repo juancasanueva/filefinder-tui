@@ -105,6 +105,8 @@ pub fn draw(
     let columns = columns(area.width, size);
     let rows = visible_rows(area.height, size);
     let caption = app.caption;
+    // Of two panes only the active one shows its cursor.
+    let active = app.active() == pane_index;
     let tab = &mut app.tabs[app.current];
     let pane = &mut tab.panes[pane_index];
     pane.grid_columns = columns;
@@ -123,7 +125,7 @@ pub fn draw(
             break;
         };
         let look = Look {
-            cursor: index == pane.cursor,
+            cursor: active && index == pane.cursor,
             focused,
             marked: pane.is_marked(index),
             ..Look::default()

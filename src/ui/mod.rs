@@ -1578,15 +1578,15 @@ mod tests {
         assert_eq!(right[(right_edge + 1, 2)].fg, theme::MUTED);
         assert_eq!(right[(right_edge + 3, 2)].fg, theme::FOREGROUND);
         // Under them a header, then the files, each pane's own, with its own
-        // cursor: only the pane with the keyboard draws the edge.
+        // cursor: only the pane with the keyboard shows it, the other none.
         assert_eq!(cells(&right, 4, start + 3..start + 12), "Documents");
         assert_eq!(cells(&right, 5, start + 3..start + 11), "Pictures");
         assert_eq!(cells(&right, 4, right_edge + 3..right_edge + 7), "Trip");
         assert_eq!(cells(&right, 5, right_edge + 3..right_edge + 8), "a.jpg");
-        assert_eq!(
-            (right[(left_edge, 5)].symbol(), right[(left_edge, 5)].bg),
-            (" ", theme::SELECTED)
-        );
+        for x in start..div {
+            assert_eq!(right[(x, 5)].bg, Color::Reset, "{x}");
+        }
+        assert_eq!(right[(left_edge, 5)].symbol(), " ");
         assert_eq!(
             (right[(right_edge, 5)].symbol(), right[(right_edge, 5)].bg),
             ("▎", theme::CURSOR)
@@ -1602,7 +1602,18 @@ mod tests {
         assert_eq!(left[(right_edge + 3, 2)].fg, theme::MUTED);
         assert_eq!(left[(left_edge, 5)].symbol(), "▎");
         assert_eq!(left[(right_edge, 5)].symbol(), " ");
+        assert_eq!(left[(right_edge, 5)].bg, Color::Reset);
         assert_eq!(cells(&left, 0, 0..60).trim(), "~");
+
+        // With the keyboard in the places panel the active pane keeps its
+        // cursor, without the edge; the other pane still shows none.
+        f.app.focus = Focus::Places;
+        let panel = buffer(&mut f.app, 120, 30);
+        assert_eq!(
+            (panel[(left_edge, 5)].symbol(), panel[(left_edge, 5)].bg),
+            (" ", theme::SELECTED)
+        );
+        assert_eq!(panel[(right_edge, 5)].bg, Color::Reset);
 
         // Closed, the window is what it was before.
         f.app.handle_key(key(KeyCode::Char('|')));

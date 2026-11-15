@@ -1,5 +1,6 @@
 //! Two panes, Ctrl+4: two lists side by side with a line between them, each
-//! under its own path. Only the list with the keyboard draws the accent edge.
+//! under its own path. Only the active list shows its cursor, and only with
+//! the keyboard does it draw the accent edge.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

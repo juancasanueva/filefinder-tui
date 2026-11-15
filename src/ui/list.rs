@@ -475,6 +475,8 @@ pub fn draw(
     let (sort, style, keep) = (app.sort, app.date_style, app.columns);
     let now = std::time::SystemTime::now();
     let me = crate::ops::user_id();
+    // Of two panes only the active one shows its cursor.
+    let active = app.active() == index;
     let pane = &mut app.tab_mut().panes[index];
     // The header takes the top row once there is a row for items under it.
     let header = area.height >= 2;
@@ -530,7 +532,7 @@ pub fn draw(
         hits.add(line, spot);
         note_app(&mut apps, entry, line);
         let look = Look {
-            cursor: item == pane.cursor,
+            cursor: active && item == pane.cursor,
             focused,
             marked: pane.is_marked(item),
             ..Look::default()
