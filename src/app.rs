@@ -516,6 +516,8 @@ pub enum Spot {
     Places,
     /// A place in the panel, by its place among them all.
     Place(usize),
+    /// The eject button on a volume's row in the panel, by its place.
+    Eject(usize),
     /// The preview pane.
     Preview,
     /// The menu, wherever no line is.
@@ -1364,6 +1366,9 @@ pub struct App {
     empty_since: Option<Instant>,
     /// The volume each folder the footer named is on, asked once.
     volumes: HashMap<PathBuf, Option<Volume>>,
+    /// Whether each mounted volume the panel listed is on the Mac's own
+    /// disk, asked once until Ctrl+R.
+    internal_volumes: HashMap<PathBuf, bool>,
     pub should_quit: bool,
     pub date_style: DateStyle,
     /// What colours code in the preview.
@@ -1454,6 +1459,7 @@ impl App {
             caption: 0,
             empty_since: None,
             volumes: HashMap::new(),
+            internal_volumes: HashMap::new(),
             should_quit: false,
             date_style: config.date_style,
             thumbs: config.thumbs,
@@ -2088,6 +2094,7 @@ impl App {
             }
             (true, Spot::Pane(pane)) => self.enter_pane(pane),
             (true, Spot::Place(index)) => self.open_place(index),
+            (true, Spot::Eject(index)) => self.eject_place(index),
             (true, Spot::Places) => self.enter_places(),
             (true, Spot::View(view)) => self.choose_view(view),
             (true, Spot::Gear) => self.open_settings(),
@@ -2190,6 +2197,15 @@ impl App {
 
     /// Reads what the panel lists again, keeping its cursor among them.
     fn read_places(&mut self) {
+        let (system, asked) = (&self.system, &mut self.internal_volumes);
+        let mut internal = |volume: &Path| {
+            let known = asked.get(volume).copied();
+            known.unwrap_or_else(|| {
+                let internal = system.internal(volume);
+                asked.insert(volume.to_path_buf(), internal);
+                internal
+            })
+        };
         self.places = places::read(
             &self.applications_dir,
             &self.home,
@@ -2197,6 +2213,7 @@ impl App {
             &self.volumes_dir,
             self.tags_in_use,
             &self.pins,
+            &mut internal,
         );
         let last = places::flat(&self.places).count().saturating_sub(1);
         self.places_cursor = self.places_cursor.min(last);
@@ -2344,9 +2361,38 @@ impl App {
             KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
                 self.unpin_place(cursor)
             }
+            KeyCode::Char('e') if plain => self.eject_place(cursor),
             _ if self.window_key(key) => self.command_key(key, None),
             _ => {}
         }
+    }
+
+    /// `e` in the panel or a click on a volume's `⏏`: ejects it, as Finder
+    /// does. Panes showing a folder on it go home; the panel lists it no
+    /// more. Anything else under the cursor is left alone.
+    fn eject_place(&mut self, index: usize) {
+        let place = places::flat(&self.places).nth(index);
+        let Some(place) = place.filter(|place| place.ejectable) else {
+            return;
+        };
+        let (name, volume) = (place.name.clone(), place.path.clone());
+        if self.system.eject(&volume).is_err() {
+            self.fail(format!("Couldn't eject {name}. Something may be using it."));
+            return;
+        }
+        let (current, home) = (self.current, self.home.clone());
+        for tab in 0..self.tabs.len() {
+            self.current = tab;
+            for pane in 0..self.panes().len() {
+                if self.panes()[pane].cwd.starts_with(&volume) {
+                    self.in_pane(pane, |app| app.navigate(&home));
+                }
+            }
+        }
+        self.current = current;
+        self.volumes.clear();
+        self.read_places();
+        self.note(&format!("Ejected {name}"));
     }
 
     /// Ctrl+B: hides or shows the places panel, and remembers it. Hidden,
@@ -2486,7 +2532,7 @@ impl App {
             }
             Some(Spot::Preview) => self.scroll_preview(rows),
             // The panel scrolls a line; drawing keeps it in range.
-            Some(Spot::Places | Spot::Place(_)) => {
+            Some(Spot::Places | Spot::Place(_) | Spot::Eject(_)) => {
                 self.places_offset = self.places_offset.saturating_add_signed(rows)
             }
             _ => {}
@@ -4763,6 +4809,7 @@ impl App {
     /// panel again.
     fn refresh(&mut self) {
         self.volumes.clear();
+        self.internal_volumes.clear();
         self.read_tags_in_use();
         self.read_places();
         self.reload();
@@ -5140,6 +5187,14 @@ pub mod testing {
         pub in_use: Rc<Cell<Option<u8>>>,
         /// How many times the tags in use were asked for.
         pub in_use_asked: Rc<Cell<usize>>,
+        /// Every volume ejected; each is removed, as if unmounted.
+        pub ejected: Rc<RefCell<Vec<PathBuf>>>,
+        /// Whether ejecting fails, as when something uses the volume.
+        pub eject_fails: Rc<Cell<bool>>,
+        /// The volumes on the Mac's own disk; the others are external.
+        pub internal: Rc<RefCell<Vec<PathBuf>>>,
+        /// How many times a volume was asked whether it is internal.
+        pub internal_asked: Rc<Cell<usize>>,
     }
 
     /// The stand-in for the editor: what it does to the file.
@@ -5244,6 +5299,19 @@ pub mod testing {
                 }
             });
             Some((lister, unpacker))
+        }
+
+        fn eject(&self, volume: &Path) -> io::Result<()> {
+            if self.eject_fails.get() {
+                return Err(io::Error::other("it is in use"));
+            }
+            self.ejected.borrow_mut().push(volume.to_path_buf());
+            std::fs::remove_dir_all(volume)
+        }
+
+        fn internal(&self, volume: &Path) -> bool {
+            self.internal_asked.set(self.internal_asked.get() + 1);
+            self.internal.borrow().iter().any(|path| path == volume)
         }
 
         fn volume(&self, _folder: &Path) -> Option<Volume> {

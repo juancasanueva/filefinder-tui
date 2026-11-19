@@ -84,6 +84,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
                 hits.add(Rect::new(area.x, y, area.width, 1), Spot::Place(index));
                 let cursor = focused && index == app.places_cursor;
                 let place = all[index];
+                if shows_eject(place, width) {
+                    let x = area.x + (width - EJECT_ROOM) as u16;
+                    hits.add(Rect::new(x, y, EJECT_ROOM as u16, 1), Spot::Eject(index));
+                }
                 place_row(place, width, cursor, current == Some(index))
             }
         });
@@ -93,6 +97,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect, hits: &mut HitMap) {
 
 /// Cells left free after the widest name, so the panel doesn't feel crowded.
 const AIR: usize = 5;
+
+/// The cells a volume's eject button takes at the end of its row, out of
+/// its air: the button and a cell after it.
+const EJECT_ROOM: usize = 2;
 
 /// The panel's width for what it lists: its widest row (the edge, the
 /// glyph and its space, the name, then `AIR`) or heading.
@@ -106,6 +114,13 @@ pub fn needed(sections: &[places::Section]) -> u16 {
         });
     let headings = sections.iter().map(|section| section.heading.width() + 2);
     rows.chain(headings).max().unwrap_or(0) as u16
+}
+
+/// Whether a place's row, `width` cells wide, ends on an eject button: a
+/// volume's does when there is room for it after the edge and the glyph.
+fn shows_eject(place: &places::Place, width: usize) -> bool {
+    let glyph = icons::place(place.kind).width() + 1;
+    place.ejectable && width > 1 + glyph + EJECT_ROOM
 }
 
 /// A place's row: the edge, the glyph, a space and the name, filled to the
@@ -125,14 +140,21 @@ fn place_row(place: &places::Place, width: usize, cursor: bool, here: bool) -> L
     let glyph_ink = icons::place_tint(place.kind);
     let glyph = fit(&format!("{} ", icons::place(place.kind)), width - 1);
     let room = width - 1 - glyph.width();
+    let eject = shows_eject(place, width);
+    let room = if eject { room - EJECT_ROOM } else { room };
     let name = fit(&place.name, room);
     let gap = room - name.width();
-    Line::from(vec![
+    let mut spans = vec![
         edge,
         Span::styled(glyph, text(glyph_ink)),
         Span::styled(name, text(theme::FOREGROUND)),
         Span::styled(" ".repeat(gap), text(theme::FOREGROUND)),
-    ])
+    ];
+    if eject {
+        spans.push(Span::styled(icons::eject(), text(theme::MUTED)));
+        spans.push(Span::styled(" ", text(theme::FOREGROUND)));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -205,6 +227,7 @@ mod tests {
             name: name.to_string(),
             path: std::path::PathBuf::from("/"),
             kind: Kind::Drive,
+            ejectable: false,
         };
         let sections = |names: &[&str], heading| {
             vec![Section {
@@ -241,6 +264,12 @@ mod tests {
             glyph("Macintosh HD", icons::PLACE_DRIVE),
             glyph("Backup", icons::PLACE_DRIVE),
         ];
+        // A volume's row ends on its eject button, after the air.
+        let ejectable = |row: &str| {
+            let name = glyph("Backup", icons::PLACE_DRIVE);
+            let button = row.strip_prefix(&name)?.strip_suffix(icons::eject())?;
+            (!button.is_empty() && button.trim().is_empty()).then_some(name)
+        };
         let views = [
             KeyCode::Char('1'),
             KeyCode::Char('2'),
@@ -249,7 +278,8 @@ mod tests {
         ];
         for view in views {
             f.app.handle_key(ctrl(view));
-            let rows = panel(&mut f);
+            let mut rows = panel(&mut f);
+            rows[9] = ejectable(&rows[9]).unwrap_or_else(|| rows[9].clone());
             assert_eq!(rows[..10], wanted, "{view:?}");
             assert!(rows[10..].iter().all(String::is_empty), "{view:?}");
             let drawn = buffer(&mut f.app, 120, 30);
@@ -391,6 +421,155 @@ mod tests {
             Some((1, 2))
         );
         assert!(launch(&home, Some(&state)).places_visible);
+    }
+}
+
+#[cfg(test)]
+mod eject_tests {
+    use crate::app::testing::{Fixture, ctrl, fixture, key};
+    use crate::app::{App, Focus, Spot};
+    use crate::icons;
+    use crate::places::{self, Kind};
+    use crate::theme;
+    use crate::ui::testing::buffer;
+    use ratatui::crossterm::event::{
+        KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use std::fs;
+
+    /// The fixture with two volumes, Backup and the system's own, and the
+    /// panel read again.
+    fn mounted() -> Fixture {
+        let mut f = fixture();
+        fs::create_dir(f.volumes.join("Backup")).unwrap();
+        std::os::unix::fs::symlink("/", f.volumes.join("Macintosh HD")).unwrap();
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        f
+    }
+
+    fn index_of(app: &App, name: &str) -> Option<usize> {
+        places::flat(&app.places).position(|place| place.name == name)
+    }
+
+    fn said(app: &App) -> Option<(&str, bool)> {
+        (app.message.as_ref()).map(|message| (message.text.as_str(), message.is_error))
+    }
+
+    fn click(app: &mut App, x: u16, y: u16) {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn a_volume_s_row_ends_on_an_eject_button_and_a_click_on_it_ejects_it() {
+        theme::set_depth(theme::Depth::Truecolor);
+        let mut f = mounted();
+        let backup = index_of(&f.app, "Backup").unwrap();
+        let system = index_of(&f.app, "Macintosh HD").unwrap();
+        let drawn = buffer(&mut f.app, 120, 30);
+        let button = f
+            .app
+            .hits
+            .rect_of(&Spot::Eject(backup))
+            .expect("its button");
+        // The button and a cell after it, at the end of the row, muted.
+        let row = f.app.hits.rect_of(&Spot::Place(backup)).unwrap();
+        assert_eq!((button.y, button.width), (row.y, 2));
+        assert_eq!(button.x + 2, row.x + row.width);
+        assert_eq!(drawn[(button.x, button.y)].symbol(), icons::eject());
+        assert_eq!(drawn[(button.x, button.y)].fg, theme::MUTED);
+        // The system's own volume and the other places have none.
+        assert_eq!(f.app.hits.rect_of(&Spot::Eject(system)), None);
+        assert_eq!(f.app.hits.rect_of(&Spot::Eject(0)), None);
+        // A click on it ejects the volume, which the panel lists no more.
+        let folder = f.app.pane().cwd.clone();
+        click(&mut f.app, button.x, button.y);
+        assert_eq!(*f.system.ejected.borrow(), [f.volumes.join("Backup")]);
+        assert_eq!(said(&f.app), Some(("Ejected Backup", false)));
+        assert_eq!(index_of(&f.app, "Backup"), None);
+        assert_eq!(f.app.pane().cwd, folder, "a pane elsewhere stays");
+        // A click on the row elsewhere opens it, as before.
+        fs::create_dir(f.volumes.join("Backup")).unwrap();
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        buffer(&mut f.app, 120, 30);
+        let row = f.app.hits.rect_of(&Spot::Place(backup)).unwrap();
+        click(&mut f.app, row.x + 3, row.y);
+        assert_eq!(f.app.pane().cwd, f.volumes.join("Backup"));
+        assert_eq!(f.system.ejected.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_volume_on_the_mac_s_own_disk_has_no_eject_button_and_is_asked_about_once() {
+        let mut f = fixture();
+        fs::create_dir(f.volumes.join("Backup")).unwrap();
+        fs::create_dir(f.volumes.join("Recovery")).unwrap();
+        f.system
+            .internal
+            .borrow_mut()
+            .push(f.volumes.join("Recovery"));
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        // Each volume asked about once, however often the panel is read.
+        assert_eq!(f.system.internal_asked.get(), 2);
+        buffer(&mut f.app, 120, 30);
+        let recovery = index_of(&f.app, "Recovery").expect("still listed");
+        let backup = index_of(&f.app, "Backup").unwrap();
+        assert_eq!(f.app.hits.rect_of(&Spot::Eject(recovery)), None);
+        assert!(f.app.hits.rect_of(&Spot::Eject(backup)).is_some());
+        // `e` on it does nothing.
+        f.app.handle_key(key(KeyCode::BackTab));
+        f.app.places_cursor = recovery;
+        f.app.handle_key(key(KeyCode::Char('e')));
+        assert!(f.system.ejected.borrow().is_empty());
+        assert!(said(&f.app).is_none_or(|(text, _)| !text.contains("eject")));
+        assert_eq!(index_of(&f.app, "Recovery"), Some(recovery));
+        // Entering the panel again reads it without asking again; Ctrl+R asks.
+        f.app.handle_key(key(KeyCode::Esc));
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(f.system.internal_asked.get(), 2);
+        f.app.handle_key(ctrl(KeyCode::Char('r')));
+        assert_eq!(f.system.internal_asked.get(), 4);
+    }
+
+    #[test]
+    fn e_in_the_panel_ejects_the_volume_under_its_cursor_and_panes_in_it_go_home() {
+        let mut f = mounted();
+        let card = f.volumes.join("Backup").join("Photos");
+        fs::create_dir(&card).unwrap();
+        f.app.navigate(&card);
+        f.app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(f.app.focus, Focus::Places);
+        // On a place that is no volume, `e` does nothing.
+        f.app.places_cursor = 0;
+        f.app.handle_key(key(KeyCode::Char('e')));
+        assert!(f.system.ejected.borrow().is_empty());
+        let system = index_of(&f.app, "Macintosh HD").unwrap();
+        f.app.places_cursor = system;
+        f.app.handle_key(key(KeyCode::Char('e')));
+        assert!(f.system.ejected.borrow().is_empty());
+        assert_eq!(f.app.pane().cwd, card);
+        // Something using it: it says so, and the volume stays.
+        let backup = index_of(&f.app, "Backup").unwrap();
+        f.app.places_cursor = backup;
+        f.system.eject_fails.set(true);
+        f.app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(
+            said(&f.app),
+            Some(("Couldn't eject Backup. Something may be using it.", true))
+        );
+        assert_eq!(index_of(&f.app, "Backup"), Some(backup));
+        assert_eq!(f.app.pane().cwd, card);
+        // Ejected, the pane that showed it goes home.
+        f.system.eject_fails.set(false);
+        f.app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(*f.system.ejected.borrow(), [f.volumes.join("Backup")]);
+        assert_eq!(f.app.pane().cwd, f.home);
+        assert!(!(places::flat(&f.app.places)).any(|place| place.ejectable));
+        assert!((places::flat(&f.app.places)).any(|place| place.kind == Kind::Drive));
+        assert_eq!(f.app.focus, Focus::Places);
     }
 }
 

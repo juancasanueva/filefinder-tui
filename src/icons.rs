@@ -182,6 +182,17 @@ pub const PLACE_TAG: &str = "\u{f04f9}";
 /// A pinned folder, in the places panel.
 pub const PLACE_PIN: &str = "\u{f0403}";
 
+/// The eject button after a volume's name in the panel.
+pub const EJECT: &str = "\u{f01ea}";
+
+/// The eject button in the glyphs in use; the plain set has `⏏`.
+pub fn eject() -> &'static str {
+    match set() {
+        IconSet::Nerd => EJECT,
+        IconSet::Plain => "⏏",
+    }
+}
+
 /// The glyph in front of a place's name in the panel.
 pub fn place(kind: Kind) -> &'static str {
     place_in(set(), kind)

@@ -48,6 +48,9 @@ pub struct Place {
     pub name: String,
     pub path: PathBuf,
     pub kind: Kind,
+    /// Whether it is a volume that can be ejected: a drive that is neither
+    /// the system's own nor on the Mac's own disk, like Recovery.
+    pub ejectable: bool,
 }
 
 /// A heading and the places under it; never empty.
@@ -57,7 +60,9 @@ pub struct Section {
     pub places: Vec<Place>,
 }
 
-/// Every section that has something to list, in order.
+/// Every section that has something to list, in order. `internal` says
+/// whether a mounted volume is on the Mac's own disk, which can't be
+/// ejected.
 pub fn read(
     applications: &Path,
     home: &Path,
@@ -65,6 +70,7 @@ pub fn read(
     volumes: &Path,
     tags: u8,
     pins: &[PathBuf],
+    internal: &mut dyn FnMut(&Path) -> bool,
 ) -> Vec<Section> {
     let mut places = Vec::new();
     if applications.is_dir() {
@@ -72,12 +78,14 @@ pub fn read(
             name: "Applications".to_string(),
             path: applications.to_path_buf(),
             kind: Kind::Applications,
+            ejectable: false,
         });
     }
     places.push(Place {
         name: "Home".to_string(),
         path: home.to_path_buf(),
         kind: Kind::Home,
+        ejectable: false,
     });
     for (name, kind) in KNOWN {
         let path = home.join(name);
@@ -86,6 +94,7 @@ pub fn read(
                 name: name.to_string(),
                 path,
                 kind,
+                ejectable: false,
             });
         }
     }
@@ -93,6 +102,7 @@ pub fn read(
         name: "Trash".to_string(),
         path: trash.to_path_buf(),
         kind: Kind::Trash,
+        ejectable: false,
     });
     let sections = [
         Section {
@@ -109,7 +119,7 @@ pub fn read(
         },
         Section {
             heading: "DEVICES",
-            places: devices(home, volumes),
+            places: devices(home, volumes, internal),
         },
     ];
     sections
@@ -127,6 +137,7 @@ fn pinned(pins: &[PathBuf]) -> Vec<Place> {
             name: label(path),
             path: path.clone(),
             kind: Kind::Pinned,
+            ejectable: false,
         })
         .collect()
 }
@@ -151,6 +162,7 @@ fn tag_places(tags: u8) -> Vec<Place> {
             name: (*name).to_string(),
             path: PathBuf::new(),
             kind: Kind::Tag(index),
+            ejectable: false,
         })
         .collect()
 }
@@ -160,14 +172,15 @@ const ICLOUD_DRIVE: &str = "Library/Mobile Documents/com~apple~CloudDocs";
 
 /// The system's own volume, which opens `/`; iCloud Drive when its folder
 /// is there; then the other mounted volumes by name.
-fn devices(home: &Path, volumes: &Path) -> Vec<Place> {
-    let (mut system, mut drives) = drives(volumes);
+fn devices(home: &Path, volumes: &Path, internal: &mut dyn FnMut(&Path) -> bool) -> Vec<Place> {
+    let (mut system, mut drives) = drives(volumes, internal);
     let icloud = home.join(ICLOUD_DRIVE);
     if icloud.is_dir() {
         system.push(Place {
             name: "iCloud Drive".to_string(),
             path: icloud,
             kind: Kind::Cloud,
+            ejectable: false,
         });
     }
     system.append(&mut drives);
@@ -175,9 +188,9 @@ fn devices(home: &Path, volumes: &Path) -> Vec<Place> {
 }
 
 /// The mounted volumes: the system's own, listed among them as a link to
-/// `/` and given `/` as its path, then the others by name. None when the
-/// folder can't be read.
-fn drives(volumes: &Path) -> (Vec<Place>, Vec<Place>) {
+/// `/` and given `/` as its path, then the others by name, ejectable unless
+/// `internal`. None when the folder can't be read.
+fn drives(volumes: &Path, internal: &mut dyn FnMut(&Path) -> bool) -> (Vec<Place>, Vec<Place>) {
     let Ok(children) = fs::read_dir(volumes) else {
         return (Vec::new(), Vec::new());
     };
@@ -189,10 +202,15 @@ fn drives(volumes: &Path) -> (Vec<Place>, Vec<Place>) {
             let path = child.path();
             let shown = !name.starts_with('.') && path.is_dir();
             let system = fs::canonicalize(&path).is_ok_and(|real| real == root);
-            shown.then(|| Place {
+            if !shown {
+                return None;
+            }
+            let ejectable = !system && !internal(&path);
+            Some(Place {
                 name,
                 path: if system { root.to_path_buf() } else { path },
                 kind: Kind::Drive,
+                ejectable,
             })
         })
         .partition(|place| place.path == root);
@@ -250,7 +268,9 @@ mod tests {
         let trash = home.join(".Trash");
         let icloud = home.join("Library/Mobile Documents/com~apple~CloudDocs");
         fs::create_dir_all(&icloud).unwrap();
-        let sections = read(&applications, &home, &trash, &volumes, 0, &[]);
+        let sections = read(&applications, &home, &trash, &volumes, 0, &[], &mut |_| {
+            false
+        });
         assert_eq!(
             names(&sections),
             [
@@ -281,6 +301,32 @@ mod tests {
         assert_eq!(sections[1].places[0].kind, Kind::Drive);
         assert_eq!(sections[1].places[1].path, icloud);
         assert_eq!(sections[1].places[1].kind, Kind::Cloud);
+        // Only the other volumes can be ejected.
+        let ejectable = |sections: &[Section]| -> Vec<bool> {
+            let places = sections.last().unwrap().places.iter();
+            places.map(|place| place.ejectable).collect()
+        };
+        assert_eq!(ejectable(&sections), [false, false, true, true]);
+        assert!(!sections[0].places.iter().any(|place| place.ejectable));
+        // One on the Mac's own disk, like Recovery, can't be; the system's
+        // own volume isn't asked about.
+        let mut asked = Vec::new();
+        let mut internal = |path: &Path| {
+            asked.push(path.to_path_buf());
+            path.ends_with("Archive")
+        };
+        let sections = read(
+            &applications,
+            &home,
+            &trash,
+            &volumes,
+            0,
+            &[],
+            &mut internal,
+        );
+        assert_eq!(ejectable(&sections), [false, false, false, true]);
+        asked.sort();
+        assert_eq!(asked, [volumes.join("Archive"), volumes.join("backup")]);
         // No volumes: DEVICES lists iCloud Drive alone.
         let sections = read(
             &applications,
@@ -289,6 +335,7 @@ mod tests {
             &dir.path().join("none"),
             0,
             &[],
+            &mut |_| false,
         );
         assert_eq!(names(&sections)[1].1, ["iCloud Drive"]);
         // No volumes and no iCloud Drive: no DEVICES heading.
@@ -300,10 +347,19 @@ mod tests {
             &dir.path().join("none"),
             0,
             &[],
+            &mut |_| false,
         );
         assert_eq!(names(&sections).len(), 1);
         // No applications folder: PLACES starts at Home.
-        let sections = read(&dir.path().join("none"), &home, &trash, &volumes, 0, &[]);
+        let sections = read(
+            &dir.path().join("none"),
+            &home,
+            &trash,
+            &volumes,
+            0,
+            &[],
+            &mut |_| false,
+        );
         assert_eq!(names(&sections)[0].1[0], "Home");
     }
 
@@ -319,6 +375,7 @@ mod tests {
             &home.join("none"),
             0,
             &[],
+            &mut |_| false,
         );
         assert_eq!(current(&sections, &home.join("Pictures/Trip")), Some(1));
         assert_eq!(current(&sections, &home), Some(0));
@@ -332,6 +389,7 @@ mod tests {
             &home.join("none"),
             1,
             &[],
+            &mut |_| false,
         );
         assert_eq!(current(&sections, Path::new("/")), None);
         assert_eq!(current(&sections, &home), Some(0));
@@ -347,7 +405,15 @@ mod tests {
         let none = dir.path().join("none");
         // Blue, Red and Gray in use: listed Red, Blue, Gray.
         let mask = crate::tags::mask(&["Blue".into(), "Red".into(), "Gray".into()]);
-        let sections = read(&none, &home, &home.join(".Trash"), &volumes, mask, &[]);
+        let sections = read(
+            &none,
+            &home,
+            &home.join(".Trash"),
+            &volumes,
+            mask,
+            &[],
+            &mut |_| false,
+        );
         assert_eq!(
             names(&sections),
             [
@@ -359,7 +425,15 @@ mod tests {
         let kinds: Vec<Kind> = sections[1].places.iter().map(|place| place.kind).collect();
         assert_eq!(kinds, [Kind::Tag(0), Kind::Tag(4), Kind::Tag(6)]);
         // No tag in use: no TAGS heading.
-        let sections = read(&none, &home, &home.join(".Trash"), &volumes, 0, &[]);
+        let sections = read(
+            &none,
+            &home,
+            &home.join(".Trash"),
+            &volumes,
+            0,
+            &[],
+            &mut |_| false,
+        );
         assert_eq!(names(&sections).len(), 2);
     }
 }

@@ -59,6 +59,14 @@ pub trait System {
     /// The volume a folder is on; `None` when that can't be told.
     fn volume(&self, folder: &Path) -> Option<Volume>;
 
+    /// Ejects the mounted volume at `volume`, as Finder does; fails while
+    /// something is using it.
+    fn eject(&self, volume: &Path) -> io::Result<()>;
+
+    /// Whether the mounted volume at `volume` is on the Mac's own disk,
+    /// like Recovery, so it can't be ejected; false when that can't be told.
+    fn internal(&self, volume: &Path) -> bool;
+
     /// Edits a file in `$EDITOR` (`vi` without one) in this terminal, and
     /// waits for it: the window is handed over meanwhile and taken back after.
     fn edit(&self, path: &Path) -> io::Result<()>;
@@ -200,6 +208,31 @@ impl System for MacSystem {
             run_until(&mut unpack, stop)
         });
         Some((lister, unpacker))
+    }
+
+    fn eject(&self, volume: &Path) -> io::Result<()> {
+        // The whole disk, like Finder; what has no disk of its own, like a
+        // network share, is unmounted instead.
+        for verb in ["eject", "unmount"] {
+            let mut command = Command::new("diskutil");
+            if quiet(command.arg(verb).arg(volume)).status()?.success() {
+                return Ok(());
+            }
+        }
+        Err(io::Error::other("it is in use"))
+    }
+
+    fn internal(&self, volume: &Path) -> bool {
+        let mut command = Command::new("diskutil");
+        let output = command
+            .args(["info", "-plist"])
+            .arg(volume)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        output.is_ok_and(|output| {
+            output.status.success() && says_internal(&String::from_utf8_lossy(&output.stdout))
+        })
     }
 
     fn volume(&self, folder: &Path) -> Option<Volume> {
@@ -700,6 +733,15 @@ pub fn quiet(command: &mut Command) -> &mut Command {
         .stderr(Stdio::null())
 }
 
+/// Whether what `diskutil info -plist` says of a volume has it on an
+/// internal disk.
+fn says_internal(plist: &str) -> bool {
+    let Some((_, after)) = plist.split_once("<key>Internal</key>") else {
+        return false;
+    };
+    after.trim_start().starts_with("<true/>")
+}
+
 /// Spotlight's own search command.
 const MDFIND: &str = "/usr/bin/mdfind";
 
@@ -732,6 +774,20 @@ fn spotlight_count(query: &str) -> Option<Child> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_volume_is_internal_only_when_diskutil_says_so() {
+        let plist = |internal: &str| {
+            format!(
+                "<dict>\n\t<key>Ejectable</key>\n\t<false/>\n\t<key>Internal</key>\n\t{internal}\n</dict>"
+            )
+        };
+        assert!(super::says_internal(&plist("<true/>")));
+        assert!(!super::says_internal(&plist("<false/>")));
+        // Nothing said, or something else first: not internal.
+        assert!(!super::says_internal(""));
+        assert!(!super::says_internal("<key>InternalX</key><true/>"));
+    }
+
     #[test]
     fn a_spotlight_query_asks_for_every_tag_in_any_case_and_refuses_odd_names() {
         let tags = |names: &[&str]| {
